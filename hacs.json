@@ -1,7 +1,6 @@
 {
   "name": "MSPA Hot Tub integration",
   "homeassistant": "2025.6.1",
-  "country": ["NO"], 
   "zip_release": true,
   "filename": "mspa.zip"
 }
