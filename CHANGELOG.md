@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-03-17
+
+### Summary
+This release adds multi-device support — you can now add multiple MSpa hot tubs from the same account as separate integrations in Home Assistant. Existing single-device setups are automatically migrated.
+
+### Added
+- **Multi-Device Support** - Add multiple MSpa hot tubs from the same account
+  - Two-step config flow: enter credentials, then select which device to add
+  - Each device gets its own config entry, coordinator, and set of entities
+  - Already-configured devices are filtered from the device picker
+  - Clear abort message when all devices on the account are already configured
+
+- **Translations** - Added `translations/en.json` for reliable UI string display in custom integrations
+
+### Changed
+- **Config Flow** - Redesigned as a two-step flow
+  - Step 1: Enter email, password, and region (with auto-detection)
+  - Step 2: Select device from your account (auto-selected if only one)
+  - Duplicate device prevention via unique_id per physical device
+
+- **Device Identity** - Devices now use the real MSpa device ID as their identifier
+  - Enables proper multi-device support in the device registry
+  - Existing devices are automatically migrated from the old generic identifier
+
+- **Entity Unique IDs** - Diagnostic sensor unique IDs now include the device ID suffix
+  - Prevents entity collisions when multiple devices are configured
+  - Existing entities are automatically migrated to the new format
+
+- **Code Quality** - Extracted helper functions and removed dead code
+  - `_build_headers()` and `_obfuscate_email()` helpers in API client
+  - `_get_option_int()` and `_calculate_total_power()` helpers in sensor module
+  - Removed unused `RAPID_POLL_MAX_ATTEMPTS`, `_update_lock`, and trivial `async_request_refresh` override
+  - Fixed `authenticate()` silently returning stale token on failure — now raises `RuntimeError`
+  - Config flow distinguishes `invalid_auth` from `cannot_connect` errors
+
+### Fixed
+- **Filter Status Unique ID** - Fixed missing underscore in `filter_status` entity unique ID (`mspa_filter_status{id}` → `mspa_filter_status_{id}`)
+
+### Migration
+- **Automatic**: Device identifiers, entity unique IDs, and the filter_status fix are all migrated automatically on first startup after upgrade. No manual action required.
+- **If you experience issues**: If entities appear duplicated or missing after upgrading, remove the integration and re-add it. Your device will be rediscovered automatically.
+
+---
+
 ## [2.1.0] - 2026-02-16
 
 ### Summary

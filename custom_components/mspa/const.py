@@ -5,7 +5,6 @@ DOMAIN = "mspa"
 DEFAULT_SCAN_INTERVAL = 60
 RAPID_SCAN_INTERVAL = 1  # Polling interval in seconds when waiting for changes
 RAPID_POLL_TIMEOUT = 15  # Maximum time in seconds to poll rapidly
-RAPID_POLL_MAX_ATTEMPTS = 15  # Maximum number of rapid polls
 
 # Configuration
 CONF_PRODUCT_ID = "product_id"

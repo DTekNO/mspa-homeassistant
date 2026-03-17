@@ -20,7 +20,7 @@ app_secret = "87025c9ecd18906d27225fe79cb68349"
 
 
 class MSpaApiClient:
-    def __init__(self, hass, account_email, password, coordinator, region="ROW", token=None):
+    def __init__(self, hass, account_email, password, coordinator, region="ROW", token=None, device_id=None):
         self.account_email = account_email
         self.password = password
         self.app_id = app_id
@@ -47,6 +47,7 @@ class MSpaApiClient:
         hass.data["mspa_creds_hash"] = current_creds_hash
 
         self._token = token
+        self._target_device_id = device_id  # If set, select this specific device on init
         self.product_id = None
         self.device_id = None
         
@@ -96,15 +97,32 @@ class MSpaApiClient:
             _LOGGER.error("DIAGNOSTIC: Device list is empty! Full device_list: %s", device_list)
             raise RuntimeError("MSpaApiClient initialization failed: Device list is empty.")
 
-        _LOGGER.info("DIAGNOSTIC: Found %d device(s). First device: %s", len(devices), devices[0])
-        self.product_id = devices[0]["product_id"] if "product_id" in devices[0] else None
-        self.device_id = devices[0]["device_id"] if "device_id" in devices[0] else None
-        self.series = devices[0]["product_series"] if "product_series" in devices[0] else None
-        self.model = devices[0]["product_model"] if "product_model" in devices[0] else None
-        self.software_version = devices[0]["software_version"] if "software_version" in devices[0] else None
-        self.product_pic_url = devices[0]["url"] if "url" in devices[0] else None
+        # Select device: use stored target device_id if available, otherwise fall back to first
+        if self._target_device_id:
+            device = next(
+                (d for d in devices if d.get("device_id") == self._target_device_id),
+                None,
+            )
+            if device is None:
+                _LOGGER.warning(
+                    "DIAGNOSTIC: Target device_id '%s' not found in device list; falling back to first device",
+                    self._target_device_id,
+                )
+                device = devices[0]
+            else:
+                _LOGGER.info("DIAGNOSTIC: Found target device_id '%s' in device list", self._target_device_id)
+        else:
+            device = devices[0]
 
-        self.device_alias = devices[0]["device_alias"] if "device_alias" in devices[0] else None
+        _LOGGER.info("DIAGNOSTIC: Found %d device(s). Selected device: %s", len(devices), device)
+        self.product_id = device.get("product_id")
+        self.device_id = device.get("device_id")
+        self.series = device.get("product_series")
+        self.model = device.get("product_model")
+        self.software_version = device.get("software_version")
+        self.product_pic_url = device.get("url")
+
+        self.device_alias = device.get("device_alias")
         self.coordinator.model = self.model
         self.coordinator.series = self.series
         self.coordinator.software_version = self.software_version
@@ -136,17 +154,40 @@ class MSpaApiClient:
         self.hass.data["mspa_token"] = token
         self._token = token
 
+    def _build_headers(self, auth_token=None):
+        """Build standard API request headers."""
+        nonce = self.generate_nonce()
+        ts = self.current_ts()
+        sign = self.build_signature(nonce, ts)
+        authorization = f"token {auth_token}" if auth_token else "token"
+        return {
+            "push_type": "Android",
+            "authorization": authorization,
+            "appid": self.app_id,
+            "nonce": nonce,
+            "ts": ts,
+            "lan_code": "de",
+            "sign": sign,
+            "content-type": "application/json; charset=UTF-8",
+            "accept-encoding": "gzip",
+            "user-agent": "okhttp/4.9.0"
+        }
+
+    def _obfuscate_email(self):
+        """Return an obfuscated version of the account email for logging."""
+        if not self.account_email:
+            return "***"
+        parts = self.account_email.split("@")
+        if len(parts) == 2 and parts[0]:
+            return f"{parts[0][:3]}***@{parts[1]}"
+        return "***"
+
     def _obfuscate_response(self, response_data):
-        """Recursively obfuscate email addresses in response data for logging."""
+        """Obfuscate email addresses in response data for logging."""
         if not self.account_email:
             return response_data
 
-        # Create email obfuscation
-        email_parts = self.account_email.split("@")
-        if len(email_parts) == 2 and email_parts[0]:
-            obfuscated = f"{email_parts[0][:3]}***@{email_parts[1]}"
-        else:
-            obfuscated = "***"
+        obfuscated = self._obfuscate_email()
 
         # Convert to JSON string, replace email, then parse back
         import copy
@@ -157,21 +198,7 @@ class MSpaApiClient:
 
 
     async def authenticate(self):
-        nonce = self.generate_nonce()
-        ts = self.current_ts()
-        sign = self.build_signature(nonce, ts)
-        headers = {
-            "push_type": "Android",
-            "authorization": "token",
-            "appid": self.app_id,
-            "nonce": nonce,
-            "ts": ts,
-            "lan_code": "de",
-            "sign": sign,
-            "content-type": "application/json; charset=UTF-8",
-            "accept-encoding": "gzip",
-            "user-agent": "okhttp/4.9.0"
-        }
+        headers = self._build_headers()
         payload = {
             "account": self.account_email,
             "app_id": self.app_id,
@@ -185,9 +212,7 @@ class MSpaApiClient:
         token_request_url = f"{self.base_url}/api/enduser/get_token/"
 
         _LOGGER.info("DIAGNOSTIC: Attempting authentication to %s", token_request_url)
-        # Obfuscate email for privacy
-        email_parts = self.account_email.split("@") if self.account_email else ["", ""]
-        obfuscated_email = f"{email_parts[0][:3]}***@{email_parts[1]}" if len(email_parts) == 2 and email_parts[0] else "***"
+        obfuscated_email = self._obfuscate_email()
         _LOGGER.info("DIAGNOSTIC: Account email: %s", obfuscated_email)
         _LOGGER.info("DIAGNOSTIC: Password hash length: %d, first 6 chars: %s", len(self.password), self.password[:6] if self.password else "None")
 
@@ -223,9 +248,11 @@ class MSpaApiClient:
                     _LOGGER.error("DIAGNOSTIC:   3. Try resetting your password in the MSpa app and using a simple password (letters and numbers only)")
                     raise RuntimeError(f"Authentication failed: {error_message}. Please check your password in the MSpa mobile app.")
 
-                _LOGGER.warning("DIAGNOSTIC: No token in response. Response data: %s", response_json.get("data"))
-                _LOGGER.warning("DIAGNOSTIC: Full response: %s", response_json)
-                return self.get_token_from_hass()
+                _LOGGER.error("DIAGNOSTIC: No token in response. Response data: %s", response_json.get("data"))
+                _LOGGER.error("DIAGNOSTIC: Full response: %s", response_json)
+                raise RuntimeError(
+                    f"Authentication failed: no token in response (code={error_code}, message={error_message})"
+                )
         except requests.exceptions.Timeout:
             _LOGGER.error("DIAGNOSTIC: Authentication request timed out after 30 seconds")
             raise
@@ -239,21 +266,7 @@ class MSpaApiClient:
     async def send_device_command(self, desired_dict, retry=False):
         _LOGGER.debug("send_device_command: %s, retry %s", desired_dict, retry)
         token = self.get_former_token()
-        nonce = self.generate_nonce()
-        ts = self.current_ts()
-        sign = self.build_signature(nonce, ts)
-        headers = {
-            "push_type": "Android",
-            "authorization": "token " + token,
-            "appid": self.app_id,
-            "nonce": nonce,
-            "ts": ts,
-            "lan_code": "de",
-            "sign": sign,
-            "content-type": "application/json; charset=UTF-8",
-            "accept-encoding": "gzip",
-            "user-agent": "okhttp/4.9.0"
-        }
+        headers = self._build_headers(token)
         payload = {
             "device_id": self.device_id,
             "product_id": self.product_id,
@@ -317,21 +330,7 @@ class MSpaApiClient:
         return await self.send_device_command({"temperature_unit": unit})
 
     async def get_hot_tub_status(self, retry=False):
-        nonce = self.generate_nonce()
-        ts = self.current_ts()
-        sign = self.build_signature(nonce, ts)
-        headers = {
-            "push_type": "Android",
-            "authorization": "token " + self.get_former_token(),
-            "appid": self.app_id,
-            "nonce": nonce,
-            "ts": ts,
-            "lan_code": "de",
-            "sign": sign,
-            "content-type": "application/json; charset=UTF-8",
-            "accept-encoding": "gzip",
-            "user-agent": "okhttp/4.9.0"
-        }
+        headers = self._build_headers(self.get_former_token())
         payload = {
             "device_id": self.device_id,
             "product_id": self.product_id
@@ -349,21 +348,7 @@ class MSpaApiClient:
         return data
 
     async def get_device_list(self, retry=False):
-        nonce = self.generate_nonce()
-        ts = self.current_ts()
-        sign = self.build_signature(nonce, ts)
-        headers = {
-            "push_type": "Android",
-            "authorization": "token " + self.get_former_token(),
-            "appid": self.app_id,
-            "nonce": nonce,
-            "ts": ts,
-            "lan_code": "de",
-            "sign": sign,
-            "content-type": "application/json; charset=UTF-8",
-            "accept-encoding": "gzip",
-            "user-agent": "okhttp/4.9.0"
-        }
+        headers = self._build_headers(self.get_former_token())
         url = f"{self.base_url}/api/enduser/devices/"
 
         _LOGGER.info("DIAGNOSTIC: Attempting to get device list from %s (retry=%s)", url, retry)

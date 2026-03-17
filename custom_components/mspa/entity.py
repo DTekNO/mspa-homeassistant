@@ -14,8 +14,6 @@ class MSpaBaseEntity:
     _attr_has_entity_name = True
 
     def __init__(self, coordinator):
-        import logging
-        _LOGGER = logging.getLogger(__name__)
         _LOGGER.debug("Initializing %s", self.__class__.__name__)
         super().__init__(coordinator)
         self.coordinator = coordinator
@@ -26,7 +24,7 @@ class MSpaBaseEntity:
     def device_info(self):
         name = f"MSpa {getattr(self.coordinator, 'series', 'unknown')} {getattr(self.coordinator, 'device_alias', getattr(self.coordinator, 'model', 'unknown model'))}"
         return {
-            "identifiers": {(DOMAIN, "mspa_hottub")},
+            "identifiers": {(DOMAIN, getattr(self.coordinator, "device_id", "mspa_hottub"))},
             "manufacturer": "MSpa",
             "model": getattr(self.coordinator, "model", None),
             "name": name,

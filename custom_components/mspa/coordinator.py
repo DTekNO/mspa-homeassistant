@@ -18,7 +18,6 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     RAPID_SCAN_INTERVAL,
     RAPID_POLL_TIMEOUT,
-    RAPID_POLL_MAX_ATTEMPTS,
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
@@ -66,8 +65,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             password=self.password,
             coordinator=self,
             region=self.region,
+            device_id=self.config.get("device_id"),
         )
-        self._update_lock = asyncio.Lock()
         self._rapid_poll_until = None  # Timestamp when to stop rapid polling
         self._pending_changes = {}  # Track expected changes
         self._last_heat_state = None  # Track heat state changes
@@ -75,10 +74,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._saved_state = {}  # Store state before power off for restoration
         self._last_snapshot = {}  # Store last known state for change detection
         self._power_cycle_detected = False  # Flag to track if we just detected a power cycle
-
-
-    async def async_request_refresh(self) -> None:
-        await super().async_request_refresh()
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""

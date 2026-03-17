@@ -219,6 +219,23 @@ When enabled, the integration will attempt to:
 - Check the Home Assistant logs for power cycle detection confirmations
 - This option works independently of "Track temperature unit". You can enable one, both, or neither based on your preferences.
 
+## Upgrading to v3.0.0 (Multi-Device Support)
+
+Version 3.0.0 introduces multi-device support. When upgrading from an earlier version:
+
+1. **Upload the new version** and restart Home Assistant.
+2. **Automatic migration** — your existing device and entities will be migrated automatically. No manual action is needed in most cases.
+3. **To add a second hot tub** — go to **Settings** > **Devices & Services** > **Add Integration** > **MSpa**. Enter the same account credentials, and the config flow will show only devices that are not yet configured.
+
+### Troubleshooting Migration Issues
+
+If you experience any of the following after upgrading:
+- Duplicate entities (old and new)
+- Missing entities or entities stuck as "unavailable"
+- Device showing without entities
+
+**Resolution**: Remove the MSpa integration and re-add it. Your device will be rediscovered automatically and entities will be recreated cleanly.
+
 ## Thermostat popup
 
 ![Climate entity thermostat control popup](img/thermostat-popup.png)
@@ -229,17 +246,17 @@ When enabled, the integration will attempt to:
 
 ## Limitations
 
-- **Regional Restriction:** The integration currently only works with MSPA installations in the European region. Installations outside Europe are not supported at this time.
-- It is not currently possible to determine which features your specific MSPA hot tub supports. If you find that some features, such as jet or ozone, do not work, it may be due to the specific model of your hot tub. You can disable the relevant entities in the Home Assistant UI.
-- The safety lock feature is not available in this integration. You can still operate the safety lock through the MSPA Link app.
+- **Multi-Region Support**: The ROW (Europe) region is well-tested. US and CH regions are experimental — see the [CHANGELOG](CHANGELOG.md) for details.
+- It is not currently possible to determine which features your specific MSpa hot tub supports. If you find that some features, such as jet or ozone, do not work, it may be due to the specific model of your hot tub. You can disable the relevant entities in the Home Assistant UI.
+- The safety lock feature is not available in this integration. You can still operate the safety lock through the MSpa Link app.
 
 
 ## Troubleshooting
 
 - Make sure you are running the latest version of HACS.
 - Check the Home Assistant logs for any errors if the component does not load.
-- Ensure that you have created and are using a guest account for Home Assistant with its own email and password in the MSPA Link app.
-- you can only have one mspa integration per Home Assistant instance. If you have multiple MSPA hot tubs, you will need to set up separate instances of Home Assistant for each one.
+- Ensure that you have created and are using a guest account for Home Assistant with its own email and password in the MSpa Link app.
+- If upgrading from a version before 3.0.0 and entities are not working correctly, remove and re-add the integration (see [Upgrading to v3.0.0](#upgrading-to-v300-multi-device-support)).
 
 
 ## Support

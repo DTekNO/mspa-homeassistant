@@ -2,27 +2,26 @@
 import logging
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, CONF_DEVICE_ID
+from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from .const import (
     DOMAIN, 
-    CONF_PRODUCT_ID,
     CONF_REGION,
-    CONF_TRACK_TEMPERATURE_UNIT,
-    CONF_RESTORE_STATE,
-    CONF_ALWAYS_ENFORCE_UNIT,
     DEFAULT_REGION,
     REGIONS,
     COUNTRY_TO_REGION,
     DEFAULT_PUMP_POWER,
     DEFAULT_BUBBLE_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
-    DEFAULT_HEATER_POWER_HEAT
+    DEFAULT_HEATER_POWER_HEAT,
+    CONF_TRACK_TEMPERATURE_UNIT,
+    CONF_RESTORE_STATE,
+    CONF_ALWAYS_ENFORCE_UNIT,
 )
 import hashlib
 
 _LOGGER = logging.getLogger(__name__)
 
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Tuple, Optional
 
 def detect_region_from_hass(hass) -> Tuple[str, Optional[str]]:
     """Detect region based on Home Assistant country/timezone with fallback to ROW.
@@ -49,8 +48,13 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None ) :
-        """Handle the initial step."""
+    def __init__(self):
+        super().__init__()
+        self._data: dict = {}
+        self._devices: list = []
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None):
+        """Handle the initial step: collect credentials and discover devices."""
         errors = {}
         
         # Auto-detect region based on HA country setting for smart default
@@ -68,15 +72,9 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             # Strip whitespace from email and password to prevent common user errors
-            # (trailing spaces from copy/paste, etc.)
             email = user_input[CONF_EMAIL].strip()
             password = user_input[CONF_PASSWORD].strip()
 
-            # Obfuscate for logging
-            email_parts = email.split("@")
-            obfuscated_email = f"{email_parts[0][:3]}***@{email_parts[1]}" if len(email_parts) == 2 else "***"
-
-            # Check for whitespace that was removed
             if len(user_input[CONF_EMAIL]) != len(email):
                 _LOGGER.warning("DIAGNOSTIC: Email had leading/trailing whitespace - removed %d characters",
                                len(user_input[CONF_EMAIL]) - len(email))
@@ -84,36 +82,37 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.warning("DIAGNOSTIC: Password had leading/trailing whitespace - removed %d characters",
                                len(user_input[CONF_PASSWORD]) - len(password))
 
-            _LOGGER.debug("User input: {'email': '%s', 'password': '%s'}", obfuscated_email, "*" * len(password))
-
             # Generate MD5 hash
             password_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
-            _LOGGER.info("DIAGNOSTIC: Generated MD5 hash length: %d, first 6 chars: %s", len(password_hash), password_hash[:6])
-            _LOGGER.info("DIAGNOSTIC: Original password length: %d", len(password))
-            
-            # Get region from user input, or use detected region if not specified
             region = user_input.get(CONF_REGION, detected_region)
-            
-            _LOGGER.info(f"Using region: {region} (detected: {detected_region}, user selected: {user_input.get(CONF_REGION)})")
 
-            return self.async_create_entry(
-                title="MSpa Hot Tub",
-                data={
-                    "account_email": email,
-                    "password": password_hash,
-                    "region": region,
-                    # "device_id": user_input[CONF_DEVICE_ID],
-                    # "product_id": user_input[CONF_PRODUCT_ID],
-                }
-            )
+            self._data = {
+                "account_email": email,
+                "password": password_hash,
+                "region": region,
+            }
 
-        # Pre-populate form with detected region
-        data_schema=vol.Schema({
+            # Fetch device list to validate credentials and discover available devices
+            try:
+                self._devices = await self._fetch_devices(email, password_hash, region)
+            except RuntimeError as err:
+                err_msg = str(err).lower()
+                if "authentication failed" in err_msg or "password" in err_msg:
+                    _LOGGER.warning("DIAGNOSTIC: Authentication failed: %s", err)
+                    errors["base"] = "invalid_auth"
+                else:
+                    _LOGGER.warning("DIAGNOSTIC: Device discovery failed: %s", err)
+                    errors["base"] = "cannot_connect"
+            except Exception as err:
+                _LOGGER.warning("DIAGNOSTIC: Device discovery failed: %s", err)
+                errors["base"] = "cannot_connect"
+            else:
+                return await self.async_step_device()
+
+        data_schema = vol.Schema({
             vol.Required(CONF_EMAIL): str,
             vol.Required(CONF_PASSWORD): str,
             vol.Optional(CONF_REGION, default=detected_region, description={"suggested_value": detected_region}): vol.In(REGIONS),
-            # vol.Required(CONF_DEVICE_ID): str,
-            # vol.Required(CONF_PRODUCT_ID): str,
         })
         return self.async_show_form(
             step_id="user", 
@@ -121,6 +120,82 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
             description_placeholders=description_placeholders
         )
+
+    async def async_step_device(self, user_input: dict[str, Any] | None = None):
+        """Handle device selection when multiple devices are available."""
+        errors = {}
+
+        # Filter out devices that are already configured
+        configured_ids = {
+            entry.unique_id
+            for entry in self._async_current_entries()
+            if entry.unique_id
+        }
+        available = [d for d in self._devices if d.get("device_id") not in configured_ids]
+
+        if not available:
+            return self.async_abort(reason="no_devices_available")
+
+        if len(available) == 1:
+            # Only one unconfigured device — select it automatically
+            return await self._create_entry_for_device(available[0])
+
+        # Multiple unconfigured devices available
+        if user_input is not None:
+            device_id = user_input["device_id"]
+            device = next((d for d in available if d.get("device_id") == device_id), None)
+            if device:
+                return await self._create_entry_for_device(device)
+            errors["base"] = "unknown"
+
+        device_options = {
+            d["device_id"]: d.get("device_alias") or d.get("product_model") or d["device_id"]
+            for d in available
+            if d.get("device_id")
+        }
+        data_schema = vol.Schema({
+            vol.Required("device_id"): vol.In(device_options),
+        })
+        return self.async_show_form(
+            step_id="device",
+            data_schema=data_schema,
+            errors=errors,
+        )
+
+    async def _create_entry_for_device(self, device: dict) -> dict:
+        """Create a config entry for the given device."""
+        device_id = device.get("device_id")
+        # Prevent adding the same physical device twice
+        await self.async_set_unique_id(device_id)
+        self._abort_if_unique_id_configured()
+
+        alias = device.get("device_alias") or device.get("product_model") or ""
+        title = f"MSpa {alias}".strip() if alias else "MSpa Hot Tub"
+
+        return self.async_create_entry(
+            title=title,
+            data={
+                **self._data,
+                "device_id": device_id,
+                "product_id": device.get("product_id"),
+            },
+        )
+
+    async def _fetch_devices(self, email: str, password_hash: str, region: str) -> list:
+        """Authenticate and return the list of devices for these credentials."""
+        from .mspa_api import MSpaApiClient
+        temp_api = MSpaApiClient(
+            hass=self.hass,
+            account_email=email,
+            password=password_hash,
+            coordinator=None,
+            region=region,
+        )
+        await temp_api.authenticate()
+        device_list = await temp_api.get_device_list()
+        if not device_list or not device_list.get("list"):
+            raise RuntimeError("No devices found for these credentials")
+        return device_list["list"]
 
     # Hook the options flow for per-device settings
     @staticmethod
