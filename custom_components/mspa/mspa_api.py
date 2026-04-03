@@ -12,6 +12,30 @@ import functools
 
 _LOGGER = logging.getLogger(__name__)
 
+
+class _MSpaThrottle:
+    """Proactive spike-arrest rate limiter shared across all API clients for one account.
+
+    The MSpa API enforces a limit of 3 requests per second. By spacing every
+    outbound HTTP call at least MIN_INTERVAL seconds apart we stay well below
+    that ceiling regardless of how many coordinators / devices are running.
+    """
+    MIN_INTERVAL = 0.4  # seconds → max ~2.5 req/s, safely under the 3/s API limit
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._last_time: float = 0.0
+
+    async def acquire(self) -> None:
+        """Block until it is safe to fire the next API request."""
+        async with self._lock:
+            now = time.monotonic()
+            wait = self.MIN_INTERVAL - (now - self._last_time)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_time = time.monotonic()
+
+
 # Relevant ids and secrets:
 # The App ID is sent in each HTTP request header from the Mspa app.
 app_id = "e1c8e068f9ca11eba4dc0242ac120002"
@@ -29,24 +53,18 @@ class MSpaApiClient:
         self.coordinator = coordinator
         self.region = region if region in ["ROW", "US", "CH"] else "ROW"  # Safe fallback
 
-        # Clear any existing cached token when creating a new API client
-        # This ensures we don't reuse old tokens with new credentials
-        # We also store the credentials hash to detect if they've changed
-        current_creds_hash = hashlib.md5(f"{account_email}:{password}".encode("utf-8")).hexdigest()
-        stored_creds_hash = hass.data.get("mspa_creds_hash")
+        # Shared auth state keyed by credentials — all API clients for the same account
+        # share one token and one lock so they never race to authenticate simultaneously.
+        self._creds_key = hashlib.md5(f"{account_email}:{password}".encode()).hexdigest()
+        auth_store = hass.data.setdefault("mspa_auth", {})
+        if self._creds_key not in auth_store:
+            auth_store[self._creds_key] = {
+                "token": token,
+                "lock": asyncio.Lock(),      # Serializes authentication across coordinators
+                "api_lock": asyncio.Lock(),  # Serializes write commands across coordinators
+                "throttle": _MSpaThrottle(), # Proactive rate limiter for all HTTP calls
+            }
 
-        if stored_creds_hash and stored_creds_hash != current_creds_hash:
-            _LOGGER.info("DIAGNOSTIC: Credentials have changed - clearing old token")
-            hass.data.pop("mspa_token", None)
-        elif "mspa_token" in hass.data:
-            old_token = hass.data.get("mspa_token")
-            if old_token:
-                _LOGGER.info("DIAGNOSTIC: Found cached token from previous session (first 20 chars: %s...), will validate it", old_token[:20] if len(old_token) >= 20 else old_token)
-
-        # Store the current credentials hash for future comparison
-        hass.data["mspa_creds_hash"] = current_creds_hash
-
-        self._token = token
         self._target_device_id = device_id  # If set, select this specific device on init
         self.product_id = None
         self.device_id = None
@@ -73,7 +91,15 @@ class MSpaApiClient:
         """Get the base URL for the current region with fallback to ROW."""
         return self._api_endpoints.get(self.region, self._api_endpoints["ROW"])
 
+    @property
+    def _throttle(self) -> _MSpaThrottle:
+        """Per-account rate limiter shared by all API clients for this account."""
+        return self.hass.data["mspa_auth"][self._creds_key]["throttle"]
+
     async def async_init(self):
+        await self._do_async_init()
+
+    async def _do_async_init(self):
         _LOGGER.info("DIAGNOSTIC: Starting MSpaApiClient initialization")
         device_list = await self.get_device_list()
         _LOGGER.info("DIAGNOSTIC: device_list result: %s", device_list)
@@ -144,15 +170,12 @@ class MSpaApiClient:
         return hashlib.md5(raw.encode("utf-8")).hexdigest().upper()
 
     def get_former_token(self):
-        return self._token or self.get_token_from_hass() or ""
-
-
-    def get_token_from_hass(self):
-        return self.hass.data.get("mspa_token")
+        return self.hass.data.get("mspa_auth", {}).get(self._creds_key, {}).get("token") or ""
 
     def set_token_in_hass(self, token):
-        self.hass.data["mspa_token"] = token
-        self._token = token
+        self.hass.data.setdefault("mspa_auth", {}).setdefault(
+            self._creds_key, {"token": None, "lock": asyncio.Lock()}
+        )["token"] = token
 
     def _build_headers(self, auth_token=None):
         """Build standard API request headers."""
@@ -198,6 +221,22 @@ class MSpaApiClient:
 
 
     async def authenticate(self):
+        auth_state = self.hass.data["mspa_auth"][self._creds_key]
+        lock = auth_state["lock"]
+        token_before_wait = auth_state.get("token")
+
+        async with lock:
+            # If another coordinator authenticated while we were waiting for the lock,
+            # reuse their fresh token instead of logging in again (which would invalidate it).
+            if auth_state.get("token") and auth_state["token"] != token_before_wait:
+                _LOGGER.info(
+                    "DIAGNOSTIC: Token refreshed by another coordinator while waiting — reusing it"
+                )
+                return auth_state["token"]
+
+            return await self._do_authenticate()
+
+    async def _do_authenticate(self):
         headers = self._build_headers()
         payload = {
             "account": self.account_email,
@@ -211,6 +250,7 @@ class MSpaApiClient:
         }
         token_request_url = f"{self.base_url}/api/enduser/get_token/"
 
+        await self._throttle.acquire()
         _LOGGER.info("DIAGNOSTIC: Attempting authentication to %s", token_request_url)
         obfuscated_email = self._obfuscate_email()
         _LOGGER.info("DIAGNOSTIC: Account email: %s", obfuscated_email)
@@ -265,6 +305,12 @@ class MSpaApiClient:
 
     async def send_device_command(self, desired_dict, retry=False):
         _LOGGER.debug("send_device_command: %s, retry %s", desired_dict, retry)
+        auth_state = self.hass.data["mspa_auth"][self._creds_key]
+        async with auth_state["api_lock"]:
+            return await self._send_device_command_locked(desired_dict, retry)
+
+    async def _send_device_command_locked(self, desired_dict, retry=False):
+        """Inner implementation — called only while the api_lock is held."""
         token = self.get_former_token()
         headers = self._build_headers(token)
         payload = {
@@ -275,13 +321,14 @@ class MSpaApiClient:
 
         url = f"{self.base_url}/api/device/command"
         _LOGGER.debug("send_device_command: %s, url: %s", desired_dict, url)
+        await self._throttle.acquire()
         response = await self.hass.async_add_executor_job(
             functools.partial(requests.post, url, headers=headers, json=payload)
         )
         response = response.json()
         if (response.get('message') != 'SUCCESS') and (not retry):
             token = await self.authenticate()
-            return await self.send_device_command(desired_dict, True)
+            return await self._send_device_command_locked(desired_dict, True)
 
         # Poll for expected state if provided
         for _ in range(5):
@@ -336,6 +383,7 @@ class MSpaApiClient:
             "product_id": self.product_id
         }
         url = f"{self.base_url}/api/device/thing_shadow/"
+        await self._throttle.acquire()
         response = await self.hass.async_add_executor_job(
             functools.partial(requests.post, url, headers=headers, json=payload)
         )
@@ -355,6 +403,7 @@ class MSpaApiClient:
         _LOGGER.info("DIAGNOSTIC: Using token (first 20 chars): %s...", self.get_former_token()[:20] if self.get_former_token() else "None")
 
         try:
+            await self._throttle.acquire()
             response = await self.hass.async_add_executor_job(
                 functools.partial(requests.get, url, headers=headers, timeout=30)
             )
@@ -364,13 +413,28 @@ class MSpaApiClient:
             response_json = response.json()
             _LOGGER.info("DIAGNOSTIC: Device list parsed response: %s", response_json)
 
-            if not response_json.get("data") and not retry:
-                _LOGGER.warning("DIAGNOSTIC: No data in device list response, re-authenticating...")
+            code = response_json.get("code")
+            data = response_json.get("data", {})
+            has_list = isinstance(data, dict) and "list" in data
+
+            if code == 11000 and not retry:
+                # Rate-limited — wait and retry once
+                _LOGGER.warning(
+                    "DIAGNOSTIC: Device list rate-limited (code 11000). Waiting 2s before retry..."
+                )
+                await asyncio.sleep(2)
+                return await self.get_device_list(True)
+
+            if not has_list and not retry:
+                _LOGGER.warning("DIAGNOSTIC: No device list in response (code=%s), re-authenticating...", code)
                 await self.authenticate()
                 return await self.get_device_list(True)
 
-            data = response_json["data"]
-            device_count = len(data.get("list", [])) if isinstance(data, dict) else 0
+            if not has_list:
+                _LOGGER.error("DIAGNOSTIC: No device list after retry. Response: %s", response_json)
+                return data
+
+            device_count = len(data["list"])
             _LOGGER.info("DIAGNOSTIC: Device list returned successfully. Number of devices: %d", device_count)
 
             if device_count == 0:
