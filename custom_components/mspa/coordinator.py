@@ -28,6 +28,15 @@ from homeassistant.const import ATTR_STATE, ATTR_TEMPERATURE
 
 _LOGGER = logging.getLogger(__name__)
 
+# Status payload keys that are explicitly restructured/renamed in transformed_data.
+# All other keys from the payload are passed through verbatim.
+_STRUCTURED_STATUS_KEYS = frozenset({
+    "water_temperature", "temperature_setting",
+    "heater_state", "filter_state", "bubble_state",
+    "jet_state", "ozone_state", "uvc_state",
+    "bubble_level", "fault",
+})
+
 class MSpaUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from MSpa Hot Tub."""
 
@@ -97,25 +106,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "uvc": "on" if status_data.get("uvc_state", 0) else "off",
                 "bubble_level": status_data.get("bubble_level", 1),
                 "fault": fault_value if fault_value else "OK",
-                # Diagnostic sensors
-                "wifivertion": status_data.get("wifivertion"),
-                "otastatus": status_data.get("otastatus"),
-                "mcuversion": status_data.get("mcuversion"),
-                "ConnectType": status_data.get("ConnectType"),
-                "temperature_unit": status_data.get("temperature_unit"),
-                "auto_inflate": status_data.get("auto_inflate"),
-                "filter_current": status_data.get("filter_current"),
-                "safety_lock": status_data.get("safety_lock"),
-                "heat_time_switch": status_data.get("heat_time_switch"),
-                "heat_state": status_data.get("heat_state"),
-                "multimcuotainfo": status_data.get("multimcuotainfo"),
-                "heat_time": status_data.get("heat_time"),
-                "filter_life": status_data.get("filter_life"),
-                "trdversion": status_data.get("trdversion"),
-                "is_online": status_data.get("is_online"),
-                "warning": status_data.get("warning"),
-                "device_heat_perhour": status_data.get("device_heat_perhour"),
             }
+
+            # Pass all remaining payload keys through verbatim so new/changed
+            # firmware keys appear immediately as diagnostic sensors.
+            for key, value in status_data.items():
+                if key not in _STRUCTURED_STATUS_KEYS:
+                    transformed_data[key] = value
 
             self._last_data = transformed_data
             _LOGGER.debug("Fetched MSpa transformed data: %s", transformed_data)

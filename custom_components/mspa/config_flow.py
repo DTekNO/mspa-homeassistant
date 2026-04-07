@@ -56,7 +56,31 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         """Handle the initial step: collect credentials and discover devices."""
         errors = {}
-        
+
+        # If an MSpa entry already exists, reuse its credentials — we only support one account.
+        # Skip the credential form and jump straight to device selection.
+        if user_input is None:
+            existing = self._async_current_entries()
+            if existing:
+                first = existing[0]
+                self._data = {
+                    "account_email": first.data["account_email"],
+                    "password": first.data["password"],
+                    "region": first.data.get("region", DEFAULT_REGION),
+                }
+                try:
+                    self._devices = await self._fetch_devices(
+                        self._data["account_email"],
+                        self._data["password"],
+                        self._data["region"],
+                    )
+                    return await self.async_step_device()
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Could not reuse existing MSpa credentials (%s) — falling back to manual entry", err
+                    )
+                    # Fall through to show the credential form
+
         # Auto-detect region based on HA country setting for smart default
         detected_region, detected_country = detect_region_from_hass(self.hass)
         

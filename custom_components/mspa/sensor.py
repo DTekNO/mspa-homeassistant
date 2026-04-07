@@ -21,21 +21,24 @@ SENSOR_TYPES = {
     "water_temperature": ["Water Temperature", "°C", SensorStateClass.MEASUREMENT, SensorDeviceClass.TEMPERATURE]
 }
 
-DIAGNOSTIC_KEYS = [
-    "wifivertion", "otastatus", "mcuversion", "ConnectType", "temperature_unit",
-    "auto_inflate", "filter_current", "safety_lock", "heat_time_switch", "heat_state",
-    "multimcuotainfo", "heat_time", "filter_life", "trdversion", "is_online",
-    "warning", "device_heat_perhour"
-]
+# Keys in coordinator._last_data that are handled by dedicated structured sensors.
+# Everything else becomes a MSpaDiagnosticSensor automatically, using the payload
+# key name verbatim — new/changed keys appear as new entities.
+_STRUCTURED_KEYS = frozenset({
+    "water_temperature", "target_temperature",
+    "heater", "filter", "bubble", "jet", "ozone", "uvc",
+    "bubble_level", "fault",
+})
 
-MEASUREMENT_KEYS = {
+# Keys whose values are numeric measurements (affects SensorStateClass).
+MEASUREMENT_KEYS = frozenset({
     "temperature_unit",
     "filter_current",
     "heat_state",
     "heat_time",
     "filter_life",
-    "device_heat_perhour"
-}
+    "device_heat_perhour",
+})
 
 
 def _get_option_int(config_entry, key: str, default: int) -> int:
@@ -92,10 +95,21 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # Energy sensors for Energy dashboard
     async_add_entities([MSpaTotalEnergySensor(coordinator, entry)], update_before_add=True)
 
+    # Dynamically create diagnostic sensors for every key that came back in the
+    # first status poll, using the payload key name directly.  This means firmware
+    # renames (e.g. wifivertion → wifi_version) are followed automatically without
+    # any code changes — new keys appear, removed keys disappear.
     diagnostic_sensors = [
-        MSpaDiagnosticSensor(coordinator, key, f"{key.replace('_', ' ').title()}")
-        for key in DIAGNOSTIC_KEYS
+        MSpaDiagnosticSensor(coordinator, key, key.replace("_", " ").title())
+        for key in sorted(coordinator._last_data.keys())
+        if key not in _STRUCTURED_KEYS
     ]
+
+    # Firmware version: combines wifi_version + mcu_version from the device list
+    # (matches the format shown in the MSpa app, e.g. "141-3A1").
+    if getattr(coordinator, "wifi_version", None) or getattr(coordinator, "mcu_version", None):
+        diagnostic_sensors.append(MSpaFirmwareVersionSensor(coordinator))
+
     async_add_entities(diagnostic_sensors)
 
 
@@ -154,11 +168,30 @@ class MSpaDiagnosticSensor(MSpaSensorEntity):
 
     @property
     def state(self):
-        return self.coordinator.last_data.get(self._key)
+        return self.coordinator._last_data.get(self._key)
 
     @property
     def entity_picture(self):
         return None
+
+
+class MSpaFirmwareVersionSensor(MSpaDiagnosticSensor):
+    """Combined firmware version, matching the MSpa app format (e.g. '141-3A1')."""
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "__firmware_version__", "Firmware Version")
+        self._attr_unique_id = f"mspa_firmware_version_{getattr(coordinator, 'device_id', 'unknown')}"
+
+    @property
+    def state(self):
+        wifi = getattr(self.coordinator, "wifi_version", None) or ""
+        mcu = getattr(self.coordinator, "mcu_version", None) or ""
+        # Strip the 'mcu-' prefix MSpa uses internally (app shows e.g. '141-3A1', not '141-mcu-3A1')
+        if mcu.startswith("mcu-"):
+            mcu = mcu[4:]
+        if wifi and mcu:
+            return f"{wifi}-{mcu}"
+        return wifi or mcu or None
 
 # This sensor is used to indicate faults or warnings in the MSpa system.
 # It checks the "fault" key in the coordinator's last data.

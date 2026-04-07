@@ -156,6 +156,9 @@ class MSpaApiClient:
         self.coordinator.device_id = self.device_id
         self.coordinator.product_id = self.product_id
         self.coordinator.device_alias = self.device_alias
+        # Store wifi/mcu versions from the device list for the firmware version sensor
+        self.coordinator.wifi_version = device.get("wifi_version")
+        self.coordinator.mcu_version = device.get("mcu_version")
 
     @staticmethod
     def generate_nonce(length=32):

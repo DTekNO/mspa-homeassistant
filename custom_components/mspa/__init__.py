@@ -84,14 +84,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         ent_reg = er.async_get(hass)
         _OLD_UNIQUE_ID_PREFIXES = [
             # Diagnostic sensors had unique_id "mspa_{key}" without device_id
-            "mspa_wifivertion", "mspa_otastatus", "mspa_mcuversion",
+            "mspa_otastatus", "mspa_wifivertion", "mspa_mcuversion",
             "mspa_ConnectType", "mspa_temperature_unit", "mspa_auto_inflate",
             "mspa_filter_current", "mspa_safety_lock", "mspa_heat_time_switch",
             "mspa_heat_state", "mspa_multimcuotainfo", "mspa_heat_time",
             "mspa_filter_life", "mspa_trdversion", "mspa_is_online",
             "mspa_warning", "mspa_device_heat_perhour",
         ]
-        # Also migrate filter_status which had a missing underscore before device_id
+        # Migrate filter_status which had a missing underscore before device_id.
         _OLD_UNIQUE_ID_RENAMES = [
             (f"mspa_filter_status{real_device_id}", f"mspa_filter_status_{real_device_id}"),
         ]
@@ -143,8 +143,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
         if not remaining:
             # Last entry unloaded — clean up services and cached auth
             _unregister_services(hass)
-            hass.data.pop("mspa_token", None)
-            hass.data.pop("mspa_creds_hash", None)
+            hass.data.pop("mspa_auth", None)
             _LOGGER.debug("MSpa integration %s fully unloaded — services and auth cache cleared", DOMAIN)
         else:
             # Re-register services pointing at a still-active coordinator
@@ -155,6 +154,19 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
                 entry.entry_id,
             )
     return unload_ok
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry
+) -> bool:
+    """Prevent removing a device independently of its config entry.
+
+    Each MSpa config entry represents exactly one spa device.  Deleting the
+    device from the device page would leave the coordinator running with no
+    owner.  Returning False tells HA to block the deletion and direct the
+    user to delete the integration entry instead.
+    """
+    return False
 
 
 async def async_options_updated(hass: HomeAssistant, entry: ConfigEntry):
