@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2026-04-13
+
+### Changed
+- **Time to Target Temperature** — renamed entity from `heating_time_remaining` to `time_to_target` to better reflect that the sensor works in both heating and cooling directions
+
+### Migration
+- The old `sensor.*_heating_time_remaining` entity will appear as unavailable after upgrading. The replacement `sensor.*_time_to_target_temperature` is created automatically. Delete the old entity from **Settings → Devices & Services → Entities** once confirmed working.
+
+---
+
 ## [3.0.0] - 2026-04-13
 
 ### Summary

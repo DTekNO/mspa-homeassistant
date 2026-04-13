@@ -284,7 +284,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
 
     def __init__(self, coordinator):
         super().__init__(coordinator)
-        self._attr_unique_id = f"mspa_heating_time_remaining_{getattr(coordinator, 'device_id', 'unknown')}"
+        self._attr_unique_id = f"mspa_time_to_target_{getattr(coordinator, 'device_id', 'unknown')}"
         self._attr_device_info = self.device_info
         self._near_target = False  # hysteresis state
 
