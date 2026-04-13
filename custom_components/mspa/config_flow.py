@@ -18,6 +18,7 @@ from .const import (
     CONF_ALWAYS_ENFORCE_UNIT,
 )
 import hashlib
+from .mspa_api import DEMO_EMAIL, _DEMO_DEVICES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -106,8 +107,11 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.warning("DIAGNOSTIC: Password had leading/trailing whitespace - removed %d characters",
                                len(user_input[CONF_PASSWORD]) - len(password))
 
-            # Generate MD5 hash
-            password_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
+            # Generate MD5 hash (skipped for demo mode — password is irrelevant)
+            if email == DEMO_EMAIL:
+                password_hash = "demo"
+            else:
+                password_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
             region = user_input.get(CONF_REGION, detected_region)
 
             self._data = {
@@ -207,6 +211,10 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _fetch_devices(self, email: str, password_hash: str, region: str) -> list:
         """Authenticate and return the list of devices for these credentials."""
+        if email == DEMO_EMAIL:
+            _LOGGER.info("DEMO MODE: returning %d virtual demo devices", len(_DEMO_DEVICES))
+            return list(_DEMO_DEVICES)
+
         from .mspa_api import MSpaApiClient
         temp_api = MSpaApiClient(
             hass=self.hass,

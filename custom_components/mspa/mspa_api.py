@@ -42,6 +42,86 @@ app_id = "e1c8e068f9ca11eba4dc0242ac120002"
 # The App Secret can be determined by decompiling the Mspa app.
 app_secret = "87025c9ecd18906d27225fe79cb68349"
 
+# ---------------------------------------------------------------------------
+# Developer demo mode
+# ---------------------------------------------------------------------------
+# Use email "demo@mspa.test" (any password) in the config flow to add virtual
+# spa devices without any cloud connectivity.  The devices below are modelled
+# on real API responses so every code path is exercised.  Safe to leave in
+# production builds — the sentinel email is completely inert for real users.
+DEMO_EMAIL = "demo@mspa.test"
+
+_DEMO_DEVICES = [
+    {
+        "device_id": "demo_device_frame_001",
+        "device_alias": "DemoSpa Frame",
+        "product_series": "FRAME",
+        "product_model": "F-TU062W",
+        "software_version": "106",
+        "wifi_version": "141",
+        "mcu_version": "mcu-3A1",
+        "product_id": "DEMO01",
+        "url": "",
+        "is_online": True,
+        "is_connect": True,
+        "sn": "DEMO-FRAME-001",
+    },
+    {
+        "device_id": "demo_device_oslouvc_002",
+        "device_alias": "DemoSpa Oslo",
+        "product_series": "OSLOUVC",
+        "product_model": "F-OS063WAP",
+        "software_version": "136",
+        "wifi_version": "141",
+        "mcu_version": "mcu-410",
+        "product_id": "DEMO02",
+        "url": "",
+        "is_online": True,
+        "is_connect": True,
+        "sn": "DEMO-OSLO-002",
+    },
+    {
+        "device_id": "demo_device_alpine_003",
+        "device_alias": "DemoSpa Alpine",
+        "product_series": "ALPINE",
+        "product_model": "F-AL052D",
+        "software_version": "118",
+        "wifi_version": "141",
+        "mcu_version": "mcu-3B2",
+        "product_id": "DEMO03",
+        "url": "",
+        "is_online": True,
+        "is_connect": True,
+        "sn": "DEMO-ALPINE-003",
+    },
+]
+
+_DEMO_STATUS = {
+    "water_temperature": 78,   # 39 °C (stored as ×2)
+    "temperature_setting": 82, # 41 °C target
+    "heater_state": 1,
+    "filter_state": 1,
+    "bubble_state": 0,
+    "jet_state": 0,
+    "ozone_state": 1,
+    "uvc_state": 1,
+    "bubble_level": 1,
+    "fault": "",
+    "temperature_unit": 0,
+    "auto_inflate": 0,
+    "filter_current": 42,
+    "safety_lock": 0,
+    "heat_time_switch": 0,
+    "heat_state": 3,
+    "heat_time": 120,
+    "filter_life": 720,
+    "is_online": True,
+    "ConnectType": "online",
+    "wifivertion": "141",
+    "otastatus": 0,
+    "trdversion": "1.0",
+}
+
 
 class MSpaApiClient:
     def __init__(self, hass, account_email, password, coordinator, region="ROW", token=None, device_id=None):
@@ -92,6 +172,11 @@ class MSpaApiClient:
         return self._api_endpoints.get(self.region, self._api_endpoints["ROW"])
 
     @property
+    def is_demo(self) -> bool:
+        """True when running in developer demo mode (no cloud calls made)."""
+        return self.account_email == DEMO_EMAIL
+
+    @property
     def _throttle(self) -> _MSpaThrottle:
         """Per-account rate limiter shared by all API clients for this account."""
         return self.hass.data["mspa_auth"][self._creds_key]["throttle"]
@@ -100,6 +185,31 @@ class MSpaApiClient:
         await self._do_async_init()
 
     async def _do_async_init(self):
+        if self.is_demo:
+            # Demo mode — populate coordinator from the matching fake device record.
+            device = next(
+                (d for d in _DEMO_DEVICES if d["device_id"] == self._target_device_id),
+                _DEMO_DEVICES[0],
+            )
+            self.device_id = device["device_id"]
+            self.product_id = device["product_id"]
+            self.series = device["product_series"]
+            self.model = device["product_model"]
+            self.software_version = device["software_version"]
+            self.product_pic_url = device.get("url", "")
+            self.device_alias = device["device_alias"]
+            self.coordinator.model = self.model
+            self.coordinator.series = self.series
+            self.coordinator.software_version = self.software_version
+            self.coordinator.product_pic_url = self.product_pic_url
+            self.coordinator.device_id = self.device_id
+            self.coordinator.product_id = self.product_id
+            self.coordinator.device_alias = self.device_alias
+            self.coordinator.wifi_version = device.get("wifi_version")
+            self.coordinator.mcu_version = device.get("mcu_version")
+            _LOGGER.info("DEMO MODE: initialised demo device '%s'", self.device_alias)
+            return
+
         _LOGGER.info("DIAGNOSTIC: Starting MSpaApiClient initialization")
         device_list = await self.get_device_list()
         _LOGGER.info("DIAGNOSTIC: device_list result: %s", device_list)
@@ -307,6 +417,14 @@ class MSpaApiClient:
             raise
 
     async def send_device_command(self, desired_dict, retry=False):
+        if self.is_demo:
+            _LOGGER.info("DEMO MODE: ignoring command %s", desired_dict)
+            # Apply the desired state directly to the shared demo status so that
+            # the next poll reflects the "change" (makes UI interactions feel real).
+            _DEMO_STATUS.update(desired_dict)
+            await self.coordinator.async_request_refresh()
+            return {"message": "SUCCESS"}
+
         _LOGGER.debug("send_device_command: %s, retry %s", desired_dict, retry)
         auth_state = self.hass.data["mspa_auth"][self._creds_key]
         async with auth_state["api_lock"]:
@@ -380,6 +498,20 @@ class MSpaApiClient:
         return await self.send_device_command({"temperature_unit": unit})
 
     async def get_hot_tub_status(self, retry=False):
+        if self.is_demo:
+            import copy
+            status = copy.copy(_DEMO_STATUS)
+            # Drift the water temperature a tiny bit each poll to look alive
+            stored = self.coordinator._last_data.get("water_temperature")
+            if stored is not None:
+                # _last_data already has the halved value; work in raw units
+                raw = int(stored * 2)
+                target = int(status["temperature_setting"])
+                raw = raw + 1 if raw < target else raw - 1 if raw > target else raw
+                status["water_temperature"] = raw
+            _LOGGER.debug("DEMO MODE: returning mock status")
+            return status
+
         headers = self._build_headers(self.get_former_token())
         payload = {
             "device_id": self.device_id,

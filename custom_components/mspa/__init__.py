@@ -55,6 +55,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     coordinator = MSpaUpdateCoordinator(hass, entry)
     await coordinator.api.async_init()
 
+    # Keep the config entry title in sync with the device alias reported by the
+    # MSpa cloud.  The title is set at creation time by the config flow, but the
+    # user may have renamed the spa in the app since then, or the title may have
+    # been stale for any other reason (e.g. a previous single-device entry that
+    # was reused).  Correcting it here means the integration list always shows
+    # the current spa name without requiring a delete-and-re-add.
+    alias = getattr(coordinator, "device_alias", None) or getattr(coordinator, "model", None)
+    expected_title = f"MSpa {alias}".strip() if alias else "MSpa Hot Tub"
+    if entry.title != expected_title:
+        _LOGGER.info("Updating config entry title: '%s' → '%s'", entry.title, expected_title)
+        hass.config_entries.async_update_entry(entry, title=expected_title)
+
     # Migrate old hardcoded device identifier to real device_id
     real_device_id = coordinator.device_id
     if real_device_id and real_device_id != "mspa_hottub":

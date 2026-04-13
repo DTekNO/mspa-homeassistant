@@ -259,6 +259,39 @@ If you experience any of the following after upgrading:
 - If upgrading from a version before 3.0.0 and entities are not working correctly, remove and re-add the integration (see [Upgrading to v3.0.0](#upgrading-to-v300-multi-device-support)).
 
 
+## Developer Demo Mode
+
+A built-in demo mode lets you add virtual spa devices without any physical hardware or cloud account. This is useful for testing the integration, developing dashboards, or exercising multi-device behaviour.
+
+### How to activate
+
+1. Go to **Settings** > **Devices & Services** > **Add Integration** > **MSpa**.
+2. Enter the following credentials:
+   - **Email**: `demo@mspa.test`
+   - **Password**: anything (it is ignored)
+   - **Region**: any
+3. Three virtual devices are available to add one at a time:
+
+| Device alias | Series | Model |
+|---|---|---|
+| DemoSpa Frame | FRAME | F-TU062W |
+| DemoSpa Oslo | OSLOUVC | F-OS063WAP |
+| DemoSpa Alpine | ALPINE | F-AL052D |
+
+Repeat the "Add Integration" flow to add additional demo devices (already-configured ones are filtered out automatically).
+
+### Behaviour
+
+- **No network calls are made** — authentication, device list, status polling and commands are all handled locally.
+- **Status polls** return realistic mock data. The water temperature drifts toward the target each poll so the climate entity looks alive.
+- **Commands work** — toggling heater/filter/bubble, adjusting the target temperature etc. update the mock state immediately and are reflected on the next poll.
+- The mock shadow payload intentionally includes the legacy `wifivertion` key so that pass-through diagnostic sensor behaviour can be verified.
+
+### Removing demo devices
+
+Delete each demo entry the same way as a real one: **Settings** > **Devices & Services** > **MSpa** > three-dot menu > **Delete**.
+
+
 ## Support
 
 For issues or feature requests, please open an issue in this repository.
