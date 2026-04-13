@@ -1,6 +1,6 @@
 """Sensor platform for MSpa integration."""
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from homeassistant.components.sensor import SensorStateClass, SensorDeviceClass
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.const import UnitOfPower, UnitOfEnergy, UnitOfTime
@@ -25,7 +25,7 @@ SENSOR_TYPES = {
 # Everything else becomes a MSpaDiagnosticSensor automatically, using the payload
 # key name verbatim — new/changed keys appear as new entities.
 # NOTE: device_heat_perhour is intentionally NOT listed here — it still produces a
-# diagnostic sensor AND is used by MSpaHeatingTimeSensor when non-zero.
+# diagnostic sensor AND is used by the temperature-reach sensors as fallback.
 _STRUCTURED_KEYS = frozenset({
     "water_temperature", "target_temperature",
     "heater", "filter", "bubble", "jet", "ozone", "uvc",
@@ -114,15 +114,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     async_add_entities(diagnostic_sensors)
 
-    # Heating time estimate: only available when the device reports a non-zero
-    # device_heat_perhour value (the Oslo does; older models report 0).
-    heat_rate = coordinator._last_data.get("device_heat_perhour", 0)
-    try:
-        heat_rate = int(heat_rate)
-    except (TypeError, ValueError):
-        heat_rate = 0
-    if heat_rate:
-        async_add_entities([MSpaHeatingTimeSensor(coordinator)])
+    # Temperature-reach sensors are registered for every spa.
+    # They show as unavailable until a reliable rate is established
+    # (computed EMA for heating/cooling, or device_heat_perhour as fallback for heating).
+    async_add_entities([
+        MSpaTempReachSensor(coordinator),
+        MSpaTempReachReadyAtSensor(coordinator),
+    ])
 
 
 class MSpaSensor(MSpaSensorEntity):
@@ -205,16 +203,70 @@ class MSpaFirmwareVersionSensor(MSpaDiagnosticSensor):
             return f"{wifi}-{mcu}"
         return wifi or mcu or None
 
-class MSpaHeatingTimeSensor(MSpaSensorEntity):
+def _effective_heat_rate(coordinator) -> float | None:
+    """Return the best available heating rate in °C/h.
+
+    Preference order:
+    1. coordinator.computed_heat_rate  — learned from observed temperature rise
+       (updated by coordinator on every poll via EMA with outlier rejection)
+    2. device_heat_perhour payload key  — device-reported estimate (some models only)
+
+    Returns None when neither source has a usable value yet.
+    """
+    # Prefer the learned rate — it adapts to real-world conditions
+    computed = getattr(coordinator, "computed_heat_rate", None)
+    if computed is not None and computed > 0:
+        return computed
+
+    # Fall back to device-reported rate (1/10 °C per hour)
+    raw = coordinator._last_data.get("device_heat_perhour", 0)
+    try:
+        raw = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if raw > 0:
+        return raw / 10.0
+
+    return None
+
+
+def _effective_cool_rate(coordinator) -> float | None:
+    """Return the best available passive cooling rate in °C/h (positive).
+
+    Only uses the computed EMA — there is no device-reported cooling rate fallback.
+    Returns None until enough cooling samples have been gathered.
+    """
+    computed = getattr(coordinator, "computed_cool_rate", None)
+    if computed is not None and computed > 0:
+        return computed
+    return None
+
+
+def _effective_rate(coordinator, water_temp: float, target_temp: float) -> float | None:
+    """Return the appropriate rate (°C/h, positive) for the current direction.
+
+    - target_temp > water_temp  →  heating: uses _effective_heat_rate
+    - target_temp < water_temp  →  cooling: uses _effective_cool_rate
+    - equal                     →  None (already at target)
+    """
+    if target_temp > water_temp:
+        return _effective_heat_rate(coordinator)
+    if target_temp < water_temp:
+        return _effective_cool_rate(coordinator)
+    return None
+
+
+class MSpaTempReachSensor(MSpaSensorEntity):
     """Estimated minutes until the spa reaches its target temperature.
 
-    Uses the `device_heat_perhour` key from the thing-shadow payload, which the
-    Oslo (and similar models) report as heating rate in 1/10 °C per hour
-    (e.g. 14 → 1.4 °C/h).  Older models that always report 0 do not get this
-    entity — it is only registered when the first poll returns a non-zero rate.
+    Works in both directions: counts down while heating up *or* while cooling
+    down to a lower target.  Uses the best available rate for the current
+    direction — the coordinator's learned EMA first, then the device-reported
+    `device_heat_perhour` value as a heating fallback.
+    Returns unavailable until a rate has been established.
     """
 
-    name = "Heating Time Remaining"
+    name = "Time to Target Temperature"
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
     _attr_device_class = SensorDeviceClass.DURATION
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -230,55 +282,105 @@ class MSpaHeatingTimeSensor(MSpaSensorEntity):
     def native_value(self):
         data = self.coordinator._last_data
 
-        water_temp = data.get("water_temperature")     # Already °C (÷2 applied by coordinator)
-        target_temp = data.get("target_temperature")   # Already °C
-        heat_rate_raw = data.get("device_heat_perhour", 0)
-
         try:
-            heat_rate_raw = int(heat_rate_raw)
-        except (TypeError, ValueError):
-            return None
-
-        if not heat_rate_raw:
-            return None
-
-        try:
-            water_temp = float(water_temp)
-            target_temp = float(target_temp)
+            water_temp = float(data.get("water_temperature"))
+            target_temp = float(data.get("target_temperature"))
         except (TypeError, ValueError):
             return None
 
         degrees_remaining = target_temp - water_temp
-        if degrees_remaining <= 0:
+        if degrees_remaining == 0:
             return 0
 
-        # heat_rate_raw is in 1/10 °C per hour → convert to °C/h
-        rate_per_hour = heat_rate_raw / 10.0
-        if rate_per_hour <= 0:
+        rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
+        if rate_per_hour is None:
             return None
 
-        minutes_remaining = (degrees_remaining / rate_per_hour) * 60
+        minutes_remaining = (abs(degrees_remaining) / rate_per_hour) * 60
         return round(minutes_remaining)
 
     @property
     def extra_state_attributes(self):
         data = self.coordinator._last_data
-        heat_rate_raw = data.get("device_heat_perhour", 0)
         try:
-            rate_per_hour = int(heat_rate_raw) / 10.0
+            water_temp = float(data.get("water_temperature"))
+            target_temp = float(data.get("target_temperature"))
         except (TypeError, ValueError):
-            rate_per_hour = None
+            water_temp = target_temp = None
+
+        if water_temp is not None and target_temp is not None:
+            effective = _effective_rate(self.coordinator, water_temp, target_temp)
+            if target_temp > water_temp:
+                direction = "heating"
+            elif target_temp < water_temp:
+                direction = "cooling"
+            else:
+                direction = "at_target"
+        else:
+            effective = None
+            direction = None
+
+        computed_heat = getattr(self.coordinator, "computed_heat_rate", None)
+        computed_cool = getattr(self.coordinator, "computed_cool_rate", None)
+        raw = data.get("device_heat_perhour", 0)
+        try:
+            device_rate = int(raw) / 10.0 if int(raw) > 0 else None
+        except (TypeError, ValueError):
+            device_rate = None
+
         return {
-            "heating_rate_deg_per_hour": rate_per_hour,
-            "current_temperature": data.get("water_temperature"),
-            "target_temperature": data.get("target_temperature"),
+            "direction": direction,
+            "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
+            "computed_heat_rate_deg_per_hour": round(computed_heat, 3) if computed_heat is not None else None,
+            "computed_cool_rate_deg_per_hour": round(computed_cool, 3) if computed_cool is not None else None,
+            "device_rate_deg_per_hour": device_rate,
+            "current_temperature": water_temp,
+            "target_temperature": target_temp,
         }
 
 
+class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
+    """Timestamp at which the spa is expected to reach its target temperature.
+
+    Works in both directions (heating up or cooling down).  Returns `None`
+    (→ unavailable) once the target is already reached, making it trivial to
+    conditionally show/hide the sensor in dashboards and automations using the
+    standard `is_unavailable` / `is_available` tests.
+    """
+
+    name = "Ready At"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-check-outline"
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"mspa_heating_ready_at_{getattr(coordinator, 'device_id', 'unknown')}"
+        self._attr_device_info = self.device_info
+
+    @property
+    def native_value(self):
+        data = self.coordinator._last_data
+
+        try:
+            water_temp = float(data.get("water_temperature"))
+            target_temp = float(data.get("target_temperature"))
+        except (TypeError, ValueError):
+            return None
+
+        degrees_remaining = target_temp - water_temp
+        if degrees_remaining == 0:
+            # Already at target — return None so the sensor shows as unavailable
+            return None
+
+        rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
+        if rate_per_hour is None:
+            return None
+
+        minutes_remaining = (abs(degrees_remaining) / rate_per_hour) * 60
+        return datetime.now(timezone.utc) + timedelta(minutes=minutes_remaining)
+
+
 # This sensor is used to indicate faults or warnings in the MSpa system.
-# It checks the "fault" key in the coordinator's last data.
-# If the fault is "OK", it indicates no issues.
-# Otherwise, it indicates a fault condition.
 class MSpaFaultSensor(MSpaDiagnosticSensor):
     name = "Fault"
     _attr_entity_category = EntityCategory.DIAGNOSTIC

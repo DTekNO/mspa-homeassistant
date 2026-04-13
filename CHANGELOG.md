@@ -22,6 +22,12 @@ This release adds multi-device support — you can now add multiple MSpa hot tub
 
 - **Firmware Version Sensor** - New sensor combining `wifi_version` and `mcu_version` from the device list API into a single `"141-3A1"` style value, matching the format shown in the MSpa app
 
+- **Heating Time Sensors** (models that report `device_heat_perhour` only, e.g. Oslo series)
+  - **Heating Time Remaining** — minutes until the target temperature is reached
+  - **Ready At** — absolute timestamp of when the spa should be ready
+  - Both sensors become **unavailable** once the target temperature is reached, making them easy to use in conditional cards and automations
+  - Not created on models where `device_heat_perhour` is absent or zero (e.g. older Tuscany series)
+
 - **Dynamic Diagnostic Sensors** - Diagnostic sensors are now created automatically from every key in the thing-shadow payload that is not otherwise handled by a structured sensor. New firmware keys appear as new sensors without any code changes; removed keys disappear.
 
 - **Shared Rate Limiter (`_MSpaThrottle`)** - Per-account spike-arrest rate limiter (0.4 s minimum between requests) shared across all coordinators for the same account, preventing API rate-limit errors (code 11000) when two spas start up simultaneously
@@ -31,6 +37,8 @@ This release adds multi-device support — you can now add multiple MSpa hot tub
 - **Entry Title Self-Correction** - On each startup the integration checks whether the config entry title matches the device alias returned by the cloud and corrects it if not. Prevents stale titles persisting across restarts without a delete-and-re-add.
 
 - **Block Device-Only Deletion** (`async_remove_config_entry_device`) - Prevents users from deleting the spa device from the device-detail page without removing the integration entry, avoiding ghost entities. HA redirects the user to delete the integration entry instead.
+
+- **Improved Device Info** — device page now shows firmware version (`141-3A1` format), serial number, MAC address, and model ID sourced from the device list API
 
 - **Developer Demo Mode** - Use email `demo@mspa.test` (any password) to add up to three virtual spa devices (Frame / Oslo / Alpine) with no cloud connectivity. Status polls return realistic drifting mock data; commands update mock state in memory. See the README for full details.
 

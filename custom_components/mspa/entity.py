@@ -34,7 +34,6 @@ class MSpaBaseEntity:
             "connections": {(dr.CONNECTION_NETWORK_MAC, getattr(self.coordinator, "mac_address"))} if getattr(self.coordinator, "mac_address", None) else set(),
             "manufacturer": "MSpa",
             "model": getattr(self.coordinator, "model", None),
-            "model_id": getattr(self.coordinator, "product_id", None) or None,
             "name": name,
             "sw_version": fw_version,
             "serial_number": getattr(self.coordinator, "serial_number", None) or None,

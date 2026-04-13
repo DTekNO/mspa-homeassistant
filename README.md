@@ -105,6 +105,45 @@ The climate entity will show the following states:
 - `preheating`: The hot tub is in preheat mode (heat_state = 2), warming up the water before entering full heating mode.
 - `heating`: The hot tub is actively heating the water (heat_state = 3).
 
+## Heating Time Sensors
+
+Some MSpa models (e.g. the Oslo series) report a heating rate in the device payload (`device_heat_perhour`). On these models the integration provides two additional sensors that estimate when the spa will reach its target temperature. These sensors are **not available on models that do not report a heating rate** (the value is absent or zero — for example, older Tuscany-series spas).
+
+| Sensor | Description |
+|---|---|
+| **Heating Time Remaining** | Minutes until the target temperature is reached |
+| **Ready At** | Absolute timestamp (clock time) when the spa should be ready |
+
+### Availability
+
+Both sensors become **unavailable** once the target temperature is reached (or the spa is already at or above target). This makes them easy to use in conditional cards and automations:
+
+**Show a card only while heating:**
+```yaml
+type: conditional
+conditions:
+  - condition: state
+    entity: sensor.mspa_ready_at
+    state_not: unavailable
+card:
+  type: entity
+  entity: sensor.mspa_ready_at
+```
+
+**Send a notification when the spa is ready:**
+```yaml
+trigger:
+  - platform: state
+    entity_id: sensor.mspa_ready_at
+    to: unavailable
+action:
+  - service: notify.mobile_app
+    data:
+      message: "The spa has reached its target temperature!"
+```
+
+> **Note on accuracy**: The heating rate reported by the device is an estimate based on the spa's own algorithm. Actual heating time may vary with ambient temperature, water volume, and lid usage.
+
 ## Power and Energy Monitoring
 
 The integration provides comprehensive power and energy monitoring for your hot tub, including individual component sensors and total power/energy tracking that can be added directly to Home Assistant's Energy dashboard.

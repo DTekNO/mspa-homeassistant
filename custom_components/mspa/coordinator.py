@@ -23,6 +23,7 @@ from .const import (
     CONF_ALWAYS_ENFORCE_UNIT,
 )
 
+import time
 from homeassistant.const import ATTR_STATE, ATTR_TEMPERATURE
 
 
@@ -84,6 +85,20 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._last_snapshot = {}  # Store last known state for change detection
         self._power_cycle_detected = False  # Flag to track if we just detected a power cycle
 
+        # Computed heating rate tracking (°C / hour, exponential moving average).
+        # Updated on every poll where the heater is in full-heat mode (heat_state == 3)
+        # and at least _MIN_RATE_SAMPLE_HOURS have elapsed since the last valid sample.
+        # Outliers (caused by adding hot/cold water, sensor noise etc.) are rejected.
+        self.computed_heat_rate: float | None = None  # °C/h, None until enough data
+        self._rate_last_temp: float | None = None     # °C at last accepted sample
+        self._rate_last_time: float | None = None     # monotonic seconds at last sample
+
+        # Computed passive cooling rate (°C/h, stored positive).
+        # Sampled when the heater is off and water temperature is actually dropping.
+        self.computed_cool_rate: float | None = None  # °C/h, None until enough data
+        self._cool_last_temp: float | None = None     # °C at last accepted sample
+        self._cool_last_time: float | None = None     # monotonic seconds at last sample
+
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""
         try:
@@ -116,6 +131,92 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             self._last_data = transformed_data
             _LOGGER.debug("Fetched MSpa transformed data: %s", transformed_data)
+
+            # --- Observed heating rate tracking ---
+            # Only sample when in full-heat mode to avoid preheat / cooling skew.
+            # Bounds are intentionally generous: even a tiny spa at max power can't
+            # exceed ~5 °C/h, and below 0.05 °C/h the signal is just sensor noise.
+            _MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
+            _MIN_HEAT_RATE = 0.05             # °C/h  — below this is noise / flat
+            _MAX_HEAT_RATE = 5.0              # °C/h  — above this is an outlier
+            _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
+
+            curr_temp = transformed_data.get("water_temperature")
+            heat_state = transformed_data.get("heat_state")
+            now_mono = time.monotonic()
+
+            if heat_state == 3 and curr_temp is not None:
+                if (
+                    self._rate_last_temp is not None
+                    and self._rate_last_time is not None
+                ):
+                    elapsed_hours = (now_mono - self._rate_last_time) / 3600
+                    if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
+                        delta = curr_temp - self._rate_last_temp
+                        rate = delta / elapsed_hours  # guarded: elapsed_hours > 0
+                        if _MIN_HEAT_RATE <= rate <= _MAX_HEAT_RATE:
+                            if self.computed_heat_rate is None:
+                                self.computed_heat_rate = rate
+                            else:
+                                self.computed_heat_rate = (
+                                    _EMA_ALPHA * rate
+                                    + (1 - _EMA_ALPHA) * self.computed_heat_rate
+                                )
+                            _LOGGER.debug(
+                                "Heat rate sample %.3f °C/h (EMA → %.3f °C/h)",
+                                rate, self.computed_heat_rate,
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "Heat rate sample %.3f °C/h rejected (out of bounds)", rate
+                            )
+                # Always advance the anchor to the current reading while heater is on
+                self._rate_last_temp = curr_temp
+                self._rate_last_time = now_mono
+            else:
+                # Heater off/preheat — reset anchor so next on-cycle starts fresh
+                self._rate_last_temp = None
+                self._rate_last_time = None
+
+            # --- Observed cooling rate tracking ---
+            # Sample passively when heater is not active and temperature is dropping.
+            _MIN_COOL_RATE = 0.01  # °C/h — below this is sensor drift
+            _MAX_COOL_RATE = 3.0   # °C/h — above this is unusual for an insulated spa
+
+            if heat_state not in (2, 3) and curr_temp is not None:
+                if (
+                    self._cool_last_temp is not None
+                    and self._cool_last_time is not None
+                ):
+                    elapsed_hours = (now_mono - self._cool_last_time) / 3600
+                    if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
+                        delta = curr_temp - self._cool_last_temp
+                        if delta < 0:  # temperature actually dropping
+                            rate = -delta / elapsed_hours  # positive °C/h
+                            if _MIN_COOL_RATE <= rate <= _MAX_COOL_RATE:
+                                if self.computed_cool_rate is None:
+                                    self.computed_cool_rate = rate
+                                else:
+                                    self.computed_cool_rate = (
+                                        _EMA_ALPHA * rate
+                                        + (1 - _EMA_ALPHA) * self.computed_cool_rate
+                                    )
+                                _LOGGER.debug(
+                                    "Cool rate sample %.3f °C/h (EMA → %.3f °C/h)",
+                                    rate, self.computed_cool_rate,
+                                )
+                            else:
+                                _LOGGER.debug(
+                                    "Cool rate sample %.3f °C/h rejected (out of bounds)", rate
+                                )
+                # Always advance the cooling anchor while heater is off
+                self._cool_last_temp = curr_temp
+                self._cool_last_time = now_mono
+            else:
+                # Actively heating — reset cooling anchor so next off-cycle starts fresh
+                self._cool_last_temp = None
+                self._cool_last_time = None
+            # --- end rate tracking ---
             
             # Check for power cycle and restore state if enabled
             await self._check_power_cycle(transformed_data)
