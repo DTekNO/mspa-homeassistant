@@ -4,7 +4,8 @@
 [![Validate with HACS][hacs-validation-badge]][hacs-validation-url]
 ![Maintenance][maintenance-badge]
 [![release][release-badge]][release-url]
-![downloads][downloads-badge]
+![GitHub Downloads (all assets, all releases)][downloads-badge]
+![GitHub Downloads (all assets, latest release)][downloads-latest]
 
 
 
@@ -373,3 +374,4 @@ For issues or feature requests, please open an issue in this repository.
 [release-badge]: https://img.shields.io/github/release/DTekNO/mspa-homeassistant.svg
 [release-url]: https://github.com/DTekNO/mspa-homeassistant/releases
 [downloads-badge]: https://img.shields.io/github/downloads/DTekNO/mspa-homeassistant/total
+[downloads-latest]: https://img.shields.io/github/downloads/DTekNO/mspa-homeassistant/latest/total
