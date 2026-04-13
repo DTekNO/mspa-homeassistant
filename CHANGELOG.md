@@ -22,11 +22,15 @@ This release adds multi-device support — you can now add multiple MSpa hot tub
 
 - **Firmware Version Sensor** - New sensor combining `wifi_version` and `mcu_version` from the device list API into a single `"141-3A1"` style value, matching the format shown in the MSpa app
 
-- **Heating Time Sensors** (models that report `device_heat_perhour` only, e.g. Oslo series)
-  - **Heating Time Remaining** — minutes until the target temperature is reached
+- **Time to Target Temperature Sensors** *(experimental)* — available on **all** models
+  - **Time to Target Temperature** — minutes until the set-point is reached (heating *or* cooling direction)
   - **Ready At** — absolute timestamp of when the spa should be ready
   - Both sensors become **unavailable** once the target temperature is reached, making them easy to use in conditional cards and automations
-  - Not created on models where `device_heat_perhour` is absent or zero (e.g. older Tuscany series)
+  - Rate is **self-learned** via an exponential moving average (EMA) of observed 0.5 °C temperature steps — no reliance on device-reported values
+  - **Heating rate** sampled during full-heat mode; **cooling rate** sampled passively when heater is off and temperature is dropping
+  - Outlier rejection (e.g. adding hot/cold water mid-session) prevents spikes from corrupting the EMA
+  - Device-reported `device_heat_perhour` (Oslo series etc.) used as a heating fallback until the EMA has enough data
+  - Marked experimental: algorithm is new and needs a few weeks of real-world validation across seasonal conditions — feedback welcome
 
 - **Dynamic Diagnostic Sensors** - Diagnostic sensors are now created automatically from every key in the thing-shadow payload that is not otherwise handled by a structured sensor. New firmware keys appear as new sensors without any code changes; removed keys disappear.
 

@@ -138,7 +138,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # exceed ~5 °C/h, and below 0.05 °C/h the signal is just sensor noise.
             _MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
             _MIN_HEAT_RATE = 0.05             # °C/h  — below this is noise / flat
-            _MAX_HEAT_RATE = 5.0              # °C/h  — above this is an outlier
+            _MAX_HEAT_RATE = 3.0              # °C/h  — above this is an outlier (no real spa heats faster than ~2.5°C/h)
             _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
 
             curr_temp = transformed_data.get("water_temperature")
@@ -146,10 +146,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             now_mono = time.monotonic()
 
             if heat_state == 3 and curr_temp is not None:
-                if (
-                    self._rate_last_temp is not None
-                    and self._rate_last_time is not None
-                ):
+                if self._rate_last_temp is None:
+                    # First poll in heat mode — set anchor, no sample yet
+                    self._rate_last_temp = curr_temp
+                    self._rate_last_time = now_mono
+                elif curr_temp != self._rate_last_temp:
+                    # Temperature has changed — elapsed time since anchor is the true
+                    # duration of the previous 0.5 °C step, giving a real rate.
                     elapsed_hours = (now_mono - self._rate_last_time) / 3600
                     if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
                         delta = curr_temp - self._rate_last_temp
@@ -170,9 +173,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             _LOGGER.debug(
                                 "Heat rate sample %.3f °C/h rejected (out of bounds)", rate
                             )
-                # Always advance the anchor to the current reading while heater is on
-                self._rate_last_temp = curr_temp
-                self._rate_last_time = now_mono
+                    # Always advance anchor to new temperature (even if rate rejected).
+                    # This prevents a rejected outlier span from being re-used.
+                    self._rate_last_temp = curr_temp
+                    self._rate_last_time = now_mono
+                # else: temperature unchanged — let elapsed time accumulate, don’t touch anchor
             else:
                 # Heater off/preheat — reset anchor so next on-cycle starts fresh
                 self._rate_last_temp = None
@@ -184,14 +189,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             _MAX_COOL_RATE = 3.0   # °C/h — above this is unusual for an insulated spa
 
             if heat_state not in (2, 3) and curr_temp is not None:
-                if (
-                    self._cool_last_temp is not None
-                    and self._cool_last_time is not None
-                ):
+                if self._cool_last_temp is None:
+                    # First poll in cooling mode — set anchor, no sample yet
+                    self._cool_last_temp = curr_temp
+                    self._cool_last_time = now_mono
+                elif curr_temp != self._cool_last_temp:
+                    # Temperature has changed — compute rate only for drops.
                     elapsed_hours = (now_mono - self._cool_last_time) / 3600
                     if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
                         delta = curr_temp - self._cool_last_temp
-                        if delta < 0:  # temperature actually dropping
+                        if delta < 0:  # temperature actually dropped
                             rate = -delta / elapsed_hours  # positive °C/h
                             if _MIN_COOL_RATE <= rate <= _MAX_COOL_RATE:
                                 if self.computed_cool_rate is None:
@@ -209,9 +216,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                 _LOGGER.debug(
                                     "Cool rate sample %.3f °C/h rejected (out of bounds)", rate
                                 )
-                # Always advance the cooling anchor while heater is off
-                self._cool_last_temp = curr_temp
-                self._cool_last_time = now_mono
+                    # Always advance anchor on any temperature change (rise or drop).
+                    self._cool_last_temp = curr_temp
+                    self._cool_last_time = now_mono
+                # else: temperature unchanged — let elapsed time accumulate
             else:
                 # Actively heating — reset cooling anchor so next off-cycle starts fresh
                 self._cool_last_temp = None

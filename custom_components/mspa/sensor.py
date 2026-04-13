@@ -203,6 +203,12 @@ class MSpaFirmwareVersionSensor(MSpaDiagnosticSensor):
             return f"{wifi}-{mcu}"
         return wifi or mcu or None
 
+# Sensors become unavailable when within this many °C of target.
+# Sized to cover normal thermostat cycling (±0.5 °C) and typical overshoot
+# without masking genuine heating/cooling runs.
+_NEAR_TARGET_THRESHOLD = 1.0
+
+
 def _effective_heat_rate(coordinator) -> float | None:
     """Return the best available heating rate in °C/h.
 
@@ -278,26 +284,29 @@ class MSpaTempReachSensor(MSpaSensorEntity):
         self._attr_unique_id = f"mspa_heating_time_remaining_{getattr(coordinator, 'device_id', 'unknown')}"
         self._attr_device_info = self.device_info
 
-    @property
-    def native_value(self):
+    def _compute_minutes(self) -> int | None:
+        """Return minutes to target, or None when unavailable (no rate / near target)."""
         data = self.coordinator._last_data
-
         try:
             water_temp = float(data.get("water_temperature"))
             target_temp = float(data.get("target_temperature"))
         except (TypeError, ValueError):
             return None
-
         degrees_remaining = target_temp - water_temp
-        if degrees_remaining == 0:
-            return 0
-
+        if abs(degrees_remaining) < _NEAR_TARGET_THRESHOLD:
+            return None  # at/near target → unavailable
         rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
         if rate_per_hour is None:
             return None
+        return round((abs(degrees_remaining) / rate_per_hour) * 60)
 
-        minutes_remaining = (abs(degrees_remaining) / rate_per_hour) * 60
-        return round(minutes_remaining)
+    @property
+    def available(self):
+        return super().available and self._compute_minutes() is not None
+
+    @property
+    def native_value(self):
+        return self._compute_minutes()
 
     @property
     def extra_state_attributes(self):
@@ -357,27 +366,30 @@ class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
         self._attr_unique_id = f"mspa_heating_ready_at_{getattr(coordinator, 'device_id', 'unknown')}"
         self._attr_device_info = self.device_info
 
-    @property
-    def native_value(self):
+    def _compute_ready_at(self):
+        """Return ready-at timestamp, or None when unavailable (no rate / near target)."""
         data = self.coordinator._last_data
-
         try:
             water_temp = float(data.get("water_temperature"))
             target_temp = float(data.get("target_temperature"))
         except (TypeError, ValueError):
             return None
-
         degrees_remaining = target_temp - water_temp
-        if degrees_remaining == 0:
-            # Already at target — return None so the sensor shows as unavailable
-            return None
-
+        if abs(degrees_remaining) < _NEAR_TARGET_THRESHOLD:
+            return None  # at/near target → unavailable
         rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
         if rate_per_hour is None:
             return None
-
         minutes_remaining = (abs(degrees_remaining) / rate_per_hour) * 60
         return datetime.now(timezone.utc) + timedelta(minutes=minutes_remaining)
+
+    @property
+    def available(self):
+        return super().available and self._compute_ready_at() is not None
+
+    @property
+    def native_value(self):
+        return self._compute_ready_at()
 
 
 # This sensor is used to indicate faults or warnings in the MSpa system.

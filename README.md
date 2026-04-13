@@ -102,23 +102,52 @@ The integration also provides `hvac_action` as part of the climate sensor that i
 The climate entity will show the following states:
 - `off`: The hot tub is turned off.
 - `idle`: The hot tub is on but not actively heating. This would normally be the state when the water is at or above the desired temperature.
-- `preheating`: The hot tub is in preheat mode (heat_state = 2), warming up the water before entering full heating mode.
-- `heating`: The hot tub is actively heating the water (heat_state = 3).
+- `preheating`: The hot tub is warming up before entering full heating mode.
+- `heating`: The hot tub is actively heating the water.
 
-## Heating Time Sensors
+## Time to Target Temperature Sensors *(Experimental)*
 
-Some MSpa models (e.g. the Oslo series) report a heating rate in the device payload (`device_heat_perhour`). On these models the integration provides two additional sensors that estimate when the spa will reach its target temperature. These sensors are **not available on models that do not report a heating rate** (the value is absent or zero — for example, older Tuscany-series spas).
+> ⚠️ **These sensors are experimental.** The self-learning rate algorithm is new and has not yet been validated across a full seasonal range of conditions. Treat the estimates as a rough guide rather than a precise prediction. Feedback on accuracy is very welcome — please open an issue with your model and observations.
+
+The integration provides two sensors that estimate when the spa will reach its set-point temperature. They work in **both directions** — counting down while heating up *and* while cooling down to a lower target.
 
 | Sensor | Description |
 |---|---|
-| **Heating Time Remaining** | Minutes until the target temperature is reached |
+| **Time to Target Temperature** | Minutes until the set-point is reached |
 | **Ready At** | Absolute timestamp (clock time) when the spa should be ready |
+
+### How the rate is learned
+
+The integration learns the heating and cooling rates by observing actual temperature changes over time:
+
+- **Heating rate** — sampled while the climate entity is in the `heating` action (full-heat mode). The first valid sample is taken after the water temperature has changed by 0.5 °C (one sensor step) and at least 3 minutes have elapsed.
+- **Cooling rate** — sampled passively whenever the heater is off and the temperature is actually dropping. Same minimum step and time requirements.
+
+Rates are fed into an **exponential moving average (EMA)** so that the estimate adapts gradually as conditions change (ambient temperature, water volume, lid on/off). Outliers — for example from adding hot or cold water — are rejected before they can distort the EMA.
+
+Both sensors show as **unavailable** until at least one valid rate sample has been collected. On a typical heating cycle this means the sensors become active after the first 0.5 °C step that takes longer than 3 minutes (usually well within the first 30 minutes of heating).
+
+### Sensor attributes
+
+The **Time to Target Temperature** sensor exposes diagnostic attributes that are useful while the algorithm is still bedding in:
+
+| Attribute | Description |
+|---|---|
+| `direction` | `heating`, `cooling`, or `at_target` |
+| `effective_rate_deg_per_hour` | Rate being used for the current estimate |
+| `computed_heat_rate_deg_per_hour` | Learned EMA heating rate (`null` until first sample) |
+| `computed_cool_rate_deg_per_hour` | Learned EMA cooling rate (`null` until first sample) |
+| `device_rate_deg_per_hour` | Heating rate reported by the device itself (some models only) |
+| `current_temperature` | Current water temperature |
+| `target_temperature` | Current set-point |
+
+You can inspect these in **Developer Tools → States** to see how the algorithm is performing.
 
 ### Availability
 
-Both sensors become **unavailable** once the target temperature is reached (or the spa is already at or above target). This makes them easy to use in conditional cards and automations:
+Both sensors become **unavailable** once the target temperature is reached (or no rate data is available yet). This makes them easy to use in conditional cards and automations:
 
-**Show a card only while heating:**
+**Show a card only while heating or cooling to target:**
 ```yaml
 type: conditional
 conditions:
@@ -142,7 +171,7 @@ action:
       message: "The spa has reached its target temperature!"
 ```
 
-> **Note on accuracy**: The heating rate reported by the device is an estimate based on the spa's own algorithm. Actual heating time may vary with ambient temperature, water volume, and lid usage.
+> **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The rate is re-learned each heating or cooling cycle.
 
 ## Power and Energy Monitoring
 
@@ -324,7 +353,7 @@ Repeat the "Add Integration" flow to add additional demo devices (already-config
 - **No network calls are made** — authentication, device list, status polling and commands are all handled locally.
 - **Status polls** return realistic mock data. The water temperature drifts toward the target each poll so the climate entity looks alive.
 - **Commands work** — toggling heater/filter/bubble, adjusting the target temperature etc. update the mock state immediately and are reflected on the next poll.
-- The mock shadow payload intentionally includes the legacy `wifivertion` key so that pass-through diagnostic sensor behaviour can be verified.
+- The mock data intentionally includes some legacy diagnostic keys so that pass-through diagnostic sensor behaviour can be verified.
 
 ### Removing demo devices
 
