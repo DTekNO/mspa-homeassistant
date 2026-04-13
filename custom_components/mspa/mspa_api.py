@@ -161,6 +161,8 @@ class MSpaApiClient:
         self.model = None
         self.software_version = None
         self.product_pic_url = None
+        self.serial_number = None
+        self.mac_address = None
         self._last_status = None
         
         _LOGGER.info("DIAGNOSTIC: MSpa API initialized for region: %s, endpoint: %s", 
@@ -207,6 +209,10 @@ class MSpaApiClient:
             self.coordinator.device_alias = self.device_alias
             self.coordinator.wifi_version = device.get("wifi_version")
             self.coordinator.mcu_version = device.get("mcu_version")
+            self.serial_number = device.get("sn")
+            self.coordinator.serial_number = self.serial_number
+            self.mac_address = device.get("mac")
+            self.coordinator.mac_address = self.mac_address
             _LOGGER.info("DEMO MODE: initialised demo device '%s'", self.device_alias)
             return
 
@@ -269,6 +275,10 @@ class MSpaApiClient:
         # Store wifi/mcu versions from the device list for the firmware version sensor
         self.coordinator.wifi_version = device.get("wifi_version")
         self.coordinator.mcu_version = device.get("mcu_version")
+        self.serial_number = device.get("sn")
+        self.coordinator.serial_number = self.serial_number
+        self.mac_address = device.get("mac")
+        self.coordinator.mac_address = self.mac_address
 
     @staticmethod
     def generate_nonce(length=32):

@@ -4,6 +4,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.climate import ClimateEntity
+from homeassistant.helpers import device_registry as dr
 
 from .const import DOMAIN
 import logging
@@ -23,12 +24,20 @@ class MSpaBaseEntity:
     @property
     def device_info(self):
         name = f"MSpa {getattr(self.coordinator, 'series', 'unknown')} {getattr(self.coordinator, 'device_alias', getattr(self.coordinator, 'model', 'unknown model'))}"
+        wifi = getattr(self.coordinator, "wifi_version", None) or ""
+        mcu = getattr(self.coordinator, "mcu_version", None) or ""
+        if mcu.startswith("mcu-"):
+            mcu = mcu[4:]
+        fw_version = f"{wifi}-{mcu}" if wifi and mcu else wifi or mcu or "unknown"
         return {
             "identifiers": {(DOMAIN, getattr(self.coordinator, "device_id", "mspa_hottub"))},
+            "connections": {(dr.CONNECTION_NETWORK_MAC, getattr(self.coordinator, "mac_address"))} if getattr(self.coordinator, "mac_address", None) else set(),
             "manufacturer": "MSpa",
             "model": getattr(self.coordinator, "model", None),
+            "model_id": getattr(self.coordinator, "product_id", None) or None,
             "name": name,
-            "sw_version": getattr(self.coordinator, "software_version", "unknown"),
+            "sw_version": fw_version,
+            "serial_number": getattr(self.coordinator, "serial_number", None) or None,
         }
 
     @property

@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from homeassistant.components.sensor import SensorStateClass, SensorDeviceClass
 from homeassistant.helpers.entity import EntityCategory
-from homeassistant.const import UnitOfPower, UnitOfEnergy
+from homeassistant.const import UnitOfPower, UnitOfEnergy, UnitOfTime
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
@@ -24,6 +24,8 @@ SENSOR_TYPES = {
 # Keys in coordinator._last_data that are handled by dedicated structured sensors.
 # Everything else becomes a MSpaDiagnosticSensor automatically, using the payload
 # key name verbatim — new/changed keys appear as new entities.
+# NOTE: device_heat_perhour is intentionally NOT listed here — it still produces a
+# diagnostic sensor AND is used by MSpaHeatingTimeSensor when non-zero.
 _STRUCTURED_KEYS = frozenset({
     "water_temperature", "target_temperature",
     "heater", "filter", "bubble", "jet", "ozone", "uvc",
@@ -112,6 +114,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     async_add_entities(diagnostic_sensors)
 
+    # Heating time estimate: only available when the device reports a non-zero
+    # device_heat_perhour value (the Oslo does; older models report 0).
+    heat_rate = coordinator._last_data.get("device_heat_perhour", 0)
+    try:
+        heat_rate = int(heat_rate)
+    except (TypeError, ValueError):
+        heat_rate = 0
+    if heat_rate:
+        async_add_entities([MSpaHeatingTimeSensor(coordinator)])
+
 
 class MSpaSensor(MSpaSensorEntity):
     def __init__(self, coordinator, key):
@@ -192,6 +204,76 @@ class MSpaFirmwareVersionSensor(MSpaDiagnosticSensor):
         if wifi and mcu:
             return f"{wifi}-{mcu}"
         return wifi or mcu or None
+
+class MSpaHeatingTimeSensor(MSpaSensorEntity):
+    """Estimated minutes until the spa reaches its target temperature.
+
+    Uses the `device_heat_perhour` key from the thing-shadow payload, which the
+    Oslo (and similar models) report as heating rate in 1/10 °C per hour
+    (e.g. 14 → 1.4 °C/h).  Older models that always report 0 do not get this
+    entity — it is only registered when the first poll returns a non-zero rate.
+    """
+
+    name = "Heating Time Remaining"
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+    _attr_icon = "mdi:timer-sand"
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"mspa_heating_time_remaining_{getattr(coordinator, 'device_id', 'unknown')}"
+        self._attr_device_info = self.device_info
+
+    @property
+    def native_value(self):
+        data = self.coordinator._last_data
+
+        water_temp = data.get("water_temperature")     # Already °C (÷2 applied by coordinator)
+        target_temp = data.get("target_temperature")   # Already °C
+        heat_rate_raw = data.get("device_heat_perhour", 0)
+
+        try:
+            heat_rate_raw = int(heat_rate_raw)
+        except (TypeError, ValueError):
+            return None
+
+        if not heat_rate_raw:
+            return None
+
+        try:
+            water_temp = float(water_temp)
+            target_temp = float(target_temp)
+        except (TypeError, ValueError):
+            return None
+
+        degrees_remaining = target_temp - water_temp
+        if degrees_remaining <= 0:
+            return 0
+
+        # heat_rate_raw is in 1/10 °C per hour → convert to °C/h
+        rate_per_hour = heat_rate_raw / 10.0
+        if rate_per_hour <= 0:
+            return None
+
+        minutes_remaining = (degrees_remaining / rate_per_hour) * 60
+        return round(minutes_remaining)
+
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator._last_data
+        heat_rate_raw = data.get("device_heat_perhour", 0)
+        try:
+            rate_per_hour = int(heat_rate_raw) / 10.0
+        except (TypeError, ValueError):
+            rate_per_hour = None
+        return {
+            "heating_rate_deg_per_hour": rate_per_hour,
+            "current_temperature": data.get("water_temperature"),
+            "target_temperature": data.get("target_temperature"),
+        }
+
 
 # This sensor is used to indicate faults or warnings in the MSpa system.
 # It checks the "fault" key in the coordinator's last data.
