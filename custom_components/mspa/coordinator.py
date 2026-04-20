@@ -1,6 +1,6 @@
 """DataUpdateCoordinator for MSpa integration."""
 import logging
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
 
 from typing import Any, Dict
@@ -99,6 +99,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._cool_last_temp: float | None = None     # °C at last accepted sample
         self._cool_last_time: float | None = None     # monotonic seconds at last sample
 
+        # Anchor for time-to-target sensors.
+        # Set whenever water_temperature or target_temperature changes so both
+        # sensors can count down to a fixed future timestamp between temp steps.
+        self.temp_anchor_time: datetime | None = None    # UTC datetime of last temp/target change
+        self.temp_anchor_temp: float | None = None       # water_temp at that moment
+        self.temp_anchor_target: float | None = None     # target_temp at that moment
+
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""
         try:
@@ -131,6 +138,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             self._last_data = transformed_data
             _LOGGER.debug("Fetched MSpa transformed data: %s", transformed_data)
+
+            # Update anchor whenever water_temp or target_temp changes.
+            # Sensors use (anchor_time, anchor_temp, anchor_target) to count down
+            # between temperature steps without needing per-sensor state.
+            new_temp   = transformed_data.get("water_temperature")
+            new_target = transformed_data.get("target_temperature")
+            if new_temp != self.temp_anchor_temp or new_target != self.temp_anchor_target:
+                self.temp_anchor_time   = datetime.now(timezone.utc)
+                self.temp_anchor_temp   = new_temp
+                self.temp_anchor_target = new_target
 
             # --- Observed heating rate tracking ---
             # Only sample when in full-heat mode to avoid preheat / cooling skew.

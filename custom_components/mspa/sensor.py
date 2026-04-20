@@ -289,7 +289,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
         self._near_target = False  # hysteresis state
 
     def _compute_minutes(self) -> int | None:
-        """Return minutes to target, or None when unavailable (no rate / near target)."""
+        """Return minutes to target, counting down each poll. None when unavailable."""
         data = self.coordinator._last_data
         try:
             water_temp = float(data.get("water_temperature"))
@@ -302,13 +302,23 @@ class MSpaTempReachSensor(MSpaSensorEntity):
             self._near_target = True
         elif abs(degrees_remaining) >= _NEAR_TARGET_ACTIVATE:
             self._near_target = False
-        # else: in the dead band — keep current state
         if self._near_target:
             return None
         rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
         if rate_per_hour is None:
             return None
-        return round((abs(degrees_remaining) / rate_per_hour) * 60)
+        # Compute ready_at from coordinator anchor, then derive remaining minutes.
+        # The anchor was set when temp/target last changed, so this counts down
+        # between temperature steps without per-sensor state.
+        anchor_time   = self.coordinator.temp_anchor_time
+        anchor_temp   = self.coordinator.temp_anchor_temp
+        anchor_target = self.coordinator.temp_anchor_target
+        if anchor_time is None or anchor_temp is None or anchor_target is None:
+            return None
+        anchor_minutes = (abs(anchor_target - anchor_temp) / rate_per_hour) * 60
+        ready_at = anchor_time + timedelta(minutes=anchor_minutes)
+        remaining = (ready_at - datetime.now(timezone.utc)).total_seconds() / 60
+        return max(0, round(remaining))
 
     @property
     def available(self):
@@ -378,7 +388,7 @@ class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
         self._near_target = False  # hysteresis state
 
     def _compute_ready_at(self):
-        """Return ready-at timestamp, or None when unavailable (no rate / near target)."""
+        """Return ready-at timestamp, counting down each poll. None when unavailable."""
         data = self.coordinator._last_data
         try:
             water_temp = float(data.get("water_temperature"))
@@ -391,14 +401,18 @@ class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
             self._near_target = True
         elif abs(degrees_remaining) >= _NEAR_TARGET_ACTIVATE:
             self._near_target = False
-        # else: in the dead band — keep current state
         if self._near_target:
             return None
         rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
         if rate_per_hour is None:
             return None
-        minutes_remaining = (abs(degrees_remaining) / rate_per_hour) * 60
-        return datetime.now(timezone.utc) + timedelta(minutes=minutes_remaining)
+        anchor_time   = self.coordinator.temp_anchor_time
+        anchor_temp   = self.coordinator.temp_anchor_temp
+        anchor_target = self.coordinator.temp_anchor_target
+        if anchor_time is None or anchor_temp is None or anchor_target is None:
+            return None
+        anchor_minutes = (abs(anchor_target - anchor_temp) / rate_per_hour) * 60
+        return anchor_time + timedelta(minutes=anchor_minutes)
 
     @property
     def available(self):
