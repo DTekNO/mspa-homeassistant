@@ -203,15 +203,6 @@ class MSpaFirmwareVersionSensor(MSpaDiagnosticSensor):
             return f"{wifi}-{mcu}"
         return wifi or mcu or None
 
-# Hysteresis thresholds for the temperature-reach sensors.
-# Sensors become unavailable when the water reaches within _NEAR_TARGET_DEACTIVATE
-# of the target, and only re-activate once the gap exceeds _NEAR_TARGET_ACTIVATE
-# (one full 0.5 °C sensor step).  This prevents flickering during thermostat
-# cycling while still showing the sensors during genuine heating/cooling runs.
-_NEAR_TARGET_DEACTIVATE = 0.25  # °C  — deactivate (effectively "exactly at target")
-_NEAR_TARGET_ACTIVATE   = 0.5   # °C  — reactivate (one full sensor step away)
-
-
 def _effective_heat_rate(coordinator) -> float | None:
     """Return the best available heating rate in °C/h.
 
@@ -286,30 +277,20 @@ class MSpaTempReachSensor(MSpaSensorEntity):
         super().__init__(coordinator)
         self._attr_unique_id = f"mspa_time_to_target_{getattr(coordinator, 'device_id', 'unknown')}"
         self._attr_device_info = self.device_info
-        self._near_target = False  # hysteresis state
 
     def _compute_minutes(self) -> int | None:
         """Return minutes to target, counting down each poll. None when unavailable."""
+        if self.coordinator.near_target:
+            return None
         data = self.coordinator._last_data
         try:
             water_temp = float(data.get("water_temperature"))
             target_temp = float(data.get("target_temperature"))
         except (TypeError, ValueError):
             return None
-        degrees_remaining = target_temp - water_temp
-        # Hysteresis: deactivate when at target, reactivate only after a full sensor step
-        if abs(degrees_remaining) < _NEAR_TARGET_DEACTIVATE:
-            self._near_target = True
-        elif abs(degrees_remaining) >= _NEAR_TARGET_ACTIVATE:
-            self._near_target = False
-        if self._near_target:
-            return None
         rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
         if rate_per_hour is None:
             return None
-        # Compute ready_at from coordinator anchor, then derive remaining minutes.
-        # The anchor was set when temp/target last changed, so this counts down
-        # between temperature steps without per-sensor state.
         anchor_time   = self.coordinator.temp_anchor_time
         anchor_temp   = self.coordinator.temp_anchor_temp
         anchor_target = self.coordinator.temp_anchor_target
@@ -385,23 +366,16 @@ class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
         super().__init__(coordinator)
         self._attr_unique_id = f"mspa_heating_ready_at_{getattr(coordinator, 'device_id', 'unknown')}"
         self._attr_device_info = self.device_info
-        self._near_target = False  # hysteresis state
 
     def _compute_ready_at(self):
         """Return ready-at timestamp, counting down each poll. None when unavailable."""
+        if self.coordinator.near_target:
+            return None
         data = self.coordinator._last_data
         try:
             water_temp = float(data.get("water_temperature"))
             target_temp = float(data.get("target_temperature"))
         except (TypeError, ValueError):
-            return None
-        degrees_remaining = target_temp - water_temp
-        # Hysteresis: deactivate when at target, reactivate only after a full sensor step
-        if abs(degrees_remaining) < _NEAR_TARGET_DEACTIVATE:
-            self._near_target = True
-        elif abs(degrees_remaining) >= _NEAR_TARGET_ACTIVATE:
-            self._near_target = False
-        if self._near_target:
             return None
         rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
         if rate_per_hour is None:

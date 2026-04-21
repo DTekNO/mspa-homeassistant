@@ -11,6 +11,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.helpers.storage import Store
 from homeassistant.const import UnitOfTemperature
 
 from .const import (
@@ -99,12 +100,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._cool_last_temp: float | None = None     # °C at last accepted sample
         self._cool_last_time: float | None = None     # monotonic seconds at last sample
 
+        # Persist learned rates across reloads / HA restarts.
+        device_id = self.config.get("device_id", "unknown")
+        self._rates_store = Store(hass, version=1, key=f"{DOMAIN}_rates_{device_id}")
+        self._rates_loaded = False  # load once on first poll
+
         # Anchor for time-to-target sensors.
         # Set whenever water_temperature or target_temperature changes so both
         # sensors can count down to a fixed future timestamp between temp steps.
         self.temp_anchor_time: datetime | None = None    # UTC datetime of last temp/target change
         self.temp_anchor_temp: float | None = None       # water_temp at that moment
         self.temp_anchor_target: float | None = None     # target_temp at that moment
+
+        # Shared hysteresis flag for the time-to-target sensors.
+        # Deactivates when within _NEAR_TARGET_DEACTIVATE of target;
+        # reactivates only when _NEAR_TARGET_ACTIVATE away, preventing flicker.
+        self.near_target: bool = False
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""
@@ -148,6 +159,30 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.temp_anchor_time   = datetime.now(timezone.utc)
                 self.temp_anchor_temp   = new_temp
                 self.temp_anchor_target = new_target
+
+            # Update shared near-target hysteresis flag.
+            _NEAR_TARGET_DEACTIVATE = 0.25
+            _NEAR_TARGET_ACTIVATE   = 0.5
+            if new_temp is not None and new_target is not None:
+                delta = abs(new_target - new_temp)
+                if delta < _NEAR_TARGET_DEACTIVATE:
+                    self.near_target = True
+                elif delta >= _NEAR_TARGET_ACTIVATE:
+                    self.near_target = False
+            # else: no temp data — leave flag unchanged
+
+            # Load persisted rates on the very first poll after startup/reload.
+            if not self._rates_loaded:
+                self._rates_loaded = True
+                stored = await self._rates_store.async_load()
+                if stored:
+                    self.computed_heat_rate = stored.get("heat_rate")
+                    self.computed_cool_rate = stored.get("cool_rate")
+                    _LOGGER.debug(
+                        "Restored rates from storage: heat=%.3f cool=%.3f",
+                        self.computed_heat_rate or 0,
+                        self.computed_cool_rate or 0,
+                    )
 
             # --- Observed heating rate tracking ---
             # Only sample when in full-heat mode to avoid preheat / cooling skew.
@@ -242,7 +277,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self._cool_last_temp = None
                 self._cool_last_time = None
             # --- end rate tracking ---
-            
+
+            # Persist updated rates so they survive reloads and HA restarts.
+            await self._rates_store.async_save({
+                "heat_rate": self.computed_heat_rate,
+                "cool_rate": self.computed_cool_rate,
+            })
+
             # Check for power cycle and restore state if enabled
             await self._check_power_cycle(transformed_data)
             
