@@ -174,6 +174,52 @@ action:
 
 > **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The rate is re-learned each heating or cooling cycle.
 
+### Dashboard card example
+
+The example below uses the [Mushroom Template Card](https://github.com/piitaya/lovelace-mushroom) (available via HACS). It shows a countdown while heating or cooling, switches to "Your spa is ready!" once the target is reached, and hides itself entirely when the sensors are unavailable (heater off, no rate learned yet).
+
+Replace `mspa_oslouvc` with your own entity name prefix.
+
+```yaml
+type: custom:mushroom-template-card
+primary: >-
+  {% set mins = states('sensor.mspa_oslouvc_time_to_target_temperature') | int(-1) %}
+  {%- if mins <= 5 -%}
+    Your spa is ready!
+  {%- else -%}
+    Spa ready at
+  {%- endif %}
+secondary: >-
+  {% set t = states('sensor.mspa_oslouvc_ready_at') %}
+  {% set mins = states('sensor.mspa_oslouvc_time_to_target_temperature') | int(-1) %}
+  {%- if mins > 5 and t not in ('unavailable', 'unknown') -%}
+    {{ (as_datetime(t) | as_local).strftime('%H:%M') }}
+  {%- endif %}
+features_position: bottom
+icon: mdi:hot-tub
+visibility:
+  - condition: state
+    entity: sensor.mspa_oslouvc_time_to_target_temperature
+    state_not: unavailable
+color: >-
+  {% set d = state_attr('sensor.mspa_oslouvc_time_to_target_temperature', 'direction') %}
+  {% set mins = states('sensor.mspa_oslouvc_time_to_target_temperature') | int(-1) %}
+  {% if mins <= 5 %}
+    green
+  {% elif d == 'heating' %}
+    red
+  {% elif d == 'cooling' %}
+    blue
+  {% else %}
+    green
+  {% endif %}
+grid_options:
+  columns: full
+  rows: 1
+```
+
+![example card](img/spa_ready_card.png)
+
 ## Power and Energy Monitoring
 
 The integration provides comprehensive power and energy monitoring for your hot tub, including individual component sensors and total power/energy tracking that can be added directly to Home Assistant's Energy dashboard.
