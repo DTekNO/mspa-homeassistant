@@ -281,7 +281,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
     def _compute_minutes(self) -> int | None:
         """Return minutes to target, counting down each poll. None when unavailable."""
         if self.coordinator.near_target:
-            return None
+            return 0
         data = self.coordinator._last_data
         try:
             water_temp = float(data.get("water_temperature"))

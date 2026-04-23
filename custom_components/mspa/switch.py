@@ -57,7 +57,7 @@ class MSpaFilterSwitch(MSpaFeatureSwitch):
 
 class MSpaJetSwitch(MSpaFeatureSwitch):
     feature = "jet"
-    # icon = "mdi:jet"  # Uncomment if you want an icon
+    icon = "mdi:turbine"
     name = "Jet"
 
 class MSpaOzoneSwitch(MSpaFeatureSwitch):
