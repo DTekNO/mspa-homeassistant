@@ -256,6 +256,78 @@ def _effective_rate(coordinator, water_temp: float, target_temp: float) -> float
     return None
 
 
+# Temperature thresholds separating the three heating-rate buckets (°C).
+# Bucket 0: T < _HEAT_BUCKET_T1  — cold, minimal thermal losses, fastest heating
+# Bucket 1: _HEAT_BUCKET_T1 ≤ T < _HEAT_BUCKET_T2
+# Bucket 2: T ≥ _HEAT_BUCKET_T2  — near setpoint, highest losses, slowest heating
+_HEAT_BUCKET_T1 = 30.0
+_HEAT_BUCKET_T2 = 37.0
+
+
+def _heat_bucket_rate(coordinator, temp: float) -> float | None:
+    """Return the best heating rate (°C/h) learned at a given water temperature.
+
+    Tries the EMA for the bucket containing `temp`, then adjacent buckets,
+    then the global flat EMA / device-reported fallback.  For buckets that have
+    not yet received observations in the current heating session, the result is
+    scaled by the session scalar (derived from the first-observed bucket) to
+    reflect today's ambient conditions.
+    """
+    buckets = getattr(coordinator, "heat_rate_buckets", [None, None, None])
+    session_scalar = getattr(coordinator, "_session_scalar", 1.0)
+    fresh = getattr(coordinator, "_session_fresh_buckets", set())
+    idx = 0 if temp < _HEAT_BUCKET_T1 else 1 if temp < _HEAT_BUCKET_T2 else 2
+    rate = None
+    source_idx = None
+    if buckets[idx] is not None and buckets[idx] > 0:
+        rate = buckets[idx]
+        source_idx = idx
+    else:
+        for offset in (1, -1, 2, -2):
+            i = idx + offset
+            if 0 <= i < 3 and buckets[i] is not None and buckets[i] > 0:
+                rate = buckets[i]
+                source_idx = i
+                break
+    if rate is None:
+        rate = _effective_heat_rate(coordinator)
+    # Only apply the session scalar to buckets not yet observed this session.
+    # Fresh buckets already contain today's real data — scaling them would be
+    # double-counting the ambient correction.
+    if rate is not None and session_scalar != 1.0 and source_idx not in fresh:
+        return rate * session_scalar
+    return rate
+
+
+def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) -> float | None:
+    """Heating time (minutes) from `from_temp` to `to_temp` using per-bucket rates.
+
+    Splits the range at bucket boundaries so each segment uses the rate observed
+    at that temperature range, naturally modelling how thermal losses slow heating
+    as the water approaches the setpoint.  Returns None if no rate data is
+    available for any required segment.
+    """
+    if from_temp >= to_temp:
+        return 0.0
+    boundaries = [from_temp]
+    for threshold in (_HEAT_BUCKET_T1, _HEAT_BUCKET_T2):
+        if from_temp < threshold < to_temp:
+            boundaries.append(threshold)
+    boundaries.append(to_temp)
+    total_minutes = 0.0
+    for i in range(len(boundaries) - 1):
+        seg_start = boundaries[i]
+        seg_end   = boundaries[i + 1]
+        delta = seg_end - seg_start
+        if delta <= 0:
+            continue
+        rate = _heat_bucket_rate(coordinator, seg_start)
+        if rate is None or rate <= 0:
+            return None
+        total_minutes += (delta / rate) * 60.0
+    return total_minutes
+
+
 class MSpaTempReachSensor(MSpaSensorEntity):
     """Estimated minutes until the spa reaches its target temperature.
 
@@ -282,21 +354,24 @@ class MSpaTempReachSensor(MSpaSensorEntity):
         """Return minutes to target, counting down each poll. None when unavailable."""
         if self.coordinator.near_target:
             return 0
-        data = self.coordinator._last_data
-        try:
-            water_temp = float(data.get("water_temperature"))
-            target_temp = float(data.get("target_temperature"))
-        except (TypeError, ValueError):
-            return None
-        rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
-        if rate_per_hour is None:
-            return None
         anchor_time   = self.coordinator.temp_anchor_time
         anchor_temp   = self.coordinator.temp_anchor_temp
         anchor_target = self.coordinator.temp_anchor_target
         if anchor_time is None or anchor_temp is None or anchor_target is None:
             return None
-        anchor_minutes = (abs(anchor_target - anchor_temp) / rate_per_hour) * 60
+        if anchor_target > anchor_temp:
+            # Heating — integrate across temperature buckets for accuracy
+            anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, self.coordinator)
+        elif anchor_target < anchor_temp:
+            # Cooling — use flat EMA (no buckets for cooling)
+            rate = _effective_cool_rate(self.coordinator)
+            if rate is None:
+                return None
+            anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
+        else:
+            return 0
+        if anchor_minutes is None:
+            return None
         ready_at = anchor_time + timedelta(minutes=anchor_minutes)
         remaining = (ready_at - datetime.now(timezone.utc)).total_seconds() / 60
         return max(0, round(remaining))
@@ -338,11 +413,17 @@ class MSpaTempReachSensor(MSpaSensorEntity):
         except (TypeError, ValueError):
             device_rate = None
 
+        buckets = getattr(self.coordinator, "heat_rate_buckets", [None, None, None])
+        session_scalar = getattr(self.coordinator, "_session_scalar", 1.0)
         return {
             "direction": direction,
             "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
             "computed_heat_rate_deg_per_hour": round(computed_heat, 3) if computed_heat is not None else None,
             "computed_cool_rate_deg_per_hour": round(computed_cool, 3) if computed_cool is not None else None,
+            "heat_rate_cold_deg_per_hour": round(buckets[0], 3) if buckets[0] is not None else None,
+            "heat_rate_mid_deg_per_hour": round(buckets[1], 3) if buckets[1] is not None else None,
+            "heat_rate_hot_deg_per_hour": round(buckets[2], 3) if buckets[2] is not None else None,
+            "session_condition_scalar": round(session_scalar, 3),
             "device_rate_deg_per_hour": device_rate,
             "current_temperature": water_temp,
             "target_temperature": target_temp,
@@ -371,21 +452,22 @@ class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
         """Return ready-at timestamp, counting down each poll. None when unavailable."""
         if self.coordinator.near_target:
             return None
-        data = self.coordinator._last_data
-        try:
-            water_temp = float(data.get("water_temperature"))
-            target_temp = float(data.get("target_temperature"))
-        except (TypeError, ValueError):
-            return None
-        rate_per_hour = _effective_rate(self.coordinator, water_temp, target_temp)
-        if rate_per_hour is None:
-            return None
         anchor_time   = self.coordinator.temp_anchor_time
         anchor_temp   = self.coordinator.temp_anchor_temp
         anchor_target = self.coordinator.temp_anchor_target
         if anchor_time is None or anchor_temp is None or anchor_target is None:
             return None
-        anchor_minutes = (abs(anchor_target - anchor_temp) / rate_per_hour) * 60
+        if anchor_target > anchor_temp:
+            anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, self.coordinator)
+        elif anchor_target < anchor_temp:
+            rate = _effective_cool_rate(self.coordinator)
+            if rate is None:
+                return None
+            anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
+        else:
+            return None
+        if anchor_minutes is None:
+            return None
         return anchor_time + timedelta(minutes=anchor_minutes)
 
     @property

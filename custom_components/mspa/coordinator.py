@@ -94,6 +94,26 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._rate_last_temp: float | None = None     # °C at last accepted sample
         self._rate_last_time: float | None = None     # monotonic seconds at last sample
 
+        # Per-temperature-bucket heating EMAs for improved long-range accuracy.
+        # Bucket 0: T < 30°C  (cold water, minimal thermal losses — fastest)
+        # Bucket 1: 30 ≤ T < 37°C
+        # Bucket 2: T ≥ 37°C  (near setpoint, highest losses — slowest)
+        # Each bucket is updated only by observations made in that temperature
+        # range, so predictions integrate the actual observed slow-down curve.
+        self.heat_rate_buckets: list[float | None] = [None, None, None]
+
+        # Session-level ambient condition scalar.
+        # Reset to 1.0 at the start of each genuine heating session (delta > 2°C).
+        # Updated from the *first bucket* to receive observations in each session
+        # (whichever bucket that is — not hardcoded to bucket-0), comparing
+        # observed rate vs the stored base rate for that bucket.  Applied to
+        # bucket predictions for segments not yet observed this session so that
+        # a cold/warm day is reflected immediately across the whole estimate.
+        self._session_scalar: float = 1.0
+        self._session_scalar_bucket: int | None = None  # which bucket drives the scalar this session
+        self._session_fresh_buckets: set[int] = set()   # buckets that received data this session
+        self._heat_was_active: bool = False  # previous-poll heater state
+
         # Computed passive cooling rate (°C/h, stored positive).
         # Sampled when the heater is off and water temperature is actually dropping.
         self.computed_cool_rate: float | None = None  # °C/h, None until enough data
@@ -116,6 +136,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Deactivates when within _NEAR_TARGET_DEACTIVATE of target;
         # reactivates only when _NEAR_TARGET_ACTIVATE away, preventing flicker.
         self.near_target: bool = False
+
+        # Prediction accuracy tracker.  Records the initial estimate at the
+        # start of a big heating session and compares it to the actual elapsed
+        # time when the target is reached.  Results are logged at INFO level
+        # (grep for "PREDICTION_RESULT") and the last 10 are persisted in the
+        # rates store under the key "prediction_history".
+        self._prediction: dict | None = None   # active prediction (see _start_prediction)
+        self._prediction_history: list[dict] = []  # last 10 completed predictions
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""
@@ -160,6 +188,59 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.temp_anchor_temp   = new_temp
                 self.temp_anchor_target = new_target
 
+            # --- Prediction accuracy tracking ---
+            # Start tracking when a big heating session begins (delta > 2°C).
+            if (new_temp is not None and new_target is not None
+                    and new_target > new_temp
+                    and (new_target - new_temp) > 2.0
+                    and self._prediction is None):
+                # Lazy import to reuse the sensor's segmented calculation.
+                from .sensor import _segmented_heating_minutes
+                est_minutes = _segmented_heating_minutes(new_temp, new_target, self)
+                if est_minutes is not None:
+                    self._prediction = {
+                        "start_time": datetime.now(timezone.utc).isoformat(),
+                        "start_temp": new_temp,
+                        "target_temp": new_target,
+                        "estimated_minutes": round(est_minutes, 1),
+                        "session_scalar": self._session_scalar,
+                    }
+                    _LOGGER.info(
+                        "PREDICTION_START: %.1f°C → %.1f°C, estimated %.0f min (scalar=%.3f)",
+                        new_temp, new_target, est_minutes, self._session_scalar,
+                    )
+
+            # Finish tracking when near_target is newly reached.
+            if (self.near_target and self._prediction is not None):
+                start_iso = self._prediction["start_time"]
+                start_dt = datetime.fromisoformat(start_iso)
+                actual_minutes = (datetime.now(timezone.utc) - start_dt).total_seconds() / 60
+                est = self._prediction["estimated_minutes"]
+                error_minutes = actual_minutes - est
+                error_pct = (error_minutes / actual_minutes * 100) if actual_minutes > 0 else 0
+                result = {
+                    **self._prediction,
+                    "actual_minutes": round(actual_minutes, 1),
+                    "error_minutes": round(error_minutes, 1),
+                    "error_percent": round(error_pct, 1),
+                    "end_time": datetime.now(timezone.utc).isoformat(),
+                }
+                self._prediction_history.append(result)
+                self._prediction_history = self._prediction_history[-10:]  # keep last 10
+                self._prediction = None
+                _LOGGER.info(
+                    "PREDICTION_RESULT: %.1f°C → %.1f°C | estimated %.0f min, actual %.0f min | error %+.0f min (%+.1f%%)",
+                    result["start_temp"], result["target_temp"],
+                    est, actual_minutes, error_minutes, error_pct,
+                )
+            # Clear prediction if target changed mid-session.
+            if (self._prediction is not None
+                    and new_target is not None
+                    and new_target != self._prediction.get("target_temp")):
+                _LOGGER.debug("Prediction cancelled — target changed from %.1f to %.1f",
+                              self._prediction.get("target_temp", 0), new_target)
+                self._prediction = None
+
             # Update shared near-target hysteresis flag.
             _NEAR_TARGET_DEACTIVATE = 0.25
             _NEAR_TARGET_ACTIVATE   = 0.5
@@ -178,6 +259,31 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if stored:
                     self.computed_heat_rate = stored.get("heat_rate")
                     self.computed_cool_rate = stored.get("cool_rate")
+                    stored_buckets = stored.get("heat_rate_buckets")
+                    self._prediction_history = stored.get("prediction_history", [])
+                    if isinstance(stored_buckets, list) and len(stored_buckets) == 3:
+                        save_ts = stored.get("bucket_save_ts")
+                        if save_ts is not None:
+                            days_elapsed = (time.time() - save_ts) / 86400
+                            # Decay each bucket toward the global flat EMA over time so
+                            # stale seasonal rates don't anchor predictions indefinitely.
+                            # 0.98/day: ~75% weight at 14 days, ~55% at 30 days, floor 0.4.
+                            decay = max(0.4, 0.98 ** days_elapsed)
+                            global_rate = self.computed_heat_rate
+                            self.heat_rate_buckets = [
+                                (float(b) * decay + global_rate * (1 - decay))
+                                if b is not None and global_rate is not None
+                                else (float(b) * decay if b is not None else None)
+                                for b in stored_buckets
+                            ]
+                            _LOGGER.debug(
+                                "Loaded buckets: %.1f days old, decay=%.3f → %s",
+                                days_elapsed, decay, self.heat_rate_buckets,
+                            )
+                        else:
+                            self.heat_rate_buckets = [
+                                float(b) if b is not None else None for b in stored_buckets
+                            ]
                     _LOGGER.debug(
                         "Restored rates from storage: heat=%.3f cool=%.3f",
                         self.computed_heat_rate or 0,
@@ -196,6 +302,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             curr_temp = transformed_data.get("water_temperature")
             heat_state = transformed_data.get("heat_state")
             now_mono = time.monotonic()
+
+            # Detect new heating session.  Only reset the session scalar when
+            # the heater newly engages AND delta-to-target is large (> 2°C).
+            # This avoids false resets from thermostat cycling near setpoint.
+            heater_now_active = (heat_state == 3)
+            if heater_now_active and not self._heat_was_active:
+                delta_to_target = abs((new_target or 0) - (curr_temp or 0))
+                if delta_to_target > 2.0:
+                    self._session_scalar = 1.0
+                    self._session_scalar_bucket = None
+                    self._session_fresh_buckets = set()
+                    _LOGGER.debug(
+                        "MSpa: new heating session (delta %.1f°C) — session scalar reset",
+                        delta_to_target,
+                    )
+            self._heat_was_active = heater_now_active
 
             if heat_state == 3 and curr_temp is not None:
                 if self._rate_last_temp is None:
@@ -217,9 +339,32 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                     _EMA_ALPHA * rate
                                     + (1 - _EMA_ALPHA) * self.computed_heat_rate
                                 )
+                            # Also update the temperature bucket for this observation.
+                            # _rate_last_temp is the *start* temperature of the step.
+                            _bi = 0 if self._rate_last_temp < 30.0 else 1 if self._rate_last_temp < 37.0 else 2
+                            _bp = self.heat_rate_buckets[_bi]
+                            self.heat_rate_buckets[_bi] = (
+                                _EMA_ALPHA * rate + (1 - _EMA_ALPHA) * _bp
+                            ) if _bp is not None else rate
+                            self._session_fresh_buckets.add(_bi)
+                            # The first bucket to receive data in this session becomes
+                            # the scalar source.  Its observations are compared against
+                            # the stored base to derive an ambient-condition factor that
+                            # is applied to all *other* buckets that haven't been
+                            # observed yet this session.
+                            if self._session_scalar_bucket is None and _bp is not None:
+                                self._session_scalar_bucket = _bi
+                            if _bi == self._session_scalar_bucket and _bp is not None:
+                                ratio = max(0.5, min(2.0, rate / _bp))
+                                self._session_scalar = 0.4 * ratio + 0.6 * self._session_scalar
+                                _LOGGER.debug(
+                                    "Session scalar → %.3f (bucket[%d] ratio actual/base=%.3f)",
+                                    self._session_scalar, _bi, ratio,
+                                )
                             _LOGGER.debug(
-                                "Heat rate sample %.3f °C/h (EMA → %.3f °C/h)",
+                                "Heat rate sample %.3f °C/h (EMA → %.3f °C/h, bucket[%d] → %.3f °C/h)",
                                 rate, self.computed_heat_rate,
+                                _bi, self.heat_rate_buckets[_bi],
                             )
                         else:
                             _LOGGER.debug(
@@ -282,6 +427,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             await self._rates_store.async_save({
                 "heat_rate": self.computed_heat_rate,
                 "cool_rate": self.computed_cool_rate,
+                "heat_rate_buckets": self.heat_rate_buckets,
+                "bucket_save_ts": time.time(),
+                "prediction_history": self._prediction_history,
             })
 
             # Check for power cycle and restore state if enabled
