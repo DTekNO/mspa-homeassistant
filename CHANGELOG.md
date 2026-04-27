@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Temperature-bucketed heating rates** — the heating rate EMA is now tracked in three temperature buckets (cold: <30 °C, mid: 30–37 °C, hot: ≥37 °C). Time-to-target estimates integrate each segment at its own observed rate, significantly improving accuracy for long heating runs (e.g. 20 °C → 40 °C)
+- **Session condition scalar** — on each new heating session the first observed bucket is compared against its stored rate to derive an ambient-condition correction factor. This factor is applied to segments not yet observed, so a hot or cold day is reflected across the whole estimate immediately
+- **Prediction accuracy tracker** — at the start of every large heating session (delta > 2 °C), the initial time-to-target estimate is recorded. When the target is reached, the actual elapsed time is logged alongside the estimate. Results are logged at INFO level (grep for `PREDICTION_RESULT`) and the last 10 are persisted across restarts
+- **Time-decay on stored bucket rates** — bucket EMAs loaded from storage decay toward the global flat rate over time (0.98/day, floor 40 %), preventing stale seasonal data from anchoring predictions indefinitely
+- Four new sensor attributes: `heat_rate_cold_deg_per_hour`, `heat_rate_mid_deg_per_hour`, `heat_rate_hot_deg_per_hour`, `session_condition_scalar`
+
+---
+
 ## [3.0.1] - 2026-04-23
 
 ### Fixed

@@ -128,6 +128,28 @@ Rates are fed into an **exponential moving average (EMA)** so that the estimate 
 
 Both sensors show as **unavailable** until at least one valid rate sample has been collected. On a typical heating cycle this means the sensors become active after the first 0.5 °C step that takes longer than 3 minutes (usually well within the first 30 minutes of heating).
 
+#### Temperature-bucketed heating rates
+
+A spa heats faster when the water is cold (small thermal losses) and slower near the set-point (large losses). To model this, the integration tracks the heating rate in three temperature buckets:
+
+| Bucket | Range | Typical behaviour |
+|---|---|---|
+| Cold | < 30 °C | Fastest — minimal heat loss to surroundings |
+| Mid | 30–37 °C | Moderate — increasing loss as water warms |
+| Hot | ≥ 37 °C | Slowest — highest thermal loss, near set-point |
+
+When estimating time-to-target, the remaining temperature delta is split at the 30 °C and 37 °C boundaries, and each segment is calculated at its own observed rate. This gives substantially more accurate estimates for long heating runs (e.g. 20 °C → 40 °C) compared to using a single flat rate.
+
+#### Ambient condition correction
+
+At the start of each new heating session (heater engages with delta > 2 °C), a **session scalar** is reset to 1.0. As soon as the first temperature bucket receives a live observation, the measured rate is compared to the stored base rate for that bucket to derive a ratio. This ratio is smoothed and applied to all other bucket predictions that have not yet been observed in the current session.
+
+The effect is that a particularly cold or warm day is reflected across the whole estimate within the first few minutes of heating, even before the spa has passed through all three temperature ranges.
+
+#### Time-decay on stored rates
+
+Bucket rates loaded from storage are decayed toward the global flat EMA over time (≈ 2 % per day, floor 40 % weight). This prevents stale seasonal data — for example rates learned in summer — from anchoring winter predictions indefinitely. After about two weeks of inactivity, stored buckets carry roughly 75 % of their original weight.
+
 ### Sensor attributes
 
 The **Time to Target Temperature** sensor exposes diagnostic attributes that are useful while the algorithm is still bedding in:
@@ -138,6 +160,10 @@ The **Time to Target Temperature** sensor exposes diagnostic attributes that are
 | `effective_rate_deg_per_hour` | Rate being used for the current estimate |
 | `computed_heat_rate_deg_per_hour` | Learned EMA heating rate (`null` until first sample) |
 | `computed_cool_rate_deg_per_hour` | Learned EMA cooling rate (`null` until first sample) |
+| `heat_rate_cold_deg_per_hour` | Bucket rate for < 30 °C (`null` until first sample in range) |
+| `heat_rate_mid_deg_per_hour` | Bucket rate for 30–37 °C |
+| `heat_rate_hot_deg_per_hour` | Bucket rate for ≥ 37 °C |
+| `session_condition_scalar` | Current ambient-condition correction factor (1.0 = neutral) |
 | `device_rate_deg_per_hour` | Heating rate reported by the device itself (some models only) |
 | `current_temperature` | Current water temperature |
 | `target_temperature` | Current set-point |
@@ -172,7 +198,7 @@ action:
       message: "The spa has reached its target temperature!"
 ```
 
-> **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The rate is re-learned each heating or cooling cycle.
+> **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The rate is re-learned each heating or cooling cycle. The integration automatically tracks prediction accuracy — grep for `PREDICTION_RESULT` in the Home Assistant log to see estimated vs actual times for each heating session.
 
 ### Dashboard card example
 
