@@ -30,6 +30,22 @@ from homeassistant.const import ATTR_STATE, ATTR_TEMPERATURE
 
 _LOGGER = logging.getLogger(__name__)
 
+# Maps coordinator _pending_changes keys (transformed names) to their raw API
+# command dict keys.  Used to prune _pending_raw_command incrementally as each
+# pending change is confirmed, so that a retry payload never re-sends fields
+# that were already acknowledged by the spa.
+_PENDING_TO_RAW_KEY: dict[str, str] = {
+    "heater": "heater_state",
+    "filter": "filter_state",
+    "jet": "jet_state",
+    "ozone": "ozone_state",
+    "uvc": "uvc_state",
+    "bubble": "bubble_state",
+    "bubble_level": "bubble_level",
+    "target_temperature": "temperature_setting",
+    "temperature_unit": "temperature_unit",
+}
+
 # Status payload keys that are explicitly restructured/renamed in transformed_data.
 # All other keys from the payload are passed through verbatim.
 _STRUCTURED_STATUS_KEYS = frozenset({
@@ -460,16 +476,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         "uvc": "set_uvc_state",
     }
 
-    # Map of transformed feature names to raw API command keys (for command retry)
-    FEATURE_RAW_KEY_MAP = {
-        "heater": "heater_state",
-        "filter": "filter_state",
-        # "bubble" is handled specially in set_feature_state (requires both bubble_state and bubble_level)
-        "jet": "jet_state",
-        "ozone": "ozone_state",
-        "uvc": "uvc_state",
-    }
-
     async def set_feature_state(self, feature: str, state: str) -> None:
         """Set a feature state using the API map."""
         _LOGGER.debug(f"Setting MSpa feature {feature} to {state}")
@@ -486,11 +492,20 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 raw_command = {"bubble_state": numerical_state, "bubble_level": bubble_level}
             else:
                 await api_method(numerical_state)
-                raw_key = self.FEATURE_RAW_KEY_MAP.get(feature)
+                raw_key = _PENDING_TO_RAW_KEY.get(feature)
                 raw_command = {raw_key: numerical_state} if raw_key else {}
 
+            # Turning off the filter also forces the heater off (handled in the API
+            # layer).  Register that implicit change here so _pending_changes stays
+            # consistent and the retry payload doesn't accidentally resend a stale
+            # heater-on command from an earlier user action.
+            expected_changes = {feature: state}
+            if feature == "filter" and numerical_state == 0:
+                expected_changes["heater"] = "off"
+                raw_command["heater_state"] = 0
+
             # Enable rapid polling to quickly detect the change
-            self._enable_rapid_polling({feature: state}, raw_command)
+            self._enable_rapid_polling(expected_changes, raw_command)
             await self.async_request_refresh()
         except Exception as err:
             _LOGGER.error("Failed to set %s to %s: %s", feature, state, str(err))
@@ -594,13 +609,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("Pending change confirmed: %s = %s", key, expected_value)
                     confirmed.append(key)
 
-            # Remove confirmed changes
+            # Remove confirmed changes and prune their raw-command counterparts so
+            # that the retry payload never re-sends already-acknowledged fields.
             for key in confirmed:
                 del self._pending_changes[key]
+                raw_key = _PENDING_TO_RAW_KEY.get(key)
+                if raw_key:
+                    self._pending_raw_command.pop(raw_key, None)
 
             if confirmed and not self._pending_changes:
                 # All pending changes confirmed — reset retry state
-                self._pending_raw_command.clear()
                 self._command_retry_count = 0
 
             # Continue rapid polling if there are still pending changes
