@@ -464,6 +464,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     FEATURE_RAW_KEY_MAP = {
         "heater": "heater_state",
         "filter": "filter_state",
+        # "bubble" is handled specially in set_feature_state (requires both bubble_state and bubble_level)
         "jet": "jet_state",
         "ozone": "ozone_state",
         "uvc": "uvc_state",

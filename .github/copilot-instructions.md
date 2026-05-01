@@ -65,12 +65,12 @@ User action (switch toggle, temperature set, etc.)
             → _send_device_command_locked()
                 → throttle.acquire()         (rate limiter, 0.4 s spacing)
                 → HTTP POST /api/device/command
-                → poll up to 5×3s for confirmation
                 → (if filter_state=0) _send_device_command_locked(heater_state=0)  ← DIRECT call, not set_heater_state()
                 → coordinator.async_request_refresh()
             → release api_lock
-        → _enable_rapid_polling(...)
+        → _enable_rapid_polling(expected_changes, raw_command)
         → async_request_refresh()
+        # coordinator _check_adaptive_polling() then polls 1s, retries once after 15s if unconfirmed
 ```
 
 ### Shared auth store (`hass.data["mspa_auth"]`)
