@@ -462,15 +462,26 @@ class MSpaApiClient:
             return await self._send_device_command_locked(desired_dict, True)
 
         # Poll for expected state if provided
+        confirmed = False
         for _ in range(5):
             await asyncio.sleep(3)
             status = await self.get_hot_tub_status()
             if all(status.get(k) == v for k, v in desired_dict.items()):
                 self._last_status = status  # Cache latest status
+                confirmed = True
                 break
+        if not confirmed:
+            _LOGGER.warning(
+                "send_device_command: device did not confirm %s after 5 polls",
+                desired_dict,
+            )
 
-        if (desired_dict.get("filter_state")) == 0:
-            await self.set_heater_state(0)
+        # Turning off the filter must also turn off the heater.
+        # Call the inner method directly — we already hold api_lock and calling
+        # set_heater_state() → send_device_command() would deadlock trying to
+        # re-acquire the non-reentrant asyncio.Lock.
+        if desired_dict.get("filter_state") == 0:
+            await self._send_device_command_locked({"heater_state": 0})
 
         # Trigger coordinator refresh after command completes
         await self.coordinator.async_request_refresh()

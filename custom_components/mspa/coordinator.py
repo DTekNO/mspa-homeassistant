@@ -575,13 +575,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 should_rapid_poll = True
                 _LOGGER.debug(f"Still waiting for changes: {self._pending_changes}")
         
-        # Check if we're in preheat mode (heat_state == 2)
+        # Track heat state transitions for logging only.
+        # Preheat does not trigger rapid polling — a multi-minute preheat cycle does not
+        # need sub-second resolution and the old behaviour caused repeated 15-call/15s
+        # bursts every ~75s during preheat.
         current_heat_state = data.get("heat_state")
-        if current_heat_state == 2 and data.get("heater") == "on":
-            _LOGGER.debug("Preheat mode detected, enabling rapid polling")
-            should_rapid_poll = True
-        
-        # Track heat state transitions
         if self._last_heat_state != current_heat_state:
             _LOGGER.debug(f"Heat state changed: {self._last_heat_state} -> {current_heat_state}")
             self._last_heat_state = current_heat_state

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Deadlock when turning filter off** — turning the filter switch off in Home Assistant caused the integration to hang indefinitely. The filter-off command internally also turns the heater off as a safety measure, but that nested call tried to re-acquire an `asyncio.Lock` already held by the outer command, deadlocking both. Fixed by calling the inner command method directly, bypassing the lock acquisition.
+- **Rapid polling storm during preheat** — while the spa was in preheat mode (`heat_state = 2`), the coordinator triggered a burst of 15 API calls over 15 seconds, then returned to the normal 60-second interval, then immediately triggered another burst on the next poll. This cycled indefinitely for the entire preheat period (typically 2–5 minutes), generating ~20× more API traffic than needed. Preheat now uses the standard 60-second polling interval; rapid polling is reserved for confirming immediate user-initiated commands only.
+- **Silent command confirmation failure** — if the spa did not reflect a commanded state change within the 5-poll / 15-second confirmation window, the failure was silently ignored. A warning is now logged identifying which command went unconfirmed.
+
 ### Added
 - **Temperature-bucketed heating rates** — the heating rate EMA is now tracked in three temperature buckets (cold: <30 °C, mid: 30–37 °C, hot: ≥37 °C). Time-to-target estimates integrate each segment at its own observed rate, significantly improving accuracy for long heating runs (e.g. 20 °C → 40 °C)
 - **Session condition scalar** — on each new heating session the first observed bucket is compared against its stored rate to derive an ambient-condition correction factor. This factor is applied to segments not yet observed, so a hot or cold day is reflected across the whole estimate immediately
