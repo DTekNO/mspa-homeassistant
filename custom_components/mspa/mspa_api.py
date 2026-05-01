@@ -468,8 +468,12 @@ class MSpaApiClient:
         if desired_dict.get("filter_state") == 0:
             await self._send_device_command_locked({"heater_state": 0})
 
-        # Trigger coordinator refresh after command completes
-        await self.coordinator.async_request_refresh()
+        # Do NOT call coordinator.async_request_refresh() here.
+        # The coordinator command methods (_set_feature_state, set_temperature, etc.)
+        # call _enable_rapid_polling() first and then async_request_refresh().
+        # Calling it here (while api_lock is still held) fires a poll *before*
+        # _pending_changes is populated, so that first poll runs blind and cannot
+        # confirm the change.  The coordinator-level refresh is the only one needed.
 
         return response
 
