@@ -79,7 +79,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             device_id=self.config.get("device_id"),
         )
         self._rapid_poll_until = None  # Timestamp when to stop rapid polling
-        self._pending_changes = {}  # Track expected changes
+        self._pending_changes = {}  # Track expected changes (transformed keys)
+        self._pending_raw_command = {}  # Raw API payload for retrying unconfirmed commands
+        self._command_retry_count = 0  # Number of retries attempted for current command
         self._last_heat_state = None  # Track heat state changes
         self._last_is_online = None  # Track power on/off transitions
         self._saved_state = {}  # Store state before power off for restoration
@@ -458,6 +460,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         "uvc": "set_uvc_state",
     }
 
+    # Map of transformed feature names to raw API command keys (for command retry)
+    FEATURE_RAW_KEY_MAP = {
+        "heater": "heater_state",
+        "filter": "filter_state",
+        "jet": "jet_state",
+        "ozone": "ozone_state",
+        "uvc": "uvc_state",
+    }
+
     async def set_feature_state(self, feature: str, state: str) -> None:
         """Set a feature state using the API map."""
         _LOGGER.debug(f"Setting MSpa feature {feature} to {state}")
@@ -466,15 +477,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 raise ValueError("State must be 'on' or 'off'")
             numerical_state = 1 if state.lower() == "on" else 0
             api_method = getattr(self.api, self.FEATURE_API_MAP[feature])
-            
-            # Bubble state requires level parameter
+
+            # Build raw command for potential retry
             if feature == "bubble":
-                await api_method(numerical_state, self._last_data.get("bubble_level", 1))
+                bubble_level = self._last_data.get("bubble_level", 1)
+                await api_method(numerical_state, bubble_level)
+                raw_command = {"bubble_state": numerical_state, "bubble_level": bubble_level}
             else:
                 await api_method(numerical_state)
-            
+                raw_key = self.FEATURE_RAW_KEY_MAP.get(feature)
+                raw_command = {raw_key: numerical_state} if raw_key else {}
+
             # Enable rapid polling to quickly detect the change
-            self._enable_rapid_polling({feature: state})
+            self._enable_rapid_polling({feature: state}, raw_command)
             await self.async_request_refresh()
         except Exception as err:
             _LOGGER.error("Failed to set %s to %s: %s", feature, state, str(err))
@@ -486,9 +501,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             temperature = service.data.get(ATTR_TEMPERATURE)
             _LOGGER.debug("Setting temperature to %s", temperature)
             await self.api.set_temperature_setting(temperature)
-            
+
             # Enable rapid polling to quickly detect the change
-            self._enable_rapid_polling({"target_temperature": temperature})
+            self._enable_rapid_polling(
+                {"target_temperature": temperature},
+                {"temperature_setting": int(temperature * 2)},
+            )
             await self.async_request_refresh()
         except Exception as err:
             _LOGGER.error("Failed to set temperature: %s", str(err))
@@ -500,10 +518,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             bubble_state = service.data.get(ATTR_STATE)
             _LOGGER.debug("Setting bubble state to %s", bubble_state)
             numerical_state = 1 if bubble_state.lower() == "on" else 0
-            await self.api.set_bubble_state(numerical_state, self._last_data.get("bubble_level", 1))
-            
+            bubble_level = self._last_data.get("bubble_level", 1)
+            await self.api.set_bubble_state(numerical_state, bubble_level)
+
             # Enable rapid polling to quickly detect the change
-            self._enable_rapid_polling({"bubble": bubble_state})
+            self._enable_rapid_polling(
+                {"bubble": bubble_state},
+                {"bubble_state": numerical_state, "bubble_level": bubble_level},
+            )
             await self.async_request_refresh()
         except Exception as err:
             _LOGGER.error("Failed to set bubble state: %s", str(err))
@@ -514,9 +536,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             bubble_level = service.data.get("level")
             _LOGGER.debug("Setting bubble level to %s", bubble_level)
             await self.api.set_bubble_level(bubble_level)
-            
+
             # Enable rapid polling to quickly detect the change
-            self._enable_rapid_polling({"bubble_level": bubble_level})
+            self._enable_rapid_polling(
+                {"bubble_level": bubble_level},
+                {"bubble_level": bubble_level},
+            )
             await self.async_request_refresh()
         except Exception as err:
             _LOGGER.error("Failed to set bubble level: %s", str(err))
@@ -527,9 +552,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         try:
             _LOGGER.debug("Setting temperature unit to %s", unit)
             await self.api.set_temperature_unit(unit)
-            
+
             # Enable rapid polling to quickly detect the change
-            self._enable_rapid_polling({"temperature_unit": unit})
+            self._enable_rapid_polling(
+                {"temperature_unit": unit},
+                {"temperature_unit": unit},
+            )
             await self.async_request_refresh()
         except Exception as err:
             _LOGGER.error("Failed to set temperature unit: %s", str(err))
@@ -552,44 +580,75 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
     async def _check_adaptive_polling(self, data: dict) -> None:
         """Check if we should enable or disable rapid polling."""
-        from datetime import datetime
         import time
-        
+
         current_time = time.time()
         should_rapid_poll = False
-        
+
         # Check if any pending changes have been confirmed
         if self._pending_changes:
             confirmed = []
             for key, expected_value in list(self._pending_changes.items()):
                 if data.get(key) == expected_value:
-                    _LOGGER.debug(f"Pending change confirmed: {key} = {expected_value}")
+                    _LOGGER.debug("Pending change confirmed: %s = %s", key, expected_value)
                     confirmed.append(key)
-            
+
             # Remove confirmed changes
             for key in confirmed:
                 del self._pending_changes[key]
-            
+
+            if confirmed and not self._pending_changes:
+                # All pending changes confirmed — reset retry state
+                self._pending_raw_command.clear()
+                self._command_retry_count = 0
+
             # Continue rapid polling if there are still pending changes
             if self._pending_changes:
                 should_rapid_poll = True
-                _LOGGER.debug(f"Still waiting for changes: {self._pending_changes}")
-        
+                _LOGGER.debug("Still waiting for changes: %s", self._pending_changes)
+
         # Track heat state transitions for logging only.
         # Preheat does not trigger rapid polling — a multi-minute preheat cycle does not
         # need sub-second resolution and the old behaviour caused repeated 15-call/15s
         # bursts every ~75s during preheat.
         current_heat_state = data.get("heat_state")
         if self._last_heat_state != current_heat_state:
-            _LOGGER.debug(f"Heat state changed: {self._last_heat_state} -> {current_heat_state}")
+            _LOGGER.debug("Heat state changed: %s -> %s", self._last_heat_state, current_heat_state)
             self._last_heat_state = current_heat_state
-        
+
         # Check if rapid poll timeout has expired
         if self._rapid_poll_until and current_time > self._rapid_poll_until:
-            _LOGGER.debug("Rapid poll timeout expired, returning to normal polling")
-            self._rapid_poll_until = None
-            should_rapid_poll = False
-        
+            if self._pending_changes:
+                if self._command_retry_count < 1 and self._pending_raw_command:
+                    # One retry: resend the original command and re-open the window
+                    self._command_retry_count += 1
+                    _LOGGER.warning(
+                        "Spa did not confirm %s — retrying command %s (attempt %d)",
+                        self._pending_changes,
+                        self._pending_raw_command,
+                        self._command_retry_count,
+                    )
+                    try:
+                        await self.api.send_device_command(self._pending_raw_command)
+                    except Exception as err:
+                        _LOGGER.error("Command retry failed: %s", err)
+                    self._rapid_poll_until = current_time + RAPID_POLL_TIMEOUT
+                    should_rapid_poll = True
+                else:
+                    # Retries exhausted — give up and return to normal polling
+                    _LOGGER.warning(
+                        "Spa did not confirm changes after retry: %s — giving up",
+                        self._pending_changes,
+                    )
+                    self._pending_changes.clear()
+                    self._pending_raw_command.clear()
+                    self._command_retry_count = 0
+                    self._rapid_poll_until = None
+                    should_rapid_poll = False
+            else:
+                self._rapid_poll_until = None
+                should_rapid_poll = False
+
         # Adjust polling interval
         if should_rapid_poll and not self._rapid_poll_until:
             # Start rapid polling
@@ -601,15 +660,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._rapid_poll_until = None
             self.update_interval = timedelta(seconds=DEFAULT_SCAN_INTERVAL)
             _LOGGER.info("Returned to normal polling (60s interval)")
-    
-    def _enable_rapid_polling(self, expected_changes: dict) -> None:
+
+    def _enable_rapid_polling(self, expected_changes: dict, raw_command: dict = None) -> None:
         """Enable rapid polling and track expected changes."""
         import time
-        
+
         self._pending_changes.update(expected_changes)
+        if raw_command:
+            self._pending_raw_command.update(raw_command)
+            self._command_retry_count = 0  # Reset retry count for new command
         self._rapid_poll_until = time.time() + RAPID_POLL_TIMEOUT
         self.update_interval = timedelta(seconds=RAPID_SCAN_INTERVAL)
-        _LOGGER.debug(f"Rapid polling enabled, waiting for changes: {expected_changes}")
+        _LOGGER.debug("Rapid polling enabled, waiting for changes: %s", expected_changes)
     
     async def _check_power_cycle(self, data: dict) -> None:
         """Check for power cycle and restore state if enabled.
