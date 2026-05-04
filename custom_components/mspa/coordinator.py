@@ -163,8 +163,35 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._prediction: dict | None = None   # active prediction (see _start_prediction)
         self._prediction_history: list[dict] = []  # last 10 completed predictions
 
+        # Historical bias correction for heating predictions.
+        # Derived from average error_percent in prediction_history.
+        # A value > 1.0 means predictions have been too optimistic (actual > estimated).
+        self.prediction_bias: float = 1.0
+
         # Extended device detail fetched once on init from /api/device/detail/
         self.device_detail: dict = {}
+
+    def _update_prediction_bias(self) -> None:
+        """Recompute prediction_bias from prediction_history.
+
+        Uses the mean of actual_minutes/estimated_minutes across all history
+        entries.  Clamped to [0.5, 2.0] to avoid runaway corrections from bad data.
+        """
+        if not self._prediction_history:
+            self.prediction_bias = 1.0
+            return
+        ratios = []
+        for p in self._prediction_history:
+            est = p.get("estimated_minutes", 0)
+            actual = p.get("actual_minutes", 0)
+            if est > 0 and actual > 0:
+                ratios.append(actual / est)
+        if ratios:
+            avg = sum(ratios) / len(ratios)
+            self.prediction_bias = max(0.5, min(2.0, avg))
+        else:
+            self.prediction_bias = 1.0
+        _LOGGER.debug("Prediction bias updated: %.3f (from %d samples)", self.prediction_bias, len(ratios))
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""
@@ -219,16 +246,23 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 from .sensor import _segmented_heating_minutes
                 est_minutes = _segmented_heating_minutes(new_temp, new_target, self)
                 if est_minutes is not None:
+                    # Store the raw estimate (without bias) for history tracking.
+                    # The bias is derived from raw vs actual, so storing the biased
+                    # value would create a feedback loop that erases the correction.
+                    raw_minutes = est_minutes / self.prediction_bias if self.prediction_bias else est_minutes
                     self._prediction = {
                         "start_time": datetime.now(timezone.utc).isoformat(),
                         "start_temp": new_temp,
                         "target_temp": new_target,
-                        "estimated_minutes": round(est_minutes, 1),
+                        "estimated_minutes": round(raw_minutes, 1),
+                        "estimated_minutes_biased": round(est_minutes, 1),
+                        "prediction_bias": round(self.prediction_bias, 3),
                         "session_scalar": self._session_scalar,
                     }
                     _LOGGER.info(
-                        "PREDICTION_START: %.1f°C → %.1f°C, estimated %.0f min (scalar=%.3f)",
-                        new_temp, new_target, est_minutes, self._session_scalar,
+                        "PREDICTION_START: %.1f°C → %.1f°C, raw=%.0f min, biased=%.0f min (bias=%.3f, scalar=%.3f)",
+                        new_temp, new_target, raw_minutes, est_minutes,
+                        self.prediction_bias, self._session_scalar,
                     )
 
             # Finish tracking when near_target is newly reached.
@@ -249,10 +283,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self._prediction_history.append(result)
                 self._prediction_history = self._prediction_history[-10:]  # keep last 10
                 self._prediction = None
+                self._update_prediction_bias()
                 _LOGGER.info(
-                    "PREDICTION_RESULT: %.1f°C → %.1f°C | estimated %.0f min, actual %.0f min | error %+.0f min (%+.1f%%)",
+                    "PREDICTION_RESULT: %.1f°C → %.1f°C | estimated %.0f min, actual %.0f min | error %+.0f min (%+.1f%%) | bias=%.3f",
                     result["start_temp"], result["target_temp"],
-                    est, actual_minutes, error_minutes, error_pct,
+                    est, actual_minutes, error_minutes, error_pct, self.prediction_bias,
                 )
             # Clear prediction if target changed mid-session.
             if (self._prediction is not None
@@ -282,6 +317,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self.computed_cool_rate = stored.get("cool_rate")
                     stored_buckets = stored.get("heat_rate_buckets")
                     self._prediction_history = stored.get("prediction_history", [])
+                    self._update_prediction_bias()
                     if isinstance(stored_buckets, list) and len(stored_buckets) == 3:
                         save_ts = stored.get("bucket_save_ts")
                         if save_ts is not None:

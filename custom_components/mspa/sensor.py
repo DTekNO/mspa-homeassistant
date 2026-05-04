@@ -308,7 +308,8 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
 
     Splits the range at bucket boundaries so each segment uses the rate observed
     at that temperature range, naturally modelling how thermal losses slow heating
-    as the water approaches the setpoint.  Returns None if no rate data is
+    as the water approaches the setpoint.  Applies a historical bias correction
+    derived from past prediction accuracy.  Returns None if no rate data is
     available for any required segment.
     """
     if from_temp >= to_temp:
@@ -329,7 +330,9 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
         if rate is None or rate <= 0:
             return None
         total_minutes += (delta / rate) * 60.0
-    return total_minutes
+    # Apply historical bias correction from past prediction accuracy.
+    bias = getattr(coordinator, "prediction_bias", 1.0)
+    return total_minutes * bias
 
 
 class MSpaTempReachSensor(MSpaSensorEntity):
@@ -419,6 +422,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
 
         buckets = getattr(self.coordinator, "heat_rate_buckets", [None, None, None])
         session_scalar = getattr(self.coordinator, "_session_scalar", 1.0)
+        prediction_bias = getattr(self.coordinator, "prediction_bias", 1.0)
         return {
             "direction": direction,
             "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
@@ -428,6 +432,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
             "heat_rate_mid_deg_per_hour": round(buckets[1], 3) if buckets[1] is not None else None,
             "heat_rate_hot_deg_per_hour": round(buckets[2], 3) if buckets[2] is not None else None,
             "session_condition_scalar": round(session_scalar, 3),
+            "prediction_bias": round(prediction_bias, 3),
             "device_rate_deg_per_hour": device_rate,
             "current_temperature": water_temp,
             "target_temperature": target_temp,
@@ -748,4 +753,12 @@ class MSpaDeviceDetailSensor(MSpaSensorEntity):
             return {}
         # Expose the interesting fields; skip certificate (very long) and redundant IDs
         skip_keys = {"certificate", "enduser_id", "app_id"}
-        return {k: v for k, v in detail.items() if k not in skip_keys}
+        attrs = {}
+        for k, v in detail.items():
+            if k in skip_keys:
+                continue
+            # Convert unix epoch to ISO timestamp
+            if k == "warning_updated_at" and isinstance(v, (int, float)) and v > 0:
+                v = datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+            attrs[k] = v
+        return attrs
