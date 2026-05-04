@@ -122,6 +122,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
         MSpaTempReachReadyAtSensor(coordinator),
     ])
 
+    # Device detail sensor — exposes extended info from /api/device/detail/ as attributes
+    if getattr(coordinator, "device_detail", None):
+        async_add_entities([MSpaDeviceDetailSensor(coordinator)])
+
 
 class MSpaSensor(MSpaSensorEntity):
     def __init__(self, coordinator, key):
@@ -713,4 +717,35 @@ class MSpaTotalEnergySensor(MSpaSensorEntity, RestoreEntity):
             "current_power_w": current_power,
             "last_reset": None,  # Total increasing sensor, never resets
         }
-        
+
+
+class MSpaDeviceDetailSensor(MSpaSensorEntity):
+    """Diagnostic sensor exposing extended device detail from /api/device/detail/.
+
+    Fetched once on init. The state is the product series; all other detail
+    fields are exposed as attributes so you can inspect them from the UI.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_name = "Device Detail"
+        self._attr_unique_id = f"mspa_device_detail_{getattr(coordinator, 'device_id', 'unknown')}"
+        self._attr_device_info = self.device_info
+        self._attr_icon = "mdi:information-slab-circle-outline"
+
+    @property
+    def native_value(self):
+        detail = getattr(self.coordinator, "device_detail", None) or {}
+        return detail.get("product_series") or getattr(self.coordinator, "series", None)
+
+    @property
+    def extra_state_attributes(self):
+        detail = getattr(self.coordinator, "device_detail", None) or {}
+        if not detail:
+            return {}
+        # Expose the interesting fields; skip certificate (very long) and redundant IDs
+        skip_keys = {"certificate", "enduser_id", "app_id"}
+        return {k: v for k, v in detail.items() if k not in skip_keys}

@@ -163,6 +163,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._prediction: dict | None = None   # active prediction (see _start_prediction)
         self._prediction_history: list[dict] = []  # last 10 completed predictions
 
+        # Extended device detail fetched once on init from /api/device/detail/
+        self.device_detail: dict = {}
+
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""
         try:
