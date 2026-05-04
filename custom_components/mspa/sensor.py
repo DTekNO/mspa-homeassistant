@@ -122,6 +122,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
         MSpaTempReachReadyAtSensor(coordinator),
     ])
 
+    # Device detail sensor — exposes extended info from /api/device/detail/ as attributes
+    if getattr(coordinator, "device_detail", None):
+        async_add_entities([MSpaDeviceDetailSensor(coordinator)])
+
 
 class MSpaSensor(MSpaSensorEntity):
     def __init__(self, coordinator, key):
@@ -304,7 +308,8 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
 
     Splits the range at bucket boundaries so each segment uses the rate observed
     at that temperature range, naturally modelling how thermal losses slow heating
-    as the water approaches the setpoint.  Returns None if no rate data is
+    as the water approaches the setpoint.  Applies a historical bias correction
+    derived from past prediction accuracy.  Returns None if no rate data is
     available for any required segment.
     """
     if from_temp >= to_temp:
@@ -325,7 +330,9 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
         if rate is None or rate <= 0:
             return None
         total_minutes += (delta / rate) * 60.0
-    return total_minutes
+    # Apply historical bias correction from past prediction accuracy.
+    bias = getattr(coordinator, "prediction_bias", 1.0)
+    return total_minutes * bias
 
 
 class MSpaTempReachSensor(MSpaSensorEntity):
@@ -415,6 +422,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
 
         buckets = getattr(self.coordinator, "heat_rate_buckets", [None, None, None])
         session_scalar = getattr(self.coordinator, "_session_scalar", 1.0)
+        prediction_bias = getattr(self.coordinator, "prediction_bias", 1.0)
         return {
             "direction": direction,
             "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
@@ -424,6 +432,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
             "heat_rate_mid_deg_per_hour": round(buckets[1], 3) if buckets[1] is not None else None,
             "heat_rate_hot_deg_per_hour": round(buckets[2], 3) if buckets[2] is not None else None,
             "session_condition_scalar": round(session_scalar, 3),
+            "prediction_bias": round(prediction_bias, 3),
             "device_rate_deg_per_hour": device_rate,
             "current_temperature": water_temp,
             "target_temperature": target_temp,
@@ -713,4 +722,43 @@ class MSpaTotalEnergySensor(MSpaSensorEntity, RestoreEntity):
             "current_power_w": current_power,
             "last_reset": None,  # Total increasing sensor, never resets
         }
-        
+
+
+class MSpaDeviceDetailSensor(MSpaSensorEntity):
+    """Diagnostic sensor exposing extended device detail from /api/device/detail/.
+
+    Fetched once on init. The state is the product series; all other detail
+    fields are exposed as attributes so you can inspect them from the UI.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_name = "Device Detail"
+        self._attr_unique_id = f"mspa_device_detail_{getattr(coordinator, 'device_id', 'unknown')}"
+        self._attr_device_info = self.device_info
+        self._attr_icon = "mdi:information-slab-circle-outline"
+
+    @property
+    def native_value(self):
+        detail = getattr(self.coordinator, "device_detail", None) or {}
+        return detail.get("product_series") or getattr(self.coordinator, "series", None)
+
+    @property
+    def extra_state_attributes(self):
+        detail = getattr(self.coordinator, "device_detail", None) or {}
+        if not detail:
+            return {}
+        # Expose the interesting fields; skip certificate (very long) and redundant IDs
+        skip_keys = {"certificate", "enduser_id", "app_id"}
+        attrs = {}
+        for k, v in detail.items():
+            if k in skip_keys:
+                continue
+            # Convert unix epoch to ISO timestamp
+            if k == "warning_updated_at" and isinstance(v, (int, float)) and v > 0:
+                v = datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+            attrs[k] = v
+        return attrs

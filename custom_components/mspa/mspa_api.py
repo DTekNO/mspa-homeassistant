@@ -280,6 +280,10 @@ class MSpaApiClient:
         self.mac_address = device.get("mac")
         self.coordinator.mac_address = self.mac_address
 
+        # Fetch extended device detail (once on init, non-critical)
+        detail = await self.get_device_detail()
+        self.coordinator.device_detail = detail
+
     @staticmethod
     def generate_nonce(length=32):
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -461,19 +465,19 @@ class MSpaApiClient:
             token = await self.authenticate()
             return await self._send_device_command_locked(desired_dict, True)
 
-        # Poll for expected state if provided
-        for _ in range(5):
-            await asyncio.sleep(3)
-            status = await self.get_hot_tub_status()
-            if all(status.get(k) == v for k, v in desired_dict.items()):
-                self._last_status = status  # Cache latest status
-                break
+        # Turning off the filter must also turn off the heater.
+        # Call the inner method directly — we already hold api_lock and calling
+        # set_heater_state() → send_device_command() would deadlock trying to
+        # re-acquire the non-reentrant asyncio.Lock.
+        if desired_dict.get("filter_state") == 0:
+            await self._send_device_command_locked({"heater_state": 0})
 
-        if (desired_dict.get("filter_state")) == 0:
-            await self.set_heater_state(0)
-
-        # Trigger coordinator refresh after command completes
-        await self.coordinator.async_request_refresh()
+        # Do NOT call coordinator.async_request_refresh() here.
+        # The coordinator command methods (_set_feature_state, set_temperature, etc.)
+        # call _enable_rapid_polling() first and then async_request_refresh().
+        # Calling it here (while api_lock is still held) fires a poll *before*
+        # _pending_changes is populated, so that first poll runs blind and cannot
+        # confirm the change.  The coordinator-level refresh is the only one needed.
 
         return response
 
@@ -539,6 +543,38 @@ class MSpaApiClient:
         data = response["data"]
         _LOGGER.debug("get_hot_tub_status %s", data)
         return data
+
+    async def get_device_detail(self, retry=False):
+        """Fetch extended device detail from /api/device/detail/ (called once on init)."""
+        if self.is_demo:
+            return {
+                "product_image": "",
+                "product_sub_image": "",
+                "detail_image": "",
+                "device_uuid": "demo-uuid-0000",
+                "warning": "00",
+                "warning_updated_at": 0,
+                "country": "NO",
+                "service_region": "eu-central-1",
+            }
+        headers = self._build_headers(self.get_former_token())
+        url = f"{self.base_url}/api/device/detail/"
+        params = {"device_id": self.device_id}
+        try:
+            await self._throttle.acquire()
+            response = await self.hass.async_add_executor_job(
+                functools.partial(requests.get, url, headers=headers, params=params, timeout=30)
+            )
+            response_json = response.json()
+            data = response_json.get("data")
+            if not data and not retry:
+                await self.authenticate()
+                return await self.get_device_detail(True)
+            _LOGGER.debug("get_device_detail: %s", data)
+            return data or {}
+        except Exception as e:
+            _LOGGER.warning("get_device_detail failed (non-critical): %s", e)
+            return {}
 
     async def get_device_list(self, retry=False):
         headers = self._build_headers(self.get_former_token())
