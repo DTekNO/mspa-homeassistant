@@ -17,8 +17,13 @@ from homeassistant.const import UnitOfTemperature
 from .const import (
     DOMAIN,
     DEFAULT_SCAN_INTERVAL,
+    IDLE_SCAN_INTERVAL,
+    ACTIVE_SCAN_INTERVAL,
     RAPID_SCAN_INTERVAL,
     RAPID_POLL_TIMEOUT,
+    EXTERNAL_CHANGE_INTERVAL,
+    EXTERNAL_CHANGE_TIMEOUT,
+    IDLE_STABLE_THRESHOLD,
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
@@ -95,6 +100,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             device_id=self.config.get("device_id"),
         )
         self._rapid_poll_until = None  # Timestamp when to stop rapid polling
+        self._external_change_until = None  # Timestamp when to stop external-change polling
         self._pending_changes = {}  # Track expected changes (transformed keys)
         self._pending_raw_command = {}  # Raw API payload for retrying unconfirmed commands
         self._command_retry_count = 0  # Number of retries attempted for current command
@@ -102,6 +108,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._last_is_online = None  # Track power on/off transitions
         self._saved_state = {}  # Store state before power off for restoration
         self._last_snapshot = {}  # Store last known state for change detection
+        self._last_state_change_time: float = 0.0  # monotonic time of last detected state change
         self._power_cycle_detected = False  # Flag to track if we just detected a power cycle
 
         # Computed heating rate tracking (°C / hour, exponential moving average).
@@ -634,13 +641,20 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     set_uvc = handle_feature_service
 
     async def _check_adaptive_polling(self, data: dict) -> None:
-        """Check if we should enable or disable rapid polling."""
-        import time
+        """3-tier adaptive polling: idle → active → rapid.
 
-        current_time = time.time()
-        should_rapid_poll = False
+        Tiers:
+          RAPID (1s, 15s window)  — after sending a command, to confirm it took effect
+          EXTERNAL (5s, 15s)     — after detecting an unexpected state change (panel/app)
+          ACTIVE (30s)           — something is running (heater, filter, bubble, jet)
+          IDLE (120s)            — nothing running and state stable for 10+ minutes
 
-        # Check if any pending changes have been confirmed
+        Transitions between active/idle happen automatically based on device state.
+        Rapid/external are time-boxed bursts that fall back to active/idle when done.
+        """
+        current_time = time.monotonic()
+
+        # --- Phase 1: Handle pending command confirmations (rapid tier) ---
         if self._pending_changes:
             confirmed = []
             for key, expected_value in list(self._pending_changes.items()):
@@ -648,8 +662,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("Pending change confirmed: %s = %s", key, expected_value)
                     confirmed.append(key)
 
-            # Remove confirmed changes and prune their raw-command counterparts so
-            # that the retry payload never re-sends already-acknowledged fields.
             for key in confirmed:
                 del self._pending_changes[key]
                 raw_key = _PENDING_TO_RAW_KEY.get(key)
@@ -657,28 +669,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._pending_raw_command.pop(raw_key, None)
 
             if confirmed and not self._pending_changes:
-                # All pending changes confirmed — reset retry state
                 self._command_retry_count = 0
 
-            # Continue rapid polling if there are still pending changes
-            if self._pending_changes:
-                should_rapid_poll = True
-                _LOGGER.debug("Still waiting for changes: %s", self._pending_changes)
-
-        # Track heat state transitions for logging only.
-        # Preheat does not trigger rapid polling — a multi-minute preheat cycle does not
-        # need sub-second resolution and the old behaviour caused repeated 15-call/15s
-        # bursts every ~75s during preheat.
-        current_heat_state = data.get("heat_state")
-        if self._last_heat_state != current_heat_state:
-            _LOGGER.debug("Heat state changed: %s -> %s", self._last_heat_state, current_heat_state)
-            self._last_heat_state = current_heat_state
-
-        # Check if rapid poll timeout has expired
-        if self._rapid_poll_until and current_time > self._rapid_poll_until:
+        # --- Phase 2: Check rapid poll timeout / retry ---
+        if self._rapid_poll_until and time.time() > self._rapid_poll_until:
             if self._pending_changes:
                 if self._command_retry_count < 1 and self._pending_raw_command:
-                    # One retry: resend the original command and re-open the window
                     self._command_retry_count += 1
                     _LOGGER.warning(
                         "Spa did not confirm %s — retrying command %s (attempt %d)",
@@ -690,10 +686,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         await self.api.send_device_command(self._pending_raw_command)
                     except Exception as err:
                         _LOGGER.error("Command retry failed: %s", err)
-                    self._rapid_poll_until = current_time + RAPID_POLL_TIMEOUT
-                    should_rapid_poll = True
+                    self._rapid_poll_until = time.time() + RAPID_POLL_TIMEOUT
                 else:
-                    # Retries exhausted — give up and return to normal polling
                     _LOGGER.warning(
                         "Spa did not confirm changes after retry: %s — giving up",
                         self._pending_changes,
@@ -702,35 +696,88 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._pending_raw_command.clear()
                     self._command_retry_count = 0
                     self._rapid_poll_until = None
-                    should_rapid_poll = False
             else:
                 self._rapid_poll_until = None
-                should_rapid_poll = False
 
-        # Adjust polling interval
-        if should_rapid_poll and not self._rapid_poll_until:
-            # Start rapid polling
-            self._rapid_poll_until = current_time + RAPID_POLL_TIMEOUT
-            self.update_interval = timedelta(seconds=RAPID_SCAN_INTERVAL)
-            _LOGGER.info("Enabled rapid polling (1s interval) for up to 15 seconds")
-        elif not should_rapid_poll and self.update_interval.total_seconds() < DEFAULT_SCAN_INTERVAL:
-            # Return to normal polling
-            self._rapid_poll_until = None
-            self.update_interval = timedelta(seconds=DEFAULT_SCAN_INTERVAL)
-            _LOGGER.info("Returned to normal polling (60s interval)")
+        # --- Phase 3: Check external-change timeout ---
+        if self._external_change_until and time.time() > self._external_change_until:
+            self._external_change_until = None
+
+        # --- Phase 4: Detect unexpected external state changes ---
+        # Compare control keys against last snapshot; if something changed that
+        # we didn't command, someone used the physical panel or MSpa Link app.
+        _CONTROL_KEYS = ("heater", "filter", "bubble", "jet", "ozone", "uvc", "target_temperature")
+        if self._last_snapshot and not self._pending_changes:
+            for key in _CONTROL_KEYS:
+                old_val = self._last_snapshot.get(key)
+                new_val = data.get(key)
+                if old_val is not None and new_val is not None and old_val != new_val:
+                    _LOGGER.info(
+                        "External change detected: %s changed %s → %s (not commanded by HA)",
+                        key, old_val, new_val,
+                    )
+                    self._external_change_until = time.time() + EXTERNAL_CHANGE_TIMEOUT
+                    self._last_state_change_time = current_time
+                    break
+
+        # --- Phase 5: Track heat state transitions for logging ---
+        current_heat_state = data.get("heat_state")
+        if self._last_heat_state != current_heat_state:
+            _LOGGER.debug("Heat state changed: %s -> %s", self._last_heat_state, current_heat_state)
+            self._last_heat_state = current_heat_state
+            self._last_state_change_time = current_time
+
+        # --- Phase 6: Determine appropriate tier and set interval ---
+        if self._rapid_poll_until or self._pending_changes:
+            # RAPID tier: confirming a command we sent
+            target_interval = RAPID_SCAN_INTERVAL
+            tier = "rapid"
+        elif self._external_change_until:
+            # EXTERNAL tier: someone used the panel/app, watch for follow-up changes
+            target_interval = EXTERNAL_CHANGE_INTERVAL
+            tier = "external"
+        elif self._is_spa_active(data):
+            # ACTIVE tier: heater, filter or bubble/jet running
+            target_interval = ACTIVE_SCAN_INTERVAL
+            tier = "active"
+            self._last_state_change_time = current_time
+        else:
+            # IDLE tier: nothing running, check if stable long enough
+            time_since_change = current_time - self._last_state_change_time if self._last_state_change_time else IDLE_STABLE_THRESHOLD + 1
+            if time_since_change >= IDLE_STABLE_THRESHOLD:
+                target_interval = IDLE_SCAN_INTERVAL
+                tier = "idle"
+            else:
+                # Recently stopped — stay at active rate briefly
+                target_interval = ACTIVE_SCAN_INTERVAL
+                tier = "active"
+
+        # Only log and update when the interval actually changes
+        current_interval = self.update_interval.total_seconds()
+        if current_interval != target_interval:
+            self.update_interval = timedelta(seconds=target_interval)
+            _LOGGER.info("Polling tier: %s (%ds interval)", tier, target_interval)
+
+    @staticmethod
+    def _is_spa_active(data: dict) -> bool:
+        """Return True if any spa component is actively running."""
+        return (
+            data.get("heater") == "on"
+            or data.get("filter") == "on"
+            or data.get("bubble") == "on"
+            or data.get("jet") == "on"
+        )
 
     def _enable_rapid_polling(self, expected_changes: dict, raw_command: dict = None) -> None:
         """Enable rapid polling and track expected changes."""
-        import time
-
         self._pending_changes.update(expected_changes)
         if raw_command:
             self._pending_raw_command.update(raw_command)
-            self._command_retry_count = 0  # Reset retry count for new command
+            self._command_retry_count = 0
         self._rapid_poll_until = time.time() + RAPID_POLL_TIMEOUT
         self.update_interval = timedelta(seconds=RAPID_SCAN_INTERVAL)
         _LOGGER.debug("Rapid polling enabled, waiting for changes: %s", expected_changes)
-    
+
     async def _check_power_cycle(self, data: dict) -> None:
         """Check for power cycle and restore state if enabled.
         

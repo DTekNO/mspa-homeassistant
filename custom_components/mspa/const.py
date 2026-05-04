@@ -3,8 +3,13 @@ from homeassistant.const import  UnitOfTemperature
 
 DOMAIN = "mspa"
 DEFAULT_SCAN_INTERVAL = 60
+IDLE_SCAN_INTERVAL = 120  # Polling interval when spa is idle (nothing running, stable)
+ACTIVE_SCAN_INTERVAL = 30  # Polling interval when spa is active (heater/filter on)
 RAPID_SCAN_INTERVAL = 1  # Polling interval in seconds when waiting for changes
 RAPID_POLL_TIMEOUT = 15  # Maximum time in seconds to poll rapidly
+EXTERNAL_CHANGE_INTERVAL = 5  # Polling interval after detecting an external change
+EXTERNAL_CHANGE_TIMEOUT = 15  # How long to rapid-poll after an external change
+IDLE_STABLE_THRESHOLD = 600  # Seconds of unchanged state before entering idle tier
 
 # Configuration
 CONF_PRODUCT_ID = "product_id"

@@ -106,6 +106,25 @@ The climate entity will show the following states:
 - `preheating`: The hot tub is warming up before entering full heating mode.
 - `heating`: The hot tub is actively heating the water.
 
+## Smart Adaptive Polling
+
+The integration uses a 3-tier adaptive polling system to balance responsiveness against API load. Aa Home Assistant integration runs 24/7 — so polling is automatically reduced when nothing is happening.
+
+| Tier | Interval | Trigger |
+|------|----------|---------|
+| **Idle** | 120 s | Nothing running (heater/filter/bubble/jet all off) and state stable for 10+ minutes |
+| **Active** | 30 s | Any component is running (heater, filter, bubble, or jet) |
+| **Rapid** | 1 s for 15 s | After sending a command from HA (to confirm the spa accepted it) |
+| **External change** | 5 s for 15 s | When the spa's state changes unexpectedly (someone used the physical panel or MSpa Link app) |
+
+**What this means in practice:**
+- When the spa is idle overnight, the integration polls only once every 2 minutes — reducing API traffic by ~50% compared to a fixed 60s interval.
+- When the spa is actively heating or filtering, polling is every 30 seconds so temperature updates and state changes are reflected quickly.
+- When you toggle something from the HA dashboard, the integration polls every second for 15 seconds to confirm the command took effect (with one automatic retry if the spa doesn't respond).
+- If someone presses a button on the spa's control panel, the integration detects the unexpected change on the next active/idle poll and temporarily speeds up to catch any follow-up changes (e.g. someone configuring multiple settings).
+
+> **Note:** There is no way to receive push notifications from the MSpa cloud — all integrations must poll. This adaptive system minimises unnecessary traffic while keeping the UI responsive during active use.
+
 ## Time to Target Temperature Sensors *(Experimental)*
 
 > ⚠️ **These sensors are experimental.** The self-learning rate algorithm is new and has not yet been validated across a full seasonal range of conditions. Treat the estimates as a rough guide rather than a precise prediction. Feedback on accuracy is very welcome — please open an issue with your model and observations.
@@ -164,6 +183,7 @@ The **Time to Target Temperature** sensor exposes diagnostic attributes that are
 | `heat_rate_mid_deg_per_hour` | Bucket rate for 30–37 °C |
 | `heat_rate_hot_deg_per_hour` | Bucket rate for ≥ 37 °C |
 | `session_condition_scalar` | Current ambient-condition correction factor (1.0 = neutral) |
+| `prediction_bias` | Historical bias correction (1.0 = no correction, >1.0 = predictions were too optimistic) |
 | `device_rate_deg_per_hour` | Heating rate reported by the device itself (some models only) |
 | `current_temperature` | Current water temperature |
 | `target_temperature` | Current set-point |
