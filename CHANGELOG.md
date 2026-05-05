@@ -5,31 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.0.2] - 2026-05-05
 
 ### Fixed
-- **First post-command poll running blind** — `_send_device_command_locked` called `coordinator.async_request_refresh()` while still holding `api_lock`, before returning to the coordinator command method. This meant a poll fired and `_check_adaptive_polling` ran against an empty `_pending_changes`, wasting the first rapid-poll slot. The premature `async_request_refresh()` has been removed; the coordinator's own refresh (called after `_enable_rapid_polling`) is now the sole trigger.
-- **Deadlock when turning filter off** — turning the filter switch off in Home Assistant caused the integration to hang indefinitely. The filter-off command internally also turns the heater off as a safety measure, but that nested call tried to re-acquire an `asyncio.Lock` already held by the outer command, deadlocking both. Fixed by calling the inner command method directly, bypassing the lock acquisition.
-- **Rapid polling storm during preheat** — while the spa was in preheat mode (`heat_state = 2`), the coordinator triggered a burst of 15 API calls over 15 seconds, then returned to the normal 60-second interval, then immediately triggered another burst on the next poll. This cycled indefinitely for the entire preheat period (typically 2–5 minutes), generating ~20× more API traffic than needed. Preheat now uses the standard 60-second polling interval; rapid polling is reserved for confirming immediate user-initiated commands only.
-- **Pending changes never cleared on confirmation timeout** — if the spa did not reflect a commanded state change within the rapid-poll window, `_pending_changes` was left intact. The next 60-second normal poll saw the stale entry and restarted rapid polling, which then expired again, creating an infinite loop of rapid-poll storms. Pending changes are now cleared (with a warning) when the window expires.
-- **Dual confirmation loops causing 30-second command latency** — every command triggered two independent confirmation mechanisms running back-to-back: a 5-poll × 3 s loop inside the API client (while holding `api_lock`) and a 15-second rapid-poll cycle in the coordinator. Total potential delay: 30 s. The API-level loop has been removed; the coordinator's rapid polling is now the sole confirmation path, and the `api_lock` is released immediately after the command is sent.
-- **No retry when spa silently ignores a command** — the spa occasionally acknowledges a command at the cloud level (`SUCCESS`) but the MCU never applies it. The integration now retries the command once (after the first 15-second confirmation window expires) before giving up and logging a warning.
-- **2-command rapid sequences: stale retry payload and conflicting pending state** — when two commands were sent in quick succession (e.g. set temperature then toggle UV), the first command to confirm removed its key from `_pending_changes` but left its raw field in `_pending_raw_command`. If a retry was later triggered for the still-pending second command, the retry payload included the already-confirmed first field, potentially re-applying a stale value. `_pending_raw_command` is now pruned field-by-field as each change confirms, keeping the retry payload accurate. Additionally, turning the filter off now explicitly registers the implicit heater-off in both `_pending_changes` and the retry payload, so a preceding heater-on command can no longer create a conflicting pending entry or cause the retry to fight the filter-off by resending `heater_state=1`.
+- **Deadlock when turning filter off** — the filter-off command could hang indefinitely
+- **Rapid polling storm during preheat** — excessive API traffic during the preheat cycle
+- **Command confirmation timeout loop** — unconfirmed commands could trigger infinite rapid-poll cycles
+- **30-second command latency** — duplicate confirmation mechanisms caused unnecessary delays
+- **Silent command failures** — commands acknowledged by the cloud but ignored by the spa are now retried once
+- **Rapid command sequences** — sending two commands quickly no longer causes stale retries or conflicting state
 
 ### Added
-- **3-tier adaptive polling** — polling interval now adjusts automatically based on spa activity:
-  - **Idle (120s):** nothing running and state has been stable for 10+ minutes. Halves API traffic for typical "spa off, keeping warm overnight" periods.
-  - **Active (30s):** heater, filter, bubble or jet is on. Detects panel/app changes within half a minute.
-  - **Rapid (1s for 15s):** immediately after sending a command from HA, to confirm it took effect.
-  - **External change (5s for 15s):** when an unexpected state change is detected (someone pressed the physical panel or used the MSpa Link app), a brief burst captures any follow-up changes.
-- **Historical prediction bias correction** — the average ratio of actual-to-estimated heating times from past runs is applied as a correction factor to future time-to-target predictions. This compensates for systematic errors (e.g. thermal losses not fully captured by bucket rates). The bias fades naturally as bucket EMAs converge from ongoing real observations.
-- **Device Detail diagnostic sensor** — extended device information from `/api/device/detail/` is fetched once on startup and exposed as a disabled-by-default diagnostic entity with attributes (product images, device UUID, warning code, service region, etc.)
-- New sensor attribute: `prediction_bias` on the Time to Target sensor
-- **Temperature-bucketed heating rates** — the heating rate EMA is now tracked in three temperature buckets (cold: <30 °C, mid: 30–37 °C, hot: ≥37 °C). Time-to-target estimates integrate each segment at its own observed rate, significantly improving accuracy for long heating runs (e.g. 20 °C → 40 °C)
-- **Session condition scalar** — on each new heating session the first observed bucket is compared against its stored rate to derive an ambient-condition correction factor. This factor is applied to segments not yet observed, so a hot or cold day is reflected across the whole estimate immediately
-- **Prediction accuracy tracker** — at the start of every large heating session (delta > 2 °C), the initial time-to-target estimate is recorded. When the target is reached, the actual elapsed time is logged alongside the estimate. Results are logged at INFO level (grep for `PREDICTION_RESULT`) and the last 10 are persisted across restarts
-- **Time-decay on stored bucket rates** — bucket EMAs loaded from storage decay toward the global flat rate over time (0.98/day, floor 40 %), preventing stale seasonal data from anchoring predictions indefinitely
-- Four new sensor attributes: `heat_rate_cold_deg_per_hour`, `heat_rate_mid_deg_per_hour`, `heat_rate_hot_deg_per_hour`, `session_condition_scalar`
+- **3-tier adaptive polling** — polling interval adjusts automatically based on spa activity:
+  - **Idle (120s):** nothing running, state stable for 10+ minutes
+  - **Active (30s):** heater, filter, bubble or jet is on
+  - **Rapid (1s for 15s):** after sending a command from HA
+  - **External change (5s for 15s):** when someone uses the physical panel or MSpa Link app
+- **Historical prediction bias correction** — past prediction accuracy is used to correct future time-to-target estimates, fading naturally as the rate model improves
+- **Device Detail diagnostic sensor** — extended device info fetched once on startup (product images, device UUID, warning code, etc.)
+- **Temperature-bucketed heating rates** — heating rate tracked in three temperature ranges for more accurate long-run estimates
+- **Session condition scalar** — ambient conditions (hot/cold day) are reflected in the estimate within the first few minutes of heating
+- **Prediction accuracy tracker** — logs estimated vs actual heating times for each session (last 10 persisted)
+- **Time-decay on stored rates** — stale seasonal data gradually loses influence over time
+- New sensor attributes: `heat_rate_cold/mid/hot_deg_per_hour`, `session_condition_scalar`, `prediction_bias`
 
 ---
 
