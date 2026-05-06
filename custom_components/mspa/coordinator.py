@@ -183,6 +183,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
         Uses the mean of actual_minutes/estimated_minutes across all history
         entries.  Clamped to [0.5, 2.0] to avoid runaway corrections from bad data.
+        Entries where the ratio is outside [0.3, 3.0] are rejected as outliers
+        (e.g. caused by the first-poll bug where device_heat_perhour gave a 10× wrong rate).
         """
         if not self._prediction_history:
             self.prediction_bias = 1.0
@@ -192,7 +194,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             est = p.get("estimated_minutes", 0)
             actual = p.get("actual_minutes", 0)
             if est > 0 and actual > 0:
-                ratios.append(actual / est)
+                ratio = actual / est
+                # Reject obvious outliers (> 3× or < 0.3× off)
+                if 0.3 <= ratio <= 3.0:
+                    ratios.append(ratio)
         if ratios:
             avg = sum(ratios) / len(ratios)
             self.prediction_bias = max(0.5, min(2.0, avg))
@@ -245,7 +250,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             # --- Prediction accuracy tracking ---
             # Start tracking when a big heating session begins (delta > 2°C).
-            if (new_temp is not None and new_target is not None
+            # Only start after rates have been loaded from storage to avoid using
+            # the unreliable device_heat_perhour fallback on the first poll.
+            if (self._rates_loaded
+                    and new_temp is not None and new_target is not None
                     and new_target > new_temp
                     and (new_target - new_temp) > 2.0
                     and self._prediction is None):
