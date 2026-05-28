@@ -181,10 +181,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     def _update_prediction_bias(self) -> None:
         """Recompute prediction_bias from prediction_history.
 
-        Uses the mean of actual_minutes/estimated_minutes across all history
-        entries.  Clamped to [0.5, 2.0] to avoid runaway corrections from bad data.
-        Entries where the ratio is outside [0.3, 3.0] are rejected as outliers
-        (e.g. caused by the first-poll bug where device_heat_perhour gave a 10× wrong rate).
+        Uses the mean of actual_minutes/estimated_minutes across history entries
+        with a temperature delta >= 10°C. Short runs have too much variance from
+        ambient conditions to be useful for bias correction.
+        Clamped to [0.5, 2.0] to avoid runaway corrections from bad data.
+        Entries where the ratio is outside [0.3, 3.0] are rejected as outliers.
         """
         if not self._prediction_history:
             self.prediction_bias = 1.0
@@ -193,6 +194,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         for p in self._prediction_history:
             est = p.get("estimated_minutes", 0)
             actual = p.get("actual_minutes", 0)
+            start = p.get("start_temp", 0)
+            target = p.get("target_temp", 0)
+            # Only use runs with >= 10°C delta for bias learning
+            if (target - start) < 10.0:
+                continue
             if est > 0 and actual > 0:
                 ratio = actual / est
                 # Reject obvious outliers (> 3× or < 0.3× off)
@@ -288,11 +294,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 est = self._prediction["estimated_minutes"]
                 error_minutes = actual_minutes - est
                 error_pct = (error_minutes / actual_minutes * 100) if actual_minutes > 0 else 0
+                est_biased = self._prediction.get("estimated_minutes_biased", est)
+                error_minutes_biased = actual_minutes - est_biased
                 result = {
                     **self._prediction,
                     "actual_minutes": round(actual_minutes, 1),
                     "error_minutes": round(error_minutes, 1),
                     "error_percent": round(error_pct, 1),
+                    "error_minutes_biased": round(error_minutes_biased, 1),
                     "end_time": datetime.now(timezone.utc).isoformat(),
                 }
                 self._prediction_history.append(result)
