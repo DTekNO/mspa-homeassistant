@@ -342,6 +342,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     stored_buckets = stored.get("heat_rate_buckets")
                     self._prediction_history = stored.get("prediction_history", [])
                     self._update_prediction_bias()
+                    # Restore in-progress prediction so a restart mid-heatup doesn't
+                    # drop the session from the learning history.
+                    self._prediction = stored.get("active_prediction")
+                    if self._prediction:
+                        _LOGGER.info(
+                            "Restored in-progress prediction: %.1f°C → %.1f°C (started %s)",
+                            self._prediction.get("start_temp", 0),
+                            self._prediction.get("target_temp", 0),
+                            self._prediction.get("start_time", "unknown"),
+                        )
                     if isinstance(stored_buckets, list) and len(stored_buckets) == 3:
                         save_ts = stored.get("bucket_save_ts")
                         if save_ts is not None:
@@ -505,12 +515,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # --- end rate tracking ---
 
             # Persist updated rates so they survive reloads and HA restarts.
+            # _prediction is included so an in-progress heatup is not lost on restart.
             await self._rates_store.async_save({
                 "heat_rate": self.computed_heat_rate,
                 "cool_rate": self.computed_cool_rate,
                 "heat_rate_buckets": self.heat_rate_buckets,
                 "bucket_save_ts": time.time(),
                 "prediction_history": self._prediction_history,
+                "active_prediction": self._prediction,
             })
 
             # Check for power cycle and restore state if enabled
