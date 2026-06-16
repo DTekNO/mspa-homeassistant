@@ -5,10 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.3] - 2026-06-16
+## [3.0.5] - 2026-06-16
 
 ### Fixed
 - **Prediction learning history lost on restart** — heating rates, bias correction, and session history are now reloaded from persistent storage on startup, preserving accumulated learning across restarts (experimental learning and prediction feature)
+
+---
+
+## [3.0.4] - 2026-05-28
+
+### Fixed
+- **Prediction bias calculation** — runs with insufficient temperature delta are now filtered out, preventing inaccurate bias corrections
+
+---
+
+## [3.0.3] - 2026-05-06
+
+### Fixed
+- **Prediction bias outliers** — outlier ratios are now rejected in the bias calculation to improve estimate accuracy
 
 ---
 
