@@ -410,6 +410,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     )
             self._heat_was_active = heater_now_active
 
+            # If the heater stops while we're still significantly below target, the
+            # session has been interrupted (maintenance, power cycle, user manually
+            # turning off the heater).  Cancel any active prediction so that when
+            # circulation later mixes the water and near_target triggers, a spurious
+            # short result isn't recorded in the history.
+            if (not heater_now_active
+                    and self._prediction is not None
+                    and not self.near_target):
+                _LOGGER.info(
+                    "PREDICTION_CANCELLED: heater stopped at %.1f°C with %.1f°C to go "
+                    "— session interrupted (maintenance / power cycle / manual off)",
+                    curr_temp or 0,
+                    abs((new_target or 0) - (curr_temp or 0)),
+                )
+                self._prediction = None
+
             if heat_state == 3 and curr_temp is not None:
                 if self._rate_last_temp is None:
                     # First poll in heat mode — set anchor, no sample yet
