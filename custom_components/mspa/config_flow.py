@@ -3,8 +3,9 @@ import logging
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
 from .const import (
-    DOMAIN, 
+    DOMAIN,
     CONF_REGION,
     DEFAULT_REGION,
     REGIONS,
@@ -16,6 +17,7 @@ from .const import (
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
+    CONF_WEATHER_ENTITY,
 )
 import hashlib
 from .mspa_api import DEMO_EMAIL, _DEMO_DEVICES
@@ -275,6 +277,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 default=self.config_entry.options.get(CONF_RESTORE_STATE, False),
                 description="Restore previous states after power outage (heater, temperature, filter, etc.)"
             ): bool,
+            vol.Optional(
+                CONF_WEATHER_ENTITY,
+                description={"suggested_value": self.config_entry.options.get(CONF_WEATHER_ENTITY)},
+            ): EntitySelector(EntitySelectorConfig(domain="weather")),
         })
 
         return self.async_show_form(step_id="init", data_schema=data_schema)

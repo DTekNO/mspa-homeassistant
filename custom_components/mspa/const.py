@@ -82,3 +82,7 @@ DEFAULT_PUMP_POWER = 60  # Filter pump: 2000l/t, 60W, 12V
 DEFAULT_BUBBLE_POWER = 900  # Bubble generator: 900W (1.2HP)
 DEFAULT_HEATER_POWER_PREHEAT = 1500  # Heating element: 1500W (preheat mode)
 DEFAULT_HEATER_POWER_HEAT = 2000  # Heating element in active heating (estimated)
+
+# Optional weather entity for ambient-condition bias correction.
+# Reads temperature and wind_speed from a weather entity (e.g. Met.no, OpenWeatherMap).
+CONF_WEATHER_ENTITY = "weather_entity"

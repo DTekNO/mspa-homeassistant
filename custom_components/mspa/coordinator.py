@@ -1,5 +1,6 @@
 """DataUpdateCoordinator for MSpa integration."""
 import logging
+import math
 from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
 
@@ -27,6 +28,7 @@ from .const import (
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
+    CONF_WEATHER_ENTITY,
 )
 
 import time
@@ -59,6 +61,79 @@ _STRUCTURED_STATUS_KEYS = frozenset({
     "jet_state", "ozone_state", "uvc_state",
     "bubble_level", "fault",
 })
+
+def _read_weather_entity(hass: HomeAssistant, entity_id: str | None) -> tuple[float | None, float | None]:
+    """Read temperature (°C) and wind speed (m/s) from a HA weather entity.
+
+    Returns (temp_celsius, wind_m_s).  Either value is None when unavailable.
+    Normalises temperature and wind speed to SI units regardless of the HA
+    unit system, so the Gaussian kernel uses consistent scales.
+    """
+    if not entity_id:
+        return None, None
+    state = hass.states.get(entity_id)
+    if state is None or state.state in ("unknown", "unavailable", ""):
+        return None, None
+
+    attrs = state.attributes
+
+    # --- Temperature → °C ---
+    temp = attrs.get("temperature")
+    if temp is not None:
+        try:
+            temp = float(temp)
+            unit = attrs.get("temperature_unit", "°C")
+            if unit in ("°F", "F"):
+                temp = (temp - 32) * 5 / 9
+        except (ValueError, TypeError):
+            temp = None
+
+    # --- Wind speed → m/s ---
+    # Prefer wind_gust_speed over wind_speed: gusts disrupt the thermal
+    # boundary layer around the cover more aggressively than steady wind,
+    # making them the dominant driver of convective heat loss.
+    # Falls back to wind_speed when gust data isn't provided by the integration.
+    raw_wind = attrs.get("wind_gust_speed") or attrs.get("wind_speed")
+    wind = None
+    if raw_wind is not None:
+        try:
+            wind = float(raw_wind)
+            unit = attrs.get("wind_speed_unit", "m/s")
+            if unit in ("km/h", "kph"):
+                wind = wind / 3.6
+            elif unit in ("mph",):
+                wind = wind * 0.44704
+            elif unit in ("kn", "knot", "knots"):
+                wind = wind * 0.514444
+            # "m/s" needs no conversion
+        except (ValueError, TypeError):
+            wind = None
+
+    return temp, wind
+
+
+def _weather_weight(
+    curr_temp: float | None,
+    curr_wind: float | None,
+    hist_temp: float | None,
+    hist_wind: float | None,
+) -> float:
+    """Gaussian kernel similarity for weather conditions.
+
+    Returns a weight in (0, 1] reflecting how similar the historical session's
+    ambient conditions are to the current ones.  Returns 1.0 (neutral) when
+    either side lacks weather data, so bias computation degrades gracefully to
+    a plain average when no weather sensors are configured.
+    """
+    if curr_temp is None or hist_temp is None:
+        return 1.0
+    _SIGMA_TEMP = 8.0   # °C  — sessions within ~8°C ambient count strongly
+    _SIGMA_WIND = 4.0   # m/s — sessions within ~4 m/s wind count strongly
+    sq = ((curr_temp - hist_temp) / _SIGMA_TEMP) ** 2
+    if curr_wind is not None and hist_wind is not None:
+        sq += ((curr_wind - hist_wind) / _SIGMA_WIND) ** 2
+    return math.exp(-0.5 * sq)
+
 
 class MSpaUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from MSpa Hot Tub."""
@@ -162,6 +237,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # reactivates only when _NEAR_TARGET_ACTIVATE away, preventing flicker.
         self.near_target: bool = False
 
+        # Current ambient conditions read from optional weather sensors.
+        # None until the first successful sensor read.
+        self.ambient_temp: float | None = None
+        self.ambient_wind: float | None = None
+
         # Prediction accuracy tracker.  Records the initial estimate at the
         # start of a big heating session and compares it to the actual elapsed
         # time when the target is reached.  Results are logged at INFO level
@@ -182,34 +262,58 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """Recompute prediction_bias from prediction_history.
 
         Uses the mean of actual_minutes/estimated_minutes across history entries
-        with a temperature delta >= 10°C. Short runs have too much variance from
+        with a temperature delta >= 3°C. Short runs have too much variance from
         ambient conditions to be useful for bias correction.
         Clamped to [0.5, 2.0] to avoid runaway corrections from bad data.
         Entries where the ratio is outside [0.3, 3.0] are rejected as outliers.
+
+        When a weather entity is configured, historical entries are weighted by a
+        Gaussian kernel over ambient temperature and wind speed similarity to the
+        current conditions.  This makes the bias reflect sessions that happened
+        under similar weather rather than an undifferentiated average.  If no
+        weather entity is configured all weights are 1.0 (plain average).
         """
         if not self._prediction_history:
             self.prediction_bias = 1.0
             return
-        ratios = []
+
+        weighted_sum = 0.0
+        weight_total = 0.0
+        n_used = 0
+
         for p in self._prediction_history:
             est = p.get("estimated_minutes", 0)
             actual = p.get("actual_minutes", 0)
             start = p.get("start_temp", 0)
             target = p.get("target_temp", 0)
-            # Only use runs with >= 10°C delta for bias learning
-            if (target - start) < 10.0:
+
+            if (target - start) < 3.0:
                 continue
-            if est > 0 and actual > 0:
-                ratio = actual / est
-                # Reject obvious outliers (> 3× or < 0.3× off)
-                if 0.3 <= ratio <= 3.0:
-                    ratios.append(ratio)
-        if ratios:
-            avg = sum(ratios) / len(ratios)
+            if est <= 0 or actual <= 0:
+                continue
+
+            ratio = actual / est
+            if not (0.3 <= ratio <= 3.0):
+                continue
+
+            weight = _weather_weight(
+                self.ambient_temp, self.ambient_wind,
+                p.get("ambient_temp"), p.get("ambient_wind"),
+            )
+            weighted_sum += ratio * weight
+            weight_total += weight
+            n_used += 1
+
+        if weight_total > 0:
+            avg = weighted_sum / weight_total
             self.prediction_bias = max(0.5, min(2.0, avg))
         else:
             self.prediction_bias = 1.0
-        _LOGGER.debug("Prediction bias updated: %.3f (from %d samples)", self.prediction_bias, len(ratios))
+
+        _LOGGER.debug(
+            "Prediction bias updated: %.3f (from %d samples, weather-weighted=%s)",
+            self.prediction_bias, n_used, self.ambient_temp is not None,
+        )
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via direct function call."""
@@ -243,6 +347,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             self._last_data = transformed_data
             _LOGGER.debug("Fetched MSpa transformed data: %s", transformed_data)
+
+            # Read optional weather entity for ambient-condition bias.
+            self.ambient_temp, self.ambient_wind = _read_weather_entity(
+                self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
+            )
 
             # Update anchor whenever water_temp or target_temp changes.
             # Sensors use (anchor_time, anchor_temp, anchor_target) to count down
@@ -279,11 +388,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         "estimated_minutes_biased": round(est_minutes, 1),
                         "prediction_bias": round(self.prediction_bias, 3),
                         "session_scalar": self._session_scalar,
+                        "ambient_temp": self.ambient_temp,
+                        "ambient_wind": self.ambient_wind,
                     }
                     _LOGGER.info(
-                        "PREDICTION_START: %.1f°C → %.1f°C, raw=%.0f min, biased=%.0f min (bias=%.3f, scalar=%.3f)",
+                        "PREDICTION_START: %.1f°C → %.1f°C, raw=%.0f min, biased=%.0f min"
+                        " (bias=%.3f, scalar=%.3f, ambient=%.1f°C %.1f m/s)",
                         new_temp, new_target, raw_minutes, est_minutes,
                         self.prediction_bias, self._session_scalar,
+                        self.ambient_temp or 0.0, self.ambient_wind or 0.0,
                     )
 
             # Finish tracking when near_target is newly reached.
@@ -358,8 +471,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             days_elapsed = (time.time() - save_ts) / 86400
                             # Decay each bucket toward the global flat EMA over time so
                             # stale seasonal rates don't anchor predictions indefinitely.
-                            # 0.98/day: ~75% weight at 14 days, ~55% at 30 days, floor 0.4.
-                            decay = max(0.4, 0.98 ** days_elapsed)
+                            # When a weather entity is configured, the bias is already
+                            # weather-weighted so seasonal variation is handled there —
+                            # the bucket rates can be trusted for longer.
+                            # Without weather: 0.98/day → ~75% weight at 14 days.
+                            # With weather:    0.994/day → ~92% weight at 14 days.
+                            has_weather = bool(
+                                self.config_entry.options.get(CONF_WEATHER_ENTITY)
+                            )
+                            decay_rate = 0.994 if has_weather else 0.98
+                            decay = max(0.4, decay_rate ** days_elapsed)
                             global_rate = self.computed_heat_rate
                             self.heat_rate_buckets = [
                                 (float(b) * decay + global_rate * (1 - decay))
@@ -368,8 +489,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                 for b in stored_buckets
                             ]
                             _LOGGER.debug(
-                                "Loaded buckets: %.1f days old, decay=%.3f → %s",
-                                days_elapsed, decay, self.heat_rate_buckets,
+                                "Loaded buckets: %.1f days old, decay=%.3f (weather=%s) → %s",
+                                days_elapsed, decay, has_weather, self.heat_rate_buckets,
                             )
                         else:
                             self.heat_rate_buckets = [

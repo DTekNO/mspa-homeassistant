@@ -36,19 +36,21 @@
   "options": {
     "step": {
       "init": {
-        "title": "MSpa Power Consumption Settings",
+        "title": "MSpa Integration Settings",
         "description": "Configure the power consumption values for accurate energy monitoring. These values are based on your hot tub model specifications but can be adjusted to match your actual measurements.",
         "data": {
           "pump_power": "Pump/Filter Power (Watts)",
           "bubble_power": "Bubble Generator Power (Watts)",
           "heater_power_preheat": "Heater Preheat Power (Watts)",
-          "heater_power_heat": "Heater Active Heating Power (Watts)"
+          "heater_power_heat": "Heater Active Heating Power (Watts)",
+          "weather_entity": "Weather Entity (optional)"
         },
         "data_description": {
           "pump_power": "Power consumption when the filter pump is running (typically 60W)",
           "bubble_power": "Power consumption when bubbles are active (typically 900W)",
           "heater_power_preheat": "Power consumption during preheat mode (typically 1500W)",
-          "heater_power_heat": "Power consumption during active heating (typically 2000W)"
+          "heater_power_heat": "Power consumption during active heating (typically 2000W)",
+          "weather_entity": "Select a weather entity (e.g. Met.no, OpenWeatherMap) to bias heating estimates by ambient temperature and wind speed. Historical sessions are weighted by how closely their conditions match the current weather."
         }
       }
     }
