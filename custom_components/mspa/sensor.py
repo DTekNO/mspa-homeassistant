@@ -540,7 +540,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             return None
         if mins <= 5:
             return "Ready"
-        ready_at = datetime.now(timezone.utc) + timedelta(minutes=mins)
+        rounded = round(mins / 5) * 5
+        ready_at = datetime.now(timezone.utc) + timedelta(minutes=rounded)
         local_ready = ready_at.astimezone()
         days = (local_ready.date() - datetime.now().date()).days
         suffix = f" +{days}d" if days > 0 else ""
