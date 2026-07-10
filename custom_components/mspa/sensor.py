@@ -342,6 +342,34 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
     return total_minutes * bias
 
 
+def _ready_at_utc(coordinator) -> "datetime | None":
+    """Return the stable absolute UTC datetime when the spa will reach target.
+
+    Derived from the coordinator anchor (set when temperature last changed),
+    so the timestamp only shifts when real conditions change — not every poll.
+    Returns None when no rate data is available or spa is already at target.
+    """
+    if coordinator.near_target:
+        return None
+    anchor_time   = coordinator.temp_anchor_time
+    anchor_temp   = coordinator.temp_anchor_temp
+    anchor_target = coordinator.temp_anchor_target
+    if anchor_time is None or anchor_temp is None or anchor_target is None:
+        return None
+    if anchor_target > anchor_temp:
+        anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, coordinator)
+    elif anchor_target < anchor_temp:
+        rate = _effective_cool_rate(coordinator)
+        if rate is None:
+            return None
+        anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
+    else:
+        return None
+    if anchor_minutes is None:
+        return None
+    return anchor_time + timedelta(minutes=anchor_minutes)
+
+
 def _minutes_to_target(coordinator) -> int | None:
     """Return minutes remaining until the spa reaches its target temperature.
 
@@ -435,9 +463,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             else "light-blue" if direction == "cooling"
             else "green"
         )
-        ready_at_ts = None
-        if rounded is not None and rounded > 0:
-            ready_at_ts = (datetime.now(timezone.utc) + timedelta(minutes=rounded)).isoformat()
+        ready_at_utc = _ready_at_utc(self.coordinator)
+        ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
 
         data = self.coordinator._last_data
         try:
