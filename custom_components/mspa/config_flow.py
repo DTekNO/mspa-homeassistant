@@ -3,7 +3,13 @@ import logging
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
+from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 from .const import (
     DOMAIN,
     CONF_REGION,
@@ -18,6 +24,9 @@ from .const import (
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_WEATHER_ENTITY,
+    CONF_SCHEDULE_CALENDAR,
+    CONF_SCHEDULE_TARGET_TEMP,
+    DEFAULT_SCHEDULE_TARGET_TEMP,
 )
 import hashlib
 from .mspa_api import DEMO_EMAIL, _DEMO_DEVICES
@@ -281,6 +290,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_WEATHER_ENTITY,
                 description={"suggested_value": self.config_entry.options.get(CONF_WEATHER_ENTITY)},
             ): EntitySelector(EntitySelectorConfig(domain="weather")),
+            vol.Optional(
+                CONF_SCHEDULE_CALENDAR,
+                description={"suggested_value": self.config_entry.options.get(CONF_SCHEDULE_CALENDAR)},
+            ): EntitySelector(EntitySelectorConfig(domain="calendar")),
+            vol.Optional(
+                CONF_SCHEDULE_TARGET_TEMP,
+                default=self.config_entry.options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP),
+            ): NumberSelector(NumberSelectorConfig(
+                min=20, max=40, step=0.5, unit_of_measurement="°C", mode=NumberSelectorMode.BOX,
+            )),
         })
 
         return self.async_show_form(step_id="init", data_schema=data_schema)

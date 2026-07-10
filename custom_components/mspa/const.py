@@ -86,3 +86,10 @@ DEFAULT_HEATER_POWER_HEAT = 2000  # Heating element in active heating (estimated
 # Optional weather entity for ambient-condition bias correction.
 # Reads temperature and wind_speed from a weather entity (e.g. Met.no, OpenWeatherMap).
 CONF_WEATHER_ENTITY = "weather_entity"
+
+# Optional heat-schedule: calendar-driven automatic preheat scheduling.
+CONF_SCHEDULE_CALENDAR = "schedule_calendar"
+CONF_SCHEDULE_TARGET_TEMP = "schedule_target_temp"
+CONF_SCHEDULE_LOOKAHEAD_DAYS = "schedule_lookahead_days"
+DEFAULT_SCHEDULE_TARGET_TEMP = 40.0
+DEFAULT_SCHEDULE_LOOKAHEAD_DAYS = 5

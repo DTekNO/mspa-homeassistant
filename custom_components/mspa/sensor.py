@@ -5,13 +5,19 @@ from homeassistant.components.sensor import SensorStateClass, SensorDeviceClass
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.const import UnitOfPower, UnitOfEnergy, UnitOfTime
 from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
     DEFAULT_PUMP_POWER,
     DEFAULT_BUBBLE_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
-    DEFAULT_HEATER_POWER_HEAT
+    DEFAULT_HEATER_POWER_HEAT,
+    CONF_SCHEDULE_CALENDAR,
+    CONF_SCHEDULE_TARGET_TEMP,
+    CONF_SCHEDULE_LOOKAHEAD_DAYS,
+    DEFAULT_SCHEDULE_TARGET_TEMP,
+    DEFAULT_SCHEDULE_LOOKAHEAD_DAYS,
 )
 from .entity import MSpaSensorEntity, MSpaBinarySensorEntity
 
@@ -120,6 +126,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities([
         MSpaTempReachSensor(coordinator),
         MSpaTempReachReadyAtSensor(coordinator),
+        MSpaReadinessSensor(coordinator),
+        MSpaHeatScheduleSensor(coordinator, entry),
     ])
 
     # Device detail sensor — exposes extended info from /api/device/detail/ as attributes
@@ -335,6 +343,50 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
     return total_minutes * bias
 
 
+def _minutes_to_target(coordinator) -> int | None:
+    """Return minutes remaining until the spa reaches its target temperature.
+
+    Returns 0 when near target, None when no rate data is available.
+    Shared by MSpaTempReachSensor and MSpaReadinessSensor.
+    """
+    if coordinator.near_target:
+        return 0
+    anchor_time   = coordinator.temp_anchor_time
+    anchor_temp   = coordinator.temp_anchor_temp
+    anchor_target = coordinator.temp_anchor_target
+    if anchor_time is None or anchor_temp is None or anchor_target is None:
+        return None
+    if anchor_target > anchor_temp:
+        anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, coordinator)
+    elif anchor_target < anchor_temp:
+        rate = _effective_cool_rate(coordinator)
+        if rate is None:
+            return None
+        anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
+    else:
+        return 0
+    if anchor_minutes is None:
+        return None
+    ready_at = anchor_time + timedelta(minutes=anchor_minutes)
+    remaining = (ready_at - datetime.now(timezone.utc)).total_seconds() / 60
+    return max(0, round(remaining))
+
+
+def _spa_direction(coordinator) -> str | None:
+    """Return 'heating', 'cooling', 'at_target', or None if data is unavailable."""
+    data = coordinator._last_data
+    try:
+        water_temp = float(data.get("water_temperature"))
+        target_temp = float(data.get("target_temperature"))
+    except (TypeError, ValueError):
+        return None
+    if target_temp > water_temp:
+        return "heating"
+    if target_temp < water_temp:
+        return "cooling"
+    return "at_target"
+
+
 class MSpaTempReachSensor(MSpaSensorEntity):
     """Estimated minutes until the spa reaches its target temperature.
 
@@ -359,29 +411,7 @@ class MSpaTempReachSensor(MSpaSensorEntity):
 
     def _compute_minutes(self) -> int | None:
         """Return minutes to target, counting down each poll. None when unavailable."""
-        if self.coordinator.near_target:
-            return 0
-        anchor_time   = self.coordinator.temp_anchor_time
-        anchor_temp   = self.coordinator.temp_anchor_temp
-        anchor_target = self.coordinator.temp_anchor_target
-        if anchor_time is None or anchor_temp is None or anchor_target is None:
-            return None
-        if anchor_target > anchor_temp:
-            # Heating — integrate across temperature buckets for accuracy
-            anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, self.coordinator)
-        elif anchor_target < anchor_temp:
-            # Cooling — use flat EMA (no buckets for cooling)
-            rate = _effective_cool_rate(self.coordinator)
-            if rate is None:
-                return None
-            anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
-        else:
-            return 0
-        if anchor_minutes is None:
-            return None
-        ready_at = anchor_time + timedelta(minutes=anchor_minutes)
-        remaining = (ready_at - datetime.now(timezone.utc)).total_seconds() / 60
-        return max(0, round(remaining))
+        return _minutes_to_target(self.coordinator)
 
     @property
     def available(self):
@@ -402,15 +432,9 @@ class MSpaTempReachSensor(MSpaSensorEntity):
 
         if water_temp is not None and target_temp is not None:
             effective = _effective_rate(self.coordinator, water_temp, target_temp)
-            if target_temp > water_temp:
-                direction = "heating"
-            elif target_temp < water_temp:
-                direction = "cooling"
-            else:
-                direction = "at_target"
         else:
             effective = None
-            direction = None
+        direction = _spa_direction(self.coordinator)
 
         computed_heat = getattr(self.coordinator, "computed_heat_rate", None)
         computed_cool = getattr(self.coordinator, "computed_cool_rate", None)
@@ -486,6 +510,164 @@ class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
     @property
     def native_value(self):
         return self._compute_ready_at()
+
+
+class MSpaReadinessSensor(MSpaSensorEntity):
+    """Human-readable spa readiness sensor.
+
+    State is 'Ready' when at or within 5 minutes of target temperature,
+    otherwise the expected ready-at time in local time (e.g. '19:45' or
+    '19:45 +1d').  Icon reflects direction: fire=heating, snowflake=cooling,
+    hot-tub=ready.  No device_class or state_class — plain text sensor.
+    """
+
+    name = "Readiness"
+    _attr_icon = "mdi:hot-tub"
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"mspa_readiness_{getattr(coordinator, 'device_id', 'unknown')}"
+        self._attr_device_info = self.device_info
+
+    @property
+    def available(self):
+        return super().available and _minutes_to_target(self.coordinator) is not None
+
+    @property
+    def native_value(self):
+        mins = _minutes_to_target(self.coordinator)
+        if mins is None:
+            return None
+        if mins <= 5:
+            return "Ready"
+        ready_at = datetime.now(timezone.utc) + timedelta(minutes=mins)
+        local_ready = ready_at.astimezone()
+        days = (local_ready.date() - datetime.now().date()).days
+        suffix = f" +{days}d" if days > 0 else ""
+        return f"{local_ready.strftime('%H:%M')}{suffix}"
+
+    @property
+    def icon(self):
+        return "mdi:hot-tub"
+
+    @property
+    def extra_state_attributes(self):
+        direction = _spa_direction(self.coordinator)
+        color = (
+            "red" if direction == "heating"
+            else "light-blue" if direction == "cooling"
+            else "green"
+        )
+        return {
+            "direction": direction,
+            "minutes_remaining": _minutes_to_target(self.coordinator),
+            "color": color,
+        }
+
+
+class MSpaHeatScheduleSensor(MSpaSensorEntity):
+    """Calendar-driven preheat schedule sensor.
+
+    Reads the next event start_time from a configured calendar entity and
+    uses the integration's learned heating rates to compute the moment the
+    heater must be started to reach the target temperature by arrival time.
+
+    State: human-readable "Start at HH:MM [+Nd]" / "Start now" / "Ready" /
+           "At cottage" / "No scheduled heating".
+    Attributes: target_time, start_at (UTC datetime), target_temperature —
+                suitable for use in automation triggers.
+    """
+
+    name = "Heat Schedule"
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, coordinator, config_entry):
+        super().__init__(coordinator)
+        self._config_entry = config_entry
+        device_id = getattr(coordinator, "device_id", "unknown")
+        self._attr_unique_id = f"mspa_heat_schedule_{device_id}"
+        self._attr_device_info = self.device_info
+
+    def _schedule_data(self):
+        """Return (target_dt_utc, target_temp, start_at_utc) or None on any failure."""
+        options = self._config_entry.options
+        cal_entity = options.get(CONF_SCHEDULE_CALENDAR)
+        if not cal_entity:
+            return None
+
+        cal_state = self.hass.states.get(cal_entity)
+        if cal_state is None:
+            return None
+
+        # If the event is currently active we're already there — nothing to schedule
+        if cal_state.state == "on":
+            return "at_cottage"
+
+        start_time_str = cal_state.attributes.get("start_time")
+        if not start_time_str:
+            return None
+
+        target_dt = dt_util.parse_datetime(start_time_str)
+        if target_dt is None:
+            return None
+        target_utc = dt_util.as_utc(target_dt)
+        now_utc = dt_util.utcnow()
+
+        days_until = (target_utc - now_utc).total_seconds() / 86400
+        lookahead = int(options.get(CONF_SCHEDULE_LOOKAHEAD_DAYS, DEFAULT_SCHEDULE_LOOKAHEAD_DAYS))
+        if days_until < 0 or days_until > lookahead:
+            return None
+
+        target_temp = float(options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP))
+
+        data = self.coordinator._last_data
+        try:
+            current_temp = float(data.get("water_temperature"))
+        except (TypeError, ValueError):
+            return None
+
+        if current_temp >= target_temp:
+            return "ready"
+
+        heating_minutes = _segmented_heating_minutes(current_temp, target_temp, self.coordinator)
+        if heating_minutes is None:
+            return None
+
+        start_at_utc = target_utc - timedelta(minutes=heating_minutes)
+        return (target_utc, target_temp, start_at_utc)
+
+    @property
+    def native_value(self):
+        result = self._schedule_data()
+        if result is None:
+            return "No scheduled heating"
+        if result == "at_cottage":
+            return "At cottage"
+        if result == "ready":
+            return "Ready"
+
+        _, _, start_at_utc = result
+        now_utc = dt_util.utcnow()
+
+        if now_utc >= start_at_utc:
+            return "Start now"
+
+        local_start = dt_util.as_local(start_at_utc)
+        days = (local_start.date() - dt_util.now().date()).days
+        suffix = f" +{days}d" if days > 0 else ""
+        return f"Start at {local_start.strftime('%H:%M')}{suffix}"
+
+    @property
+    def extra_state_attributes(self):
+        result = self._schedule_data()
+        if not isinstance(result, tuple):
+            return {}
+        target_utc, target_temp, start_at_utc = result
+        return {
+            "target_time": target_utc.isoformat(),
+            "start_at": start_at_utc.isoformat(),
+            "target_temperature": target_temp,
+        }
 
 
 # This sensor is used to indicate faults or warnings in the MSpa system.
