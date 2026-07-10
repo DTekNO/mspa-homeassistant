@@ -228,22 +228,72 @@ actions:
 
 > **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The integration automatically tracks prediction accuracy — grep for `PREDICTION_RESULT` in the Home Assistant log to see estimated vs actual times for each heating session.
 
-### Dashboard card example
-
-The example below uses the [Mushroom Template Card](https://github.com/piitaya/lovelace-mushroom) (available via HACS). The **Ready at** sensor state (`10:34`, `10:34 +1d`, `Ready`) is used directly — no timestamp parsing needed.
+### Dashboard card examples
 
 Replace `mspa_oslouvc` with your own entity name prefix.
 
+**Tile card** — no extra dependencies. Uses a conditional stack to show a clean message when ready, hiding the redundant state label:
+
+```yaml
+type: vertical-stack
+cards:
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: sensor.mspa_oslouvc_ready_at
+        state_not: Ready
+    card:
+      type: tile
+      entity: sensor.mspa_oslouvc_ready_at
+      name: Spa ready at
+      grid_options:
+        columns: full
+      vertical: false
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: sensor.mspa_oslouvc_ready_at
+        state: Ready
+    card:
+      type: tile
+      entity: sensor.mspa_oslouvc_ready_at
+      name: Your spa is ready!
+      color: light-green
+      hide_state: true
+      grid_options:
+        columns: full
+      vertical: false
+```
+
+**Mushroom Template Card** — requires [Mushroom](https://github.com/piitaya/lovelace-mushroom) (available via HACS). Shows a context-aware primary message, suppresses the secondary when ready, and uses the `color` attribute for icon colour:
+
 ```yaml
 type: custom:mushroom-template-card
-primary: Hot tub
-secondary: "{{ states('sensor.mspa_oslouvc_ready_at') }}"
+entity: sensor.mspa_oslouvc_ready_at
+primary: |-
+  {% set mins = state_attr(config.entity, 'minutes_remaining') | int(-1) %}
+  {%- if mins <= 5 -%}
+    Your spa is ready!
+  {%- else -%}
+    Spa ready at
+  {%- endif %}
+secondary: |-
+  {% if states(config.entity) != 'Ready' %}
+    {{ states(config.entity) }}
+  {% endif %}
 icon: mdi:hot-tub
-visibility:
-  - condition: state
-    entity: sensor.mspa_oslouvc_ready_at
-    state_not: unavailable
-color: "{{ state_attr('sensor.mspa_oslouvc_ready_at', 'color') }}"
+color: >-
+  {% set d = state_attr(config.entity, 'direction') %}
+  {% set mins = state_attr(config.entity, 'minutes_remaining') | int(-1) %}
+  {% if mins <= 5 %}
+    green
+  {% elif d == 'heating' %}
+    red
+  {% elif d == 'cooling' %}
+    blue
+  {% else %}
+    green
+  {% endif %}
 grid_options:
   columns: full
   rows: 1
@@ -269,15 +319,6 @@ The **Ready at** sensor gives a single, human-readable answer to "is the spa rea
 | `minutes_remaining` | Integer countdown (null when ready or unavailable) |
 | `color` | `green` (ready/at_target), `red` (heating), `light-blue` (cooling) |
 | `ready_at` | ISO 8601 timestamp of the estimated ready time (null when ready or unavailable) |
-
-The `color` attribute is intended for use with a **Mushroom Template Card**:
-
-```yaml
-type: custom:mushroom-template-card
-primary: "{{ states('sensor.mspa_readiness') }}"
-icon: mdi:hot-tub
-color: "{{ state_attr('sensor.mspa_readiness', 'color') }}"
-```
 
 ## Heat Schedule Sensor
 
@@ -358,6 +399,8 @@ actions:
       entity_id: climate.mspa_heater_control
     data:
       temperature: "{{ state_attr('sensor.mspa_heat_schedule', 'target_temperature') }}"
+  - delay:
+      seconds: 30
   - action: notify.mobile_app_your_phone
     data:
       message: "MSpa conditioning started – ready at {{ states('sensor.mspa_readiness') }}"
@@ -366,6 +409,8 @@ actions:
 Replace `climate.mspa_heater_control`, `sensor.mspa_heat_schedule`, and `notify.mobile_app_your_phone` with your actual entity IDs — **including inside the template string in the notify action**.
 
 > **Two triggers, one condition**: The `state` trigger handles the normal case — it fires once when the sensor transitions to `Start now`. The `homeassistant.start` trigger is a safety net: if HA restarts while the sensor is already `Start now`, the state never *changes* so the first trigger won't fire; `homeassistant.start` catches that. The condition on both triggers ensures the action only runs if the sensor is genuinely in the `Start now` state. `mode: single` prevents both triggers from double-firing in edge cases.
+>
+> **Why the 30-second delay before notify**: The integration confirms commands via rapid polling (every 1 s for 15 s after a command). The delay gives the coordinator time to poll the updated device state and recalculate the **Ready at** estimate with the correct target temperature before the notification is sent. Without it, the notification may read a stale value.
 >
 > **Why use Ready at for the notification**: The Ready at sensor reflects the actual current water temperature and learned heating rate, so if the spa is already partially warm the estimated ready time will be sooner than the original schedule. It also already handles multi-day offsets (e.g. `10:34 +1d`). It will never show `Ready` in this context because the automation only fires when heating is needed.
 
