@@ -266,6 +266,110 @@ grid_options:
 
 ![example card](img/spa_ready_card.png)
 
+## Readiness Sensor
+
+The **Readiness** sensor gives a single, human-readable answer to "is the spa ready, and if not, when?".
+
+| State | Meaning |
+|-------|---------|
+| `Ready` | Temperature is within 5 minutes of target |
+| `HH:MM` | Estimated time to reach target today |
+| `HH:MM +Nd` | Estimated time with a day offset (e.g. `+1d` = tomorrow) |
+
+### Attributes
+
+| Attribute | Description |
+|-----------|-------------|
+| `direction` | `heating`, `cooling`, or `at_target` |
+| `minutes_remaining` | Integer countdown (null when ready or unavailable) |
+| `color` | `green` (ready/at_target), `red` (heating), `light-blue` (cooling) |
+
+The `color` attribute is intended for use with a **Mushroom Template Card**:
+
+```yaml
+type: custom:mushroom-template-card
+primary: "{{ states('sensor.mspa_readiness') }}"
+icon: mdi:hot-tub
+color: "{{ state_attr('sensor.mspa_readiness', 'color') }}"
+```
+
+## Heat Schedule Sensor
+
+The **Heat Schedule** sensor tells you when to start conditioning the spa for your next planned session. Give it a target ready time via an `input_datetime` helper and it works out the start time automatically — for both heating up and cooling down.
+
+### Configuration
+
+1. Create an `input_datetime` helper in Home Assistant (**Settings → Devices & Services → Helpers → Add Helper → Date and/or time**). Enable both **date** and **time**. Name it something like *Hot tub ready at*.
+
+2. In the integration options (**Settings → Devices & Services → MSpa → ⚙️ Configure**):
+   - **Schedule: Ready at** — select your `input_datetime` helper
+   - **Schedule: Target Temperature** — the temperature to reach by the target time (default 40 °C)
+
+3. Update the helper whenever you plan a session. The sensor automatically calculates the conditioning start time.
+
+### States
+
+| State | Meaning |
+|-------|---------|
+| `Not scheduled` | No target time set, or the set time has passed |
+| `Ready` | The spa is already within 1 °C of the target temperature |
+| `Start now` | Conditioning should begin immediately to reach the target in time |
+| `Start at HH:MM` | Conditioning should start at this time today |
+| `Start at HH:MM +Nd` | Conditioning should start in N days at this time |
+
+The sensor works in both directions: if the spa needs to heat up it uses the learned bucket heating rates; if it needs to cool down it uses the learned cooling rate.
+
+### Attributes
+
+| Attribute | Description |
+|-----------|-------------|
+| `target_time` | ISO 8601 timestamp of the planned ready time |
+| `start_at` | ISO 8601 timestamp when conditioning should begin |
+| `target_temperature` | The configured target temperature (°C) |
+
+### Automation example
+
+Trigger the spa automatically when it is time to start conditioning for the next planned session.
+
+The `Start now` state is the clean trigger — the sensor transitions to it at exactly the right moment based on the learned rates, so no polling or conditions are needed.
+
+```yaml
+alias: "MSpa – Start conditioning for planned session"
+mode: single
+trigger:
+  - platform: state
+    entity_id: sensor.mspa_heat_schedule
+    to: "Start now"
+  - platform: homeassistant
+    event: start
+condition:
+  - condition: state
+    entity_id: sensor.mspa_heat_schedule
+    state: "Start now"
+action:
+  - service: climate.set_hvac_mode
+    target:
+      entity_id: climate.mspa
+    data:
+      hvac_mode: heat
+  - service: climate.set_temperature
+    target:
+      entity_id: climate.mspa
+    data:
+      temperature: "{{ state_attr('sensor.mspa_heat_schedule', 'target_temperature') }}"
+  - service: notify.mobile_app
+    data:
+      message: >
+        MSpa conditioning started.
+        Ready at: {{ state_attr('sensor.mspa_heat_schedule', 'target_time') | as_datetime | as_local | strftime('%H:%M') }}
+```
+
+Replace `climate.mspa` and `sensor.mspa_heat_schedule` with your actual entity IDs.
+
+> **Two triggers, one condition**: The `state` trigger handles the normal case — it fires once when the sensor transitions to `Start now`. The `homeassistant.start` trigger is a safety net: if HA restarts while the sensor is already `Start now`, the state never *changes* so the first trigger won't fire; `homeassistant.start` catches that. The condition on both triggers ensures the action only runs if the sensor is genuinely in the `Start now` state. `mode: single` prevents both triggers from double-firing in edge cases.
+
+> **How the timing is calculated**: The sensor uses the same temperature-bucketed rate model as the Time to Target Temperature sensor, accounting for how heating rate varies across the temperature range and applying the historical prediction bias correction.
+
 ## Power and Energy Monitoring
 
 The integration provides comprehensive power and energy monitoring for your hot tub, including individual component sensors and total power/energy tracking that can be added directly to Home Assistant's Energy dashboard.

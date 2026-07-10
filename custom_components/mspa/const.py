@@ -88,7 +88,7 @@ DEFAULT_HEATER_POWER_HEAT = 2000  # Heating element in active heating (estimated
 CONF_WEATHER_ENTITY = "weather_entity"
 
 # Optional heat-schedule: calendar-driven automatic preheat scheduling.
-CONF_SCHEDULE_CALENDAR = "schedule_calendar"
+CONF_SCHEDULE_DATETIME = "schedule_datetime"
 CONF_SCHEDULE_TARGET_TEMP = "schedule_target_temp"
 CONF_SCHEDULE_LOOKAHEAD_DAYS = "schedule_lookahead_days"
 DEFAULT_SCHEDULE_TARGET_TEMP = 40.0

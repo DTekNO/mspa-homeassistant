@@ -13,7 +13,7 @@ from .const import (
     DEFAULT_BUBBLE_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
     DEFAULT_HEATER_POWER_HEAT,
-    CONF_SCHEDULE_CALENDAR,
+    CONF_SCHEDULE_DATETIME,
     CONF_SCHEDULE_TARGET_TEMP,
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
     DEFAULT_SCHEDULE_TARGET_TEMP,
@@ -566,16 +566,15 @@ class MSpaReadinessSensor(MSpaSensorEntity):
 
 
 class MSpaHeatScheduleSensor(MSpaSensorEntity):
-    """Calendar-driven preheat schedule sensor.
+    """input_datetime-driven spa conditioning schedule sensor.
 
-    Reads the next event start_time from a configured calendar entity and
-    uses the integration's learned heating rates to compute the moment the
-    heater must be started to reach the target temperature by arrival time.
+    Reads the target ready time from a configured input_datetime helper and
+    uses the integration's learned rates to compute when conditioning must
+    start to reach the target temperature by that time.  Works for both
+    heating (target > current) and cooling (target < current).
 
-    State: human-readable "Start at HH:MM [+Nd]" / "Start now" / "Ready" /
-           "At cottage" / "No scheduled heating".
-    Attributes: target_time, start_at (UTC datetime), target_temperature —
-                suitable for use in automation triggers.
+    State: "Not scheduled" / "Ready" / "Start now" / "Start at HH:MM [+Nd]"
+    Attributes: target_time, start_at (ISO 8601), target_temperature
     """
 
     name = "Heat Schedule"
@@ -589,33 +588,30 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         self._attr_device_info = self.device_info
 
     def _schedule_data(self):
-        """Return (target_dt_utc, target_temp, start_at_utc) or None on any failure."""
+        """Return (target_dt_utc, target_temp, start_at_utc) or a sentinel string."""
         options = self._config_entry.options
-        cal_entity = options.get(CONF_SCHEDULE_CALENDAR)
-        if not cal_entity:
+        dt_entity = options.get(CONF_SCHEDULE_DATETIME)
+        if not dt_entity:
             return None
 
-        cal_state = self.hass.states.get(cal_entity)
-        if cal_state is None:
+        dt_state = self.hass.states.get(dt_entity)
+        if dt_state is None or dt_state.state in ("unknown", "unavailable"):
             return None
 
-        # If the event is currently active we're already there — nothing to schedule
-        if cal_state.state == "on":
-            return "at_cottage"
-
-        start_time_str = cal_state.attributes.get("start_time")
-        if not start_time_str:
-            return None
-
-        target_dt = dt_util.parse_datetime(start_time_str)
+        target_dt = dt_util.parse_datetime(dt_state.state)
         if target_dt is None:
             return None
+        if target_dt.tzinfo is None:
+            target_dt = dt_util.as_local(target_dt)
         target_utc = dt_util.as_utc(target_dt)
         now_utc = dt_util.utcnow()
 
+        if target_utc <= now_utc:
+            return None
+
         days_until = (target_utc - now_utc).total_seconds() / 86400
         lookahead = int(options.get(CONF_SCHEDULE_LOOKAHEAD_DAYS, DEFAULT_SCHEDULE_LOOKAHEAD_DAYS))
-        if days_until < 0 or days_until > lookahead:
+        if days_until > lookahead:
             return None
 
         target_temp = float(options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP))
@@ -626,23 +622,28 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         except (TypeError, ValueError):
             return None
 
-        if current_temp >= target_temp:
+        if abs(current_temp - target_temp) <= 1.0:
             return "ready"
 
-        heating_minutes = _segmented_heating_minutes(current_temp, target_temp, self.coordinator)
-        if heating_minutes is None:
+        if target_temp > current_temp:
+            minutes_needed = _segmented_heating_minutes(current_temp, target_temp, self.coordinator)
+        else:
+            rate = _effective_cool_rate(self.coordinator)
+            if rate is None:
+                return None
+            minutes_needed = ((current_temp - target_temp) / rate) * 60.0
+
+        if minutes_needed is None:
             return None
 
-        start_at_utc = target_utc - timedelta(minutes=heating_minutes)
+        start_at_utc = target_utc - timedelta(minutes=minutes_needed)
         return (target_utc, target_temp, start_at_utc)
 
     @property
     def native_value(self):
         result = self._schedule_data()
         if result is None:
-            return "No scheduled heating"
-        if result == "at_cottage":
-            return "At cottage"
+            return "Not scheduled"
         if result == "ready":
             return "Ready"
 

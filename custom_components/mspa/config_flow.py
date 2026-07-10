@@ -24,7 +24,7 @@ from .const import (
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_WEATHER_ENTITY,
-    CONF_SCHEDULE_CALENDAR,
+    CONF_SCHEDULE_DATETIME,
     CONF_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_TARGET_TEMP,
 )
@@ -291,9 +291,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 description={"suggested_value": self.config_entry.options.get(CONF_WEATHER_ENTITY)},
             ): EntitySelector(EntitySelectorConfig(domain="weather")),
             vol.Optional(
-                CONF_SCHEDULE_CALENDAR,
-                description={"suggested_value": self.config_entry.options.get(CONF_SCHEDULE_CALENDAR)},
-            ): EntitySelector(EntitySelectorConfig(domain="calendar")),
+                CONF_SCHEDULE_DATETIME,
+                description={"suggested_value": self.config_entry.options.get(CONF_SCHEDULE_DATETIME)},
+            ): EntitySelector(EntitySelectorConfig(domain="input_datetime")),
             vol.Optional(
                 CONF_SCHEDULE_TARGET_TEMP,
                 default=self.config_entry.options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP),
