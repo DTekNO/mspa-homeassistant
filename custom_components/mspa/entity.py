@@ -4,6 +4,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.climate import ClimateEntity
+from homeassistant.components.datetime import DateTimeEntity
 from homeassistant.helpers import device_registry as dr
 
 from .const import DOMAIN
@@ -74,4 +75,7 @@ class MSpaSwitchEntity(MSpaBaseEntity, CoordinatorEntity, SwitchEntity):
     pass
 
 class MSpaNumberEntity(MSpaBaseEntity, CoordinatorEntity, NumberEntity):
+    pass
+
+class MSpaDateTimeEntity(MSpaBaseEntity, CoordinatorEntity, DateTimeEntity):
     pass

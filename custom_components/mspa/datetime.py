@@ -2,12 +2,11 @@
 import logging
 from datetime import datetime
 
-from homeassistant.components.datetime import DateTimeEntity
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .entity import MSpaBaseEntity
+from .entity import MSpaDateTimeEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -17,7 +16,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities([MSpaScheduledReadyAt(coordinator)])
 
 
-class MSpaScheduledReadyAt(MSpaBaseEntity, RestoreEntity, DateTimeEntity):
+class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
     """Scheduled ready-at time for the spa.
 
     Appears in the device panel under Controls.  Set it to when you want the
