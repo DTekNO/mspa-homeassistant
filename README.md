@@ -359,9 +359,7 @@ action:
       temperature: "{{ state_attr('sensor.mspa_heat_schedule', 'target_temperature') }}"
   - service: notify.mobile_app
     data:
-      message: >
-        MSpa conditioning started.
-        Ready at: {{ state_attr('sensor.mspa_heat_schedule', 'target_time') | as_datetime | as_local | strftime('%H:%M') }}
+      message: "MSpa conditioning started – ready at {{ (as_datetime(state_attr('sensor.mspa_heat_schedule', 'target_time')) | as_local).strftime('%H:%M') }}"
 ```
 
 Replace `climate.mspa` and `sensor.mspa_heat_schedule` with your actual entity IDs.
