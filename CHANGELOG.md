@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Heat Schedule sensor** — predicts when to start conditioning based on a planned session time, using the learned temperature-bucketed heating rates. Works for both heating and cooling. Requires the new **Scheduled for** datetime control to be set.
+- **Scheduled for** datetime control — a datetime entity owned by the device (appears in the device panel under Controls). Set it to when you want the spa ready; no external `input_datetime` helper needed.
+- **Ready at attribute** — the `ready_at` ISO 8601 timestamp is now exposed as an attribute on the Ready at sensor for use in automations and template cards.
+- **Device-reported heating rate clamped** — the API `device_heat_perhour` seed value is now clamped to 0.5–2.0 °C/h to prevent implausible cold-start estimates.
+
+### Changed
+- **Readiness sensor renamed to "Ready at"** — the sensor unique ID is unchanged so the entity ID in existing installations is preserved; only the display name changes. *(Experimental)*
+
+### Removed
+- **⚠️ BREAKING: "Ready At" timestamp sensor removed** — the `sensor.mspa_xxx_ready_at` timestamp entity (device class: timestamp) has been removed. It was redundant with the renamed "Ready at" sensor. *(Experimental)*
+
+  **Migration**: Replace references with the **Ready at** sensor (`sensor.mspa_xxx_readiness` on existing installs, `sensor.mspa_xxx_ready_at` on new installs):
+  - Dashboards showing the timestamp → use the sensor state directly (`10:34`, `10:34 +1d`, `Ready`)
+  - Conditional cards using `state_not: unavailable` → add a second condition `state_not: Ready`, or show the card always (it displays `Ready` at target)
+  - Automations triggering `to: unavailable` (spa reached target) → change to `to: "Ready"`
+  - Automations/templates reading the timestamp value → use the `ready_at` attribute (`state_attr('sensor.mspa_xxx_readiness', 'ready_at')`)
+
+- **⚠️ BREAKING: "Time to Target Temperature" sensor removed** — the `sensor.mspa_xxx_time_to_target_temperature` entity has been removed. All its attributes (including the diagnostic algorithm internals) have been merged into the **Ready at** sensor. *(Experimental)*
+
+  **Migration**: Replace references with the **Ready at** sensor (`sensor.mspa_xxx_readiness` on existing installs):
+  - Dashboards or cards showing minutes → use `state_attr('sensor.mspa_xxx_readiness', 'minutes_remaining')`
+  - Conditional cards using `state_not: unavailable` → same as above
+  - Automations comparing minutes numerically → use `state_attr(..., 'minutes_remaining') | int`
+  - Attribute references (e.g. `direction`, `prediction_bias`, bucket rates) → same attribute names, now on the Ready at sensor
+
+---
+
 ## [3.0.5] - 2026-06-16
 
 ### Fixed

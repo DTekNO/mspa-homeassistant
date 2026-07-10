@@ -236,6 +236,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Deactivates when within _NEAR_TARGET_DEACTIVATE of target;
         # reactivates only when _NEAR_TARGET_ACTIVATE away, preventing flicker.
         self.near_target: bool = False
+        self.scheduled_ready_at: datetime | None = None  # set by MSpaScheduledReadyAt entity
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.

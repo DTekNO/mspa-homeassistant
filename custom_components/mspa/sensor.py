@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from homeassistant.components.sensor import SensorStateClass, SensorDeviceClass
 from homeassistant.helpers.entity import EntityCategory
-from homeassistant.const import UnitOfPower, UnitOfEnergy, UnitOfTime
+from homeassistant.const import UnitOfPower, UnitOfEnergy
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
@@ -13,7 +13,6 @@ from .const import (
     DEFAULT_BUBBLE_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
     DEFAULT_HEATER_POWER_HEAT,
-    CONF_SCHEDULE_DATETIME,
     CONF_SCHEDULE_TARGET_TEMP,
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
     DEFAULT_SCHEDULE_TARGET_TEMP,
@@ -124,8 +123,6 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # They show as unavailable until a reliable rate is established
     # (computed EMA for heating/cooling, or device_heat_perhour as fallback for heating).
     async_add_entities([
-        MSpaTempReachSensor(coordinator),
-        MSpaTempReachReadyAtSensor(coordinator),
         MSpaReadinessSensor(coordinator),
         MSpaHeatScheduleSensor(coordinator, entry),
     ])
@@ -230,14 +227,16 @@ def _effective_heat_rate(coordinator) -> float | None:
     if computed is not None and computed > 0:
         return computed
 
-    # Fall back to device-reported rate (1/10 °C per hour)
+    # Fall back to device-reported rate (1/10 °C per hour).
+    # Clamped to 0.5–2.0 °C/h — physically plausible range for MSpa units.
+    # Only used as a cold-start seed until the EMA has real observations.
     raw = coordinator._last_data.get("device_heat_perhour", 0)
     try:
         raw = int(raw)
     except (TypeError, ValueError):
         return None
     if raw > 0:
-        return raw / 10.0
+        return max(0.5, min(2.0, raw / 10.0))
 
     return None
 
@@ -387,131 +386,6 @@ def _spa_direction(coordinator) -> str | None:
     return "at_target"
 
 
-class MSpaTempReachSensor(MSpaSensorEntity):
-    """Estimated minutes until the spa reaches its target temperature.
-
-    Works in both directions: counts down while heating up *or* while cooling
-    down to a lower target.  Uses the best available rate for the current
-    direction — the coordinator's learned EMA first, then the device-reported
-    `device_heat_perhour` value as a heating fallback.
-    Returns unavailable until a rate has been established.
-    """
-
-    name = "Time to Target Temperature"
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_suggested_display_precision = 0
-    _attr_icon = "mdi:timer-sand"
-
-    def __init__(self, coordinator):
-        super().__init__(coordinator)
-        self._attr_unique_id = f"mspa_time_to_target_{getattr(coordinator, 'device_id', 'unknown')}"
-        self._attr_device_info = self.device_info
-
-    def _compute_minutes(self) -> int | None:
-        """Return minutes to target, counting down each poll. None when unavailable."""
-        return _minutes_to_target(self.coordinator)
-
-    @property
-    def available(self):
-        return super().available and self._compute_minutes() is not None
-
-    @property
-    def native_value(self):
-        return self._compute_minutes()
-
-    @property
-    def extra_state_attributes(self):
-        data = self.coordinator._last_data
-        try:
-            water_temp = float(data.get("water_temperature"))
-            target_temp = float(data.get("target_temperature"))
-        except (TypeError, ValueError):
-            water_temp = target_temp = None
-
-        if water_temp is not None and target_temp is not None:
-            effective = _effective_rate(self.coordinator, water_temp, target_temp)
-        else:
-            effective = None
-        direction = _spa_direction(self.coordinator)
-
-        computed_heat = getattr(self.coordinator, "computed_heat_rate", None)
-        computed_cool = getattr(self.coordinator, "computed_cool_rate", None)
-        raw = data.get("device_heat_perhour", 0)
-        try:
-            device_rate = int(raw) / 10.0 if int(raw) > 0 else None
-        except (TypeError, ValueError):
-            device_rate = None
-
-        buckets = getattr(self.coordinator, "heat_rate_buckets", [None, None, None])
-        session_scalar = getattr(self.coordinator, "_session_scalar", 1.0)
-        prediction_bias = getattr(self.coordinator, "prediction_bias", 1.0)
-        return {
-            "direction": direction,
-            "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
-            "computed_heat_rate_deg_per_hour": round(computed_heat, 3) if computed_heat is not None else None,
-            "computed_cool_rate_deg_per_hour": round(computed_cool, 3) if computed_cool is not None else None,
-            "heat_rate_cold_deg_per_hour": round(buckets[0], 3) if buckets[0] is not None else None,
-            "heat_rate_mid_deg_per_hour": round(buckets[1], 3) if buckets[1] is not None else None,
-            "heat_rate_hot_deg_per_hour": round(buckets[2], 3) if buckets[2] is not None else None,
-            "session_condition_scalar": round(session_scalar, 3),
-            "prediction_bias": round(prediction_bias, 3),
-            "device_rate_deg_per_hour": device_rate,
-            "current_temperature": water_temp,
-            "target_temperature": target_temp,
-        }
-
-
-class MSpaTempReachReadyAtSensor(MSpaSensorEntity):
-    """Timestamp at which the spa is expected to reach its target temperature.
-
-    Works in both directions (heating up or cooling down).  Returns `None`
-    (→ unavailable) once the target is already reached, making it trivial to
-    conditionally show/hide the sensor in dashboards and automations using the
-    standard `is_unavailable` / `is_available` tests.
-    """
-
-    name = "Ready At"
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
-    _attr_icon = "mdi:clock-check-outline"
-
-    def __init__(self, coordinator):
-        super().__init__(coordinator)
-        self._attr_unique_id = f"mspa_heating_ready_at_{getattr(coordinator, 'device_id', 'unknown')}"
-        self._attr_device_info = self.device_info
-
-    def _compute_ready_at(self):
-        """Return ready-at timestamp, counting down each poll. None when unavailable."""
-        if self.coordinator.near_target:
-            return None
-        anchor_time   = self.coordinator.temp_anchor_time
-        anchor_temp   = self.coordinator.temp_anchor_temp
-        anchor_target = self.coordinator.temp_anchor_target
-        if anchor_time is None or anchor_temp is None or anchor_target is None:
-            return None
-        if anchor_target > anchor_temp:
-            anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, self.coordinator)
-        elif anchor_target < anchor_temp:
-            rate = _effective_cool_rate(self.coordinator)
-            if rate is None:
-                return None
-            anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
-        else:
-            return None
-        if anchor_minutes is None:
-            return None
-        return anchor_time + timedelta(minutes=anchor_minutes)
-
-    @property
-    def available(self):
-        return super().available and self._compute_ready_at() is not None
-
-    @property
-    def native_value(self):
-        return self._compute_ready_at()
-
-
 class MSpaReadinessSensor(MSpaSensorEntity):
     """Human-readable spa readiness sensor.
 
@@ -521,7 +395,7 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     hot-tub=ready.  No device_class or state_class — plain text sensor.
     """
 
-    name = "Readiness"
+    name = "Ready at"
     _attr_icon = "mdi:hot-tub"
 
     def __init__(self, coordinator):
@@ -553,16 +427,52 @@ class MSpaReadinessSensor(MSpaSensorEntity):
 
     @property
     def extra_state_attributes(self):
+        mins = _minutes_to_target(self.coordinator)
         direction = _spa_direction(self.coordinator)
         color = (
             "red" if direction == "heating"
             else "light-blue" if direction == "cooling"
             else "green"
         )
+        ready_at_ts = None
+        if mins is not None and mins > 0:
+            ready_at_ts = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat()
+
+        data = self.coordinator._last_data
+        try:
+            water_temp = float(data.get("water_temperature"))
+            target_temp = float(data.get("target_temperature"))
+        except (TypeError, ValueError):
+            water_temp = target_temp = None
+
+        effective = _effective_rate(self.coordinator, water_temp, target_temp) if water_temp is not None and target_temp is not None else None
+        computed_heat = getattr(self.coordinator, "computed_heat_rate", None)
+        computed_cool = getattr(self.coordinator, "computed_cool_rate", None)
+        raw = data.get("device_heat_perhour", 0)
+        try:
+            device_rate = int(raw) / 10.0 if int(raw) > 0 else None
+        except (TypeError, ValueError):
+            device_rate = None
+        buckets = getattr(self.coordinator, "heat_rate_buckets", [None, None, None])
+        session_scalar = getattr(self.coordinator, "_session_scalar", 1.0)
+        prediction_bias = getattr(self.coordinator, "prediction_bias", 1.0)
+
         return {
             "direction": direction,
-            "minutes_remaining": _minutes_to_target(self.coordinator),
+            "minutes_remaining": mins,
             "color": color,
+            "ready_at": ready_at_ts,
+            "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
+            "computed_heat_rate_deg_per_hour": round(computed_heat, 3) if computed_heat is not None else None,
+            "computed_cool_rate_deg_per_hour": round(computed_cool, 3) if computed_cool is not None else None,
+            "heat_rate_cold_deg_per_hour": round(buckets[0], 3) if buckets[0] is not None else None,
+            "heat_rate_mid_deg_per_hour": round(buckets[1], 3) if buckets[1] is not None else None,
+            "heat_rate_hot_deg_per_hour": round(buckets[2], 3) if buckets[2] is not None else None,
+            "session_condition_scalar": round(session_scalar, 3),
+            "prediction_bias": round(prediction_bias, 3),
+            "device_rate_deg_per_hour": device_rate,
+            "current_temperature": water_temp,
+            "target_temperature": target_temp,
         }
 
 
@@ -590,20 +500,10 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 
     def _schedule_data(self):
         """Return (target_dt_utc, target_temp, start_at_utc) or a sentinel string."""
-        options = self._config_entry.options
-        dt_entity = options.get(CONF_SCHEDULE_DATETIME)
-        if not dt_entity:
-            return None
-
-        dt_state = self.hass.states.get(dt_entity)
-        if dt_state is None or dt_state.state in ("unknown", "unavailable"):
-            return None
-
-        target_dt = dt_util.parse_datetime(dt_state.state)
+        target_dt = self.coordinator.scheduled_ready_at
         if target_dt is None:
             return None
-        if target_dt.tzinfo is None:
-            target_dt = dt_util.as_local(target_dt)
+
         target_utc = dt_util.as_utc(target_dt)
         now_utc = dt_util.utcnow()
 
@@ -611,6 +511,7 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
             return None
 
         days_until = (target_utc - now_utc).total_seconds() / 86400
+        options = self._config_entry.options
         lookahead = int(options.get(CONF_SCHEDULE_LOOKAHEAD_DAYS, DEFAULT_SCHEDULE_LOOKAHEAD_DAYS))
         if days_until > lookahead:
             return None

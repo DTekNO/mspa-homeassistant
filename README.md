@@ -125,16 +125,33 @@ The integration uses a 3-tier adaptive polling system to balance responsiveness 
 
 > **Note:** There is no way to receive push notifications from the MSpa cloud — all integrations must poll. This adaptive system minimises unnecessary traffic while keeping the UI responsive during active use.
 
-## Time to Target Temperature Sensors *(Experimental)*
+---
 
-> ⚠️ **These sensors are experimental.** The self-learning rate algorithm is new and has not yet been validated across a full seasonal range of conditions. Treat the estimates as a rough guide rather than a precise prediction. Feedback on accuracy is very welcome — please open an issue with your model and observations.
+## ⚠️ Experimental: Predictive Scheduling
 
-The integration provides two sensors that estimate when the spa will reach its set-point temperature. They work in **both directions** — counting down while heating up *and* while cooling down to a lower target.
+> **These features are experimental.** The self-learning rate algorithm has not yet been validated across a full seasonal range of conditions. Estimates improve over time but should be treated as a guide rather than a precise prediction. The scheduling automation should not be your only safeguard — build in a time buffer (see [Heat Schedule Sensor](#heat-schedule-sensor)).
+>
+> Feedback on accuracy is very welcome — please open an issue with your model and observations.
 
-| Sensor | Description |
-|---|---|
-| **Time to Target Temperature** | Minutes until the set-point is reached |
-| **Ready At** | Absolute timestamp (clock time) when the spa should be ready |
+This section covers three related sensors and one control entity that work together:
+
+| Entity | Type | Purpose |
+|--------|------|---------|
+| **Ready at** | Sensor | Estimated ready time — "10:34", "10:34 +1d", or "Ready". `minutes_remaining` available as attribute. |
+| **Heat Schedule** | Sensor | When to start heating for a planned session |
+| **Scheduled for** | Control (datetime) | Set when you want the spa ready |
+
+### First-time use — no learning data yet
+
+On a brand-new installation the integration has no observed heating or cooling rates. Here is what happens:
+
+**Heating estimates**: Some MSpa models report their own heating rate via the `device_heat_perhour` diagnostic value. The integration uses this as a cold-start seed, clamped to a physically plausible range of **0.5–2.0 °C/h**. On models that report a zero or missing value, no seed is available — the Ready at and Heat Schedule sensors will remain **unavailable** until the EMA has learned from at least one real heating run. On supported models, estimates are available from the very first heating cycle — not yet accurate but in the right ballpark.
+
+**Cooling estimates**: There is no device-reported cooling rate. The cooling sensors (when the target is lower than the current temperature) remain **unavailable** until the integration has observed at least one passive cooling cycle.
+
+**How quickly does it improve?** After 2–3 full heating runs the EMA has enough data to start outperforming the device seed. The bucket-based model (which tracks rates separately for cold, mid, and hot temperature ranges) fills in over the first few weeks of normal use. The prediction bias correction — which adjusts for systematic over- or under-estimation — also needs a few completed heating sessions to calibrate.
+
+**The device seed is replaced automatically** the first time the EMA produces a valid observation for the same temperature bucket. You do not need to do anything.
 
 ### How the rate is learned
 
@@ -145,7 +162,7 @@ The integration learns the heating and cooling rates by observing actual tempera
 
 Rates are fed into an **exponential moving average (EMA)** so that the estimate adapts gradually as conditions change (ambient temperature, water volume, lid on/off). Outliers — for example from adding hot or cold water — are rejected before they can distort the EMA.
 
-Both sensors show as **unavailable** until at least one valid rate sample has been collected. On a typical heating cycle this means the sensors become active after the first 0.5 °C step that takes longer than 3 minutes (usually well within the first 30 minutes of heating).
+The **Ready at** sensor shows as **unavailable** until at least one valid rate sample has been collected. On a typical heating cycle this means the sensor becomes active after the first 0.5 °C step that takes longer than 3 minutes (usually well within the first 30 minutes of heating).
 
 #### Temperature-bucketed heating rates
 
@@ -171,11 +188,14 @@ Bucket rates loaded from storage are decayed toward the global flat EMA over tim
 
 ### Sensor attributes
 
-The **Time to Target Temperature** sensor exposes diagnostic attributes that are useful while the algorithm is still bedding in:
+The **Ready at** sensor exposes diagnostic attributes useful while the algorithm is still bedding in. The user-facing attributes (`direction`, `minutes_remaining`, `color`, `ready_at`) are at the top; the algorithm internals follow:
 
 | Attribute | Description |
 |---|---|
 | `direction` | `heating`, `cooling`, or `at_target` |
+| `minutes_remaining` | Integer minutes until target (null when ready or unavailable) |
+| `color` | `green` (ready), `red` (heating), `light-blue` (cooling) — for Mushroom card |
+| `ready_at` | ISO 8601 timestamp of estimated ready time (null when ready or unavailable) |
 | `effective_rate_deg_per_hour` | Rate being used for the current estimate |
 | `computed_heat_rate_deg_per_hour` | Learned EMA heating rate (`null` until first sample) |
 | `computed_cool_rate_deg_per_hour` | Learned EMA cooling rate (`null` until first sample) |
@@ -192,73 +212,38 @@ You can inspect these in **Developer Tools → States** to see how the algorithm
 
 ### Availability
 
-Both sensors become **unavailable** once the target temperature is reached (or no rate data is available yet). This makes them easy to use in conditional cards and automations:
+The **Ready at** sensor shows `Ready` when at target and becomes `unavailable` only when no rate data exists yet.
 
-**Show a card only while heating or cooling to target:**
-```yaml
-type: conditional
-conditions:
-  - condition: state
-    entity: sensor.mspa_ready_at
-    state_not: unavailable
-card:
-  type: entity
-  entity: sensor.mspa_ready_at
-```
-
-**Send a notification when the spa is ready:**
+**Notify when the spa reaches its target:**
 ```yaml
 trigger:
   - platform: state
     entity_id: sensor.mspa_ready_at
-    to: unavailable
-action:
-  - service: notify.mobile_app
+    to: "Ready"
+actions:
+  - action: notify.mobile_app_your_phone
     data:
       message: "The spa has reached its target temperature!"
 ```
 
-> **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The rate is re-learned each heating or cooling cycle. The integration automatically tracks prediction accuracy — grep for `PREDICTION_RESULT` in the Home Assistant log to see estimated vs actual times for each heating session.
+> **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The integration automatically tracks prediction accuracy — grep for `PREDICTION_RESULT` in the Home Assistant log to see estimated vs actual times for each heating session.
 
 ### Dashboard card example
 
-The example below uses the [Mushroom Template Card](https://github.com/piitaya/lovelace-mushroom) (available via HACS). It shows a countdown while heating or cooling, switches to "Your spa is ready!" once the target is reached, and hides itself entirely when the sensors are unavailable (heater off, no rate learned yet).
+The example below uses the [Mushroom Template Card](https://github.com/piitaya/lovelace-mushroom) (available via HACS). The **Ready at** sensor state (`10:34`, `10:34 +1d`, `Ready`) is used directly — no timestamp parsing needed.
 
 Replace `mspa_oslouvc` with your own entity name prefix.
 
 ```yaml
 type: custom:mushroom-template-card
-primary: >-
-  {% set mins = states('sensor.mspa_oslouvc_time_to_target_temperature') | int(-1) %}
-  {%- if mins <= 5 -%}
-    Your spa is ready!
-  {%- else -%}
-    Spa ready at
-  {%- endif %}
-secondary: >-
-  {% set t = states('sensor.mspa_oslouvc_ready_at') %}
-  {% set mins = states('sensor.mspa_oslouvc_time_to_target_temperature') | int(-1) %}
-  {%- if mins > 5 and t not in ('unavailable', 'unknown') -%}
-    {{ (as_datetime(t) | as_local).strftime('%H:%M') }}
-  {%- endif %}
-features_position: bottom
+primary: Hot tub
+secondary: "{{ states('sensor.mspa_oslouvc_ready_at') }}"
 icon: mdi:hot-tub
 visibility:
   - condition: state
-    entity: sensor.mspa_oslouvc_time_to_target_temperature
+    entity: sensor.mspa_oslouvc_ready_at
     state_not: unavailable
-color: >-
-  {% set d = state_attr('sensor.mspa_oslouvc_time_to_target_temperature', 'direction') %}
-  {% set mins = states('sensor.mspa_oslouvc_time_to_target_temperature') | int(-1) %}
-  {% if mins <= 5 %}
-    green
-  {% elif d == 'heating' %}
-    red
-  {% elif d == 'cooling' %}
-    blue
-  {% else %}
-    green
-  {% endif %}
+color: "{{ state_attr('sensor.mspa_oslouvc_ready_at', 'color') }}"
 grid_options:
   columns: full
   rows: 1
@@ -266,9 +251,9 @@ grid_options:
 
 ![example card](img/spa_ready_card.png)
 
-## Readiness Sensor
+## Ready at Sensor
 
-The **Readiness** sensor gives a single, human-readable answer to "is the spa ready, and if not, when?".
+The **Ready at** sensor gives a single, human-readable answer to "is the spa ready, and if not, when?".
 
 | State | Meaning |
 |-------|---------|
@@ -283,6 +268,7 @@ The **Readiness** sensor gives a single, human-readable answer to "is the spa re
 | `direction` | `heating`, `cooling`, or `at_target` |
 | `minutes_remaining` | Integer countdown (null when ready or unavailable) |
 | `color` | `green` (ready/at_target), `red` (heating), `light-blue` (cooling) |
+| `ready_at` | ISO 8601 timestamp of the estimated ready time (null when ready or unavailable) |
 
 The `color` attribute is intended for use with a **Mushroom Template Card**:
 
@@ -295,17 +281,16 @@ color: "{{ state_attr('sensor.mspa_readiness', 'color') }}"
 
 ## Heat Schedule Sensor
 
-The **Heat Schedule** sensor tells you when to start conditioning the spa for your next planned session. Give it a target ready time via an `input_datetime` helper and it works out the start time automatically — for both heating up and cooling down.
+The **Heat Schedule** sensor tells you when to start heating the spa for your next planned session. Set the **Ready at** datetime entity on the device to when you want the spa ready, and the sensor works out the heating start time automatically — for both heating up and cooling down.
 
 ### Configuration
 
-1. Create an `input_datetime` helper in Home Assistant (**Settings → Devices & Services → Helpers → Add Helper → Date and/or time**). Enable both **date** and **time**. Name it something like *Hot tub ready at*.
+The integration creates a **Scheduled for** datetime entity directly on the device — no external helper needed. It appears in the device panel under Controls.
 
-2. In the integration options (**Settings → Devices & Services → MSpa → ⚙️ Configure**):
-   - **Schedule: Ready at** — select your `input_datetime` helper
-   - **Schedule: Target Temperature** — the temperature to reach by the target time (default 40 °C)
+- Set it to when you want the spa to be ready.
+- In the integration options (**Settings → Devices & Services → MSpa → ⚙️ Configure**), set **Schedule: Target Temperature** — the temperature to reach by the target time (default 40 °C).
 
-3. Update the helper whenever you plan a session. The sensor automatically calculates the conditioning start time.
+Update the **Scheduled for** entity whenever you plan a session. The Heat Schedule sensor recalculates automatically.
 
 ### States
 
@@ -324,49 +309,54 @@ The sensor works in both directions: if the spa needs to heat up it uses the lea
 | Attribute | Description |
 |-----------|-------------|
 | `target_time` | ISO 8601 timestamp of the planned ready time |
-| `start_at` | ISO 8601 timestamp when conditioning should begin |
+| `start_at` | ISO 8601 timestamp when heating should begin |
 | `target_temperature` | The configured target temperature (°C) |
 
 ### Automation example
 
-Trigger the spa automatically when it is time to start conditioning for the next planned session.
+Trigger the spa automatically when it is time to start heating for the next planned session.
 
 The `Start now` state is the clean trigger — the sensor transitions to it at exactly the right moment based on the learned rates, so no polling or conditions are needed.
 
 ```yaml
 alias: "MSpa – Start conditioning for planned session"
+description: ""
 mode: single
-trigger:
-  - platform: state
+triggers:
+  - trigger: state
     entity_id: sensor.mspa_heat_schedule
     to: "Start now"
-  - platform: homeassistant
+  - trigger: homeassistant
     event: start
-condition:
+conditions:
   - condition: state
     entity_id: sensor.mspa_heat_schedule
     state: "Start now"
-action:
-  - service: climate.set_hvac_mode
+actions:
+  - action: climate.set_hvac_mode
     target:
-      entity_id: climate.mspa
+      entity_id: climate.mspa_heater_control
     data:
       hvac_mode: heat
-  - service: climate.set_temperature
+  - action: climate.set_temperature
     target:
-      entity_id: climate.mspa
+      entity_id: climate.mspa_heater_control
     data:
       temperature: "{{ state_attr('sensor.mspa_heat_schedule', 'target_temperature') }}"
-  - service: notify.mobile_app
+  - action: notify.mobile_app_your_phone
     data:
-      message: "MSpa conditioning started – ready at {{ (as_datetime(state_attr('sensor.mspa_heat_schedule', 'target_time')) | as_local).strftime('%H:%M') }}"
+      message: "MSpa conditioning started – ready at {{ states('sensor.mspa_readiness') }}"
 ```
 
-Replace `climate.mspa` and `sensor.mspa_heat_schedule` with your actual entity IDs.
+Replace `climate.mspa_heater_control`, `sensor.mspa_heat_schedule`, and `notify.mobile_app_your_phone` with your actual entity IDs — **including inside the template string in the notify action**.
 
 > **Two triggers, one condition**: The `state` trigger handles the normal case — it fires once when the sensor transitions to `Start now`. The `homeassistant.start` trigger is a safety net: if HA restarts while the sensor is already `Start now`, the state never *changes* so the first trigger won't fire; `homeassistant.start` catches that. The condition on both triggers ensures the action only runs if the sensor is genuinely in the `Start now` state. `mode: single` prevents both triggers from double-firing in edge cases.
+>
+> **Why use Ready at for the notification**: The Ready at sensor reflects the actual current water temperature and learned heating rate, so if the spa is already partially warm the estimated ready time will be sooner than the original schedule. It also already handles multi-day offsets (e.g. `10:34 +1d`). It will never show `Ready` in this context because the automation only fires when heating is needed.
 
-> **How the timing is calculated**: The sensor uses the same temperature-bucketed rate model as the Time to Target Temperature sensor, accounting for how heating rate varies across the temperature range and applying the historical prediction bias correction.
+> **How the timing is calculated**: The sensor uses a temperature-bucketed rate model, accounting for how heating rate varies across the temperature range and applying the historical prediction bias correction.
+
+---
 
 ## Power and Energy Monitoring
 
