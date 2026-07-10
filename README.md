@@ -285,12 +285,27 @@ The **Heat Schedule** sensor tells you when to start heating the spa for your ne
 
 ### Configuration
 
-The integration creates a **Scheduled for** datetime entity directly on the device — no external helper needed. It appears in the device panel under Controls.
+The integration creates a **Scheduled for** datetime entity directly on the device — no external helper needed. It appears under **Configuration** in the device panel.
 
 - Set it to when you want the spa to be ready.
 - In the integration options (**Settings → Devices & Services → MSpa → ⚙️ Configure**), set **Schedule: Target Temperature** — the temperature to reach by the target time (default 40 °C).
 
 Update the **Scheduled for** entity whenever you plan a session. The Heat Schedule sensor recalculates automatically.
+
+### Dashboard card
+
+A simple tile card works well for setting the schedule from a dashboard:
+
+```yaml
+type: tile
+entity: datetime.mspa_scheduled_for
+name: Hot tub ready at
+icon: mdi:calendar-clock
+```
+
+Replace `datetime.mspa_scheduled_for` with your actual entity ID. Clicking the tile opens a popup datetime picker.
+
+> **For custom cards**: the **Ready at** sensor exposes a `color` attribute (`red` for heating, `light-blue` for cooling, `green` for ready) that can drive icon colour or card styling in a Mushroom Template Card or similar. See the [Ready at Sensor](#ready-at-sensor) section for an example.
 
 ### States
 
@@ -355,6 +370,38 @@ Replace `climate.mspa_heater_control`, `sensor.mspa_heat_schedule`, and `notify.
 > **Why use Ready at for the notification**: The Ready at sensor reflects the actual current water temperature and learned heating rate, so if the spa is already partially warm the estimated ready time will be sooner than the original schedule. It also already handles multi-day offsets (e.g. `10:34 +1d`). It will never show `Ready` in this context because the automation only fires when heating is needed.
 
 > **How the timing is calculated**: The sensor uses a temperature-bucketed rate model, accounting for how heating rate varies across the temperature range and applying the historical prediction bias correction.
+
+### Syncing the schedule from a calendar (optional)
+
+If you use a Home Assistant calendar to track spa sessions, you can automatically set **Scheduled for** from the next calendar event. This automation fires when the calendar state changes or when HA restarts, and sets the target time so that the heating is complete 4 hours before you need it. This gives the MSpa time to heat the water with some buffer so it is ready before you need it. Adjust the offset to match your preference.
+
+```yaml
+alias: "MSpa – Sync schedule from calendar"
+description: ""
+mode: single
+triggers:
+  - trigger: state
+    entity_id: calendar.your_calendar
+  - trigger: homeassistant
+    event: start
+conditions:
+  - condition: template
+    value_template: >
+      {% set start = state_attr('calendar.your_calendar', 'start_time') %}
+      {{ start is not none and as_local(as_datetime(start)) > now() + timedelta(hours=4) }}
+actions:
+  - action: datetime.set_value
+    target:
+      entity_id: datetime.mspa_scheduled_for
+    data:
+      datetime: >
+        {{ (as_local(as_datetime(state_attr('calendar.your_calendar', 'start_time'))) - timedelta(hours=4))
+           .strftime('%Y-%m-%d %H:%M:%S') }}
+```
+
+Replace `calendar.your_calendar` and `datetime.mspa_scheduled_for` with your actual entity IDs.  Once the integration has learned your heating rates, the Heat Schedule sensor will more accurately predict the heating time and a high "safety margin" will not be needed. You can use to fine-tune this value.
+
+> **Timezone note**: `as_local()` is required around `as_datetime()` here. Home Assistant calendar integrations return start times as timezone-naive strings; without `as_local()` the comparison with `now()` (which is always timezone-aware) will raise a template error.
 
 ---
 

@@ -428,6 +428,7 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     @property
     def extra_state_attributes(self):
         mins = _minutes_to_target(self.coordinator)
+        rounded = (round(mins / 5) * 5) if (mins is not None and mins > 5) else mins
         direction = _spa_direction(self.coordinator)
         color = (
             "red" if direction == "heating"
@@ -435,8 +436,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             else "green"
         )
         ready_at_ts = None
-        if mins is not None and mins > 0:
-            ready_at_ts = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat()
+        if rounded is not None and rounded > 0:
+            ready_at_ts = (datetime.now(timezone.utc) + timedelta(minutes=rounded)).isoformat()
 
         data = self.coordinator._last_data
         try:
@@ -459,7 +460,7 @@ class MSpaReadinessSensor(MSpaSensorEntity):
 
         return {
             "direction": direction,
-            "minutes_remaining": mins,
+            "minutes_remaining": rounded,
             "color": color,
             "ready_at": ready_at_ts,
             "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,

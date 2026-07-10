@@ -2,6 +2,7 @@
 import logging
 from datetime import datetime
 
+from homeassistant.const import EntityCategory
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
@@ -26,6 +27,7 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
 
     name = "Scheduled for"
     _attr_icon = "mdi:calendar-clock"
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, coordinator):
         super().__init__(coordinator)
