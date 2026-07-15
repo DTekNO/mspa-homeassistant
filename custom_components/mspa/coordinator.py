@@ -236,6 +236,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Deactivates when within _NEAR_TARGET_DEACTIVATE of target;
         # reactivates only when _NEAR_TARGET_ACTIVATE away, preventing flicker.
         self.near_target: bool = False
+        # Latched True once near_target is first reached; reset only when temperature
+        # drifts _READY_LATCH_RESET degrees away (new session) or a new schedule is set.
+        self.ready_latched: bool = False
         self.scheduled_ready_at: datetime | None = None  # set by MSpaScheduledReadyAt entity
 
         # Current ambient conditions read from optional weather sensors.
@@ -442,9 +445,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 delta = abs(new_target - new_temp)
                 if delta < _NEAR_TARGET_DEACTIVATE:
                     self.near_target = True
+                    self.ready_latched = True
                 elif delta >= _NEAR_TARGET_ACTIVATE:
                     self.near_target = False
-            # else: no temp data — leave flag unchanged
+            # else: no temp data — leave flags unchanged
 
             # Load persisted rates on the very first poll after startup/reload.
             if not self._rates_loaded:

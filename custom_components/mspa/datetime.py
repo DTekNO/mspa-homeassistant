@@ -39,6 +39,7 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
 
     async def async_set_value(self, value: datetime) -> None:
         self.coordinator.scheduled_ready_at = value
+        self.coordinator.ready_latched = False
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:

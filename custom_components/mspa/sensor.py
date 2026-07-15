@@ -433,10 +433,18 @@ class MSpaReadinessSensor(MSpaSensorEntity):
 
     @property
     def available(self):
-        return super().available and _minutes_to_target(self.coordinator) is not None
+        if not super().available:
+            return False
+        if self.coordinator.ready_latched:
+            return True
+        return _minutes_to_target(self.coordinator) is not None
 
     @property
     def native_value(self):
+        if self.coordinator.ready_latched:
+            return "Ready"
+        if _spa_direction(self.coordinator) == "cooling":
+            return None
         mins = _minutes_to_target(self.coordinator)
         if mins is None:
             return None
@@ -456,15 +464,20 @@ class MSpaReadinessSensor(MSpaSensorEntity):
 
     @property
     def extra_state_attributes(self):
-        mins = _minutes_to_target(self.coordinator)
-        rounded = (round(mins / 5) * 5) if (mins is not None and mins > 5) else mins
         direction = _spa_direction(self.coordinator)
-        color = (
-            "red" if direction == "heating"
-            else "light-blue" if direction == "cooling"
-            else "green"
-        )
-        ready_at_utc = _ready_at_utc(self.coordinator)
+        latched = self.coordinator.ready_latched
+        cooling = direction == "cooling"
+        mins = _minutes_to_target(self.coordinator)
+        rounded = (round(mins / 5) * 5) if (mins is not None and mins > 5 and not cooling) else (None if cooling else mins)
+        if latched:
+            color = "green"
+        elif direction == "heating":
+            color = "red"
+        elif cooling:
+            color = "light-blue"
+        else:
+            color = "green"
+        ready_at_utc = _ready_at_utc(self.coordinator) if not latched and not cooling else None
         ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
 
         data = self.coordinator._last_data
