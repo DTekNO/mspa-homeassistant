@@ -40,6 +40,7 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
     async def async_set_value(self, value: datetime) -> None:
         self.coordinator.scheduled_ready_at = value
         self.coordinator.ready_latched = False
+        self.coordinator._schedule_triggered = False
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
@@ -47,5 +48,5 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
         last_state = await self.async_get_last_state()
         if last_state and last_state.state not in ("unknown", "unavailable"):
             restored = dt_util.parse_datetime(last_state.state)
-            if restored is not None:
+            if restored is not None and restored > dt_util.now():
                 self.coordinator.scheduled_ready_at = restored

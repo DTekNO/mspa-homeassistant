@@ -558,7 +558,7 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         if days_until > lookahead:
             return None
 
-        target_temp = float(options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP))
+        target_temp = float(self.coordinator.schedule_target_temp)
 
         data = self.coordinator._last_data
         try:

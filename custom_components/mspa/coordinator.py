@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.helpers.storage import Store
 from homeassistant.const import UnitOfTemperature
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -29,6 +30,8 @@ from .const import (
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_WEATHER_ENTITY,
+    CONF_SCHEDULE_TARGET_TEMP,
+    DEFAULT_SCHEDULE_TARGET_TEMP,
 )
 
 import time
@@ -236,10 +239,20 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Deactivates when within _NEAR_TARGET_DEACTIVATE of target;
         # reactivates only when _NEAR_TARGET_ACTIVATE away, preventing flicker.
         self.near_target: bool = False
-        # Latched True once near_target is first reached; reset only when temperature
-        # drifts _READY_LATCH_RESET degrees away (new session) or a new schedule is set.
+        # Latched True on the False→True transition of near_target (spa first reaches
+        # temperature).  Cleared ONLY when the user sets a new scheduled_ready_at.
+        # Never cleared automatically by temperature changes — the spa staying warm
+        # between sessions must not re-arm predictions.
         self.ready_latched: bool = False
         self.scheduled_ready_at: datetime | None = None  # set by MSpaScheduledReadyAt entity
+        # Target temperature the scheduler should heat to.  Exposed as a number entity
+        # so the user can adjust it from the device panel without entering options.
+        self.schedule_target_temp: float = float(
+            config_entry.options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP)
+        )
+        # True once the autonomous heat-start command has been sent for the current
+        # schedule.  Prevents re-triggering on every poll.  Reset when schedule clears.
+        self._schedule_triggered: bool = False
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.
@@ -444,8 +457,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if new_temp is not None and new_target is not None:
                 delta = abs(new_target - new_temp)
                 if delta < _NEAR_TARGET_DEACTIVATE:
+                    if not self.near_target:   # latch only on the False→True transition
+                        self.ready_latched = True
                     self.near_target = True
-                    self.ready_latched = True
                 elif delta >= _NEAR_TARGET_ACTIVATE:
                     self.near_target = False
             # else: no temp data — leave flags unchanged
@@ -667,6 +681,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "active_prediction": self._prediction,
             })
 
+            # Auto-clear scheduled_ready_at once its time has passed.
+            if (self.scheduled_ready_at is not None
+                    and dt_util.utcnow() >= dt_util.as_utc(self.scheduled_ready_at)):
+                _LOGGER.debug("Heat schedule: scheduled time has passed — clearing")
+                self.scheduled_ready_at = None
+                self._schedule_triggered = False
+
+            # Trigger heating autonomously when the schedule window opens.
+            await self._check_schedule_trigger(new_temp, new_target)
+
             # Check for power cycle and restore state if enabled
             await self._check_power_cycle(transformed_data)
             
@@ -682,6 +706,117 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Error updating MSpa data: %s", str(err))
             raise UpdateFailed(f"Update failed: {str(err)}")
 
+
+    async def _check_schedule_trigger(
+        self, current_temp: float | None, current_target: float | None
+    ) -> None:
+        """Start the heater autonomously when the schedule window opens.
+
+        Fires at most once per schedule (guarded by _schedule_triggered).
+        Skips if the heater is already running at the right temperature.
+        """
+        if self.scheduled_ready_at is None or self._schedule_triggered:
+            return
+        if current_temp is None:
+            return
+
+        target_temp = self.schedule_target_temp
+        target_utc  = dt_util.as_utc(self.scheduled_ready_at)
+        now_utc     = dt_util.utcnow()
+
+        if now_utc >= target_utc:
+            return  # Past schedule — auto-clear handled above
+
+        minutes_needed = self._compute_heating_minutes(current_temp, target_temp)
+        if minutes_needed is None:
+            return  # No rate data yet; will retry next poll
+
+        start_at = target_utc - timedelta(minutes=minutes_needed)
+        if now_utc < start_at:
+            return  # Not yet time
+
+        heater_on    = self._last_data.get("heater") == "on"
+        temp_already = (current_target is not None
+                        and abs(current_target - target_temp) < 0.5)
+
+        if heater_on and temp_already:
+            self._schedule_triggered = True
+            return  # Already doing the right thing
+
+        _LOGGER.info(
+            "Heat schedule: starting conditioning — %.1f°C → %.1f°C, %.0f min before %s",
+            current_temp, target_temp, minutes_needed, target_utc.isoformat(),
+        )
+        try:
+            if not temp_already:
+                await self.api.set_temperature_setting(target_temp)
+            if not heater_on:
+                await self.set_feature_state("heater", "on")
+            self._schedule_triggered = True
+        except Exception as err:
+            _LOGGER.error("Heat schedule: failed to start conditioning: %s", err)
+
+    def _compute_heating_minutes(self, from_temp: float, to_temp: float) -> float | None:
+        """Heating time (minutes) from from_temp to to_temp using learned bucket rates.
+
+        Mirrors the sensor's _segmented_heating_minutes so the coordinator can
+        compute start times without a circular import.
+        """
+        if from_temp >= to_temp:
+            return 0.0
+        _T1, _T2 = 30.0, 37.0
+        boundaries = [from_temp]
+        for t in (_T1, _T2):
+            if from_temp < t < to_temp:
+                boundaries.append(t)
+        boundaries.append(to_temp)
+
+        total = 0.0
+        for i in range(len(boundaries) - 1):
+            seg_start = boundaries[i]
+            seg_end   = boundaries[i + 1]
+            delta     = seg_end - seg_start
+            if delta <= 0:
+                continue
+            rate = self._bucket_rate_at(seg_start)
+            if rate is None or rate <= 0:
+                return None
+            total += (delta / rate) * 60.0
+
+        bias = getattr(self, "prediction_bias", 1.0)
+        return total * bias
+
+    def _bucket_rate_at(self, temp: float) -> float | None:
+        """Best available heating rate (°C/h) for the bucket containing temp."""
+        _T1, _T2 = 30.0, 37.0
+        buckets        = getattr(self, "heat_rate_buckets", [None, None, None])
+        session_scalar = getattr(self, "_session_scalar", 1.0)
+        fresh          = getattr(self, "_session_fresh_buckets", set())
+
+        idx = 0 if temp < _T1 else 1 if temp < _T2 else 2
+        rate, source_idx = None, idx
+        if buckets[idx] is not None:
+            rate = buckets[idx]
+        else:
+            for i in range(3):
+                if buckets[i] is not None:
+                    rate = buckets[i]
+                    source_idx = i
+                    break
+
+        if rate is None:
+            raw = self._last_data.get("device_heat_perhour", 0)
+            try:
+                raw = int(raw)
+                if raw > 0:
+                    return max(0.5, min(2.0, raw / 10.0))
+            except (TypeError, ValueError):
+                pass
+            return None
+
+        if session_scalar != 1.0 and source_idx not in fresh:
+            return rate * session_scalar
+        return rate
 
     # Map of features to their respective API methods
     FEATURE_API_MAP = {
