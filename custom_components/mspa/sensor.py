@@ -443,12 +443,28 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     def native_value(self):
         if self.coordinator.ready_latched:
             return "Ready"
-        if _spa_direction(self.coordinator) == "cooling":
+        direction = _spa_direction(self.coordinator)
+        if direction == "cooling":
+            return None
+        # Water is below setpoint but the heater is not running — spa is idle/off.
+        # Don't show a stale rate-based prediction; wait until heating actually starts.
+        if direction == "heating" and self.coordinator._last_data.get("heater") != "on":
             return None
         mins = _minutes_to_target(self.coordinator)
         if mins is None:
             return None
         if mins <= 5:
+            # Spa may be maintaining at a lowered interim setpoint while the schedule
+            # targets a higher temperature.  Don't claim "Ready" until water is also
+            # near the schedule target, otherwise the sensor shows "Ready" at 35°C
+            # when the user wants 40°C.
+            if self.coordinator.scheduled_ready_at is not None:
+                try:
+                    water = float(self.coordinator._last_data.get("water_temperature") or 0)
+                    if water < self.coordinator.schedule_target_temp - 0.5:
+                        return None
+                except (ValueError, TypeError):
+                    pass
             return "Ready"
         ready_at_utc = _ready_at_utc(self.coordinator)
         if ready_at_utc is None:
