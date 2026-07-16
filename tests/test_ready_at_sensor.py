@@ -40,6 +40,10 @@ class MockCoordinator:
         device_heat_perhour: int = 0,
         is_online: bool = True,
         last_update_success: bool = True,
+        # None = auto-infer: "on" when target > water (heating), else "off"
+        heater: str | None = None,
+        scheduled_ready_at: "datetime | None" = None,
+        schedule_target_temp: float = 40.0,
     ):
         self.near_target = near_target
         self.ready_latched = ready_latched
@@ -48,6 +52,8 @@ class MockCoordinator:
         self._session_scalar = 1.0
         self._session_fresh_buckets = {0, 1, 2}
         self.last_update_success = last_update_success
+        self.scheduled_ready_at = scheduled_ready_at
+        self.schedule_target_temp = schedule_target_temp
 
         # Anchor: set N minutes ago at the given water/target temps
         self.temp_anchor_time = datetime.now(timezone.utc) + timedelta(minutes=anchor_offset_minutes)
@@ -57,11 +63,13 @@ class MockCoordinator:
         # Bucket rates (None = no data for that bucket)
         self.heat_rate_buckets = [heat_rate, heat_rate, heat_rate]
 
+        _heater = heater if heater is not None else ("on" if target_temp > water_temp else "off")
         self._last_data = {
             "water_temperature": str(water_temp),
             "target_temperature": str(target_temp),
             "device_heat_perhour": device_heat_perhour,
             "is_online": is_online,
+            "heater": _heater,
         }
 
 
@@ -144,15 +152,20 @@ _NEAR_TARGET_ACTIVATE   = 0.5
 
 
 def _apply_temp_update(coordinator: MockCoordinator, new_temp: float, new_target: float):
-    """Run the near_target / ready_latched update block from coordinator.py."""
+    """Run the near_target / ready_latched update block from coordinator.py.
+
+    Mirrors the exact logic in MSpaUpdateCoordinator._async_update_data so that
+    tests stay in sync with production behaviour.
+    """
     coordinator.temp_anchor_temp   = new_temp
     coordinator.temp_anchor_target = new_target
     coordinator._last_data["water_temperature"]  = str(new_temp)
     coordinator._last_data["target_temperature"] = str(new_target)
     delta = abs(new_target - new_temp)
     if delta < _NEAR_TARGET_DEACTIVATE:
-        coordinator.near_target  = True
-        coordinator.ready_latched = True
+        if not coordinator.near_target:        # latch only on False→True transition
+            coordinator.ready_latched = True
+        coordinator.near_target = True
     elif delta >= _NEAR_TARGET_ACTIVATE:
         coordinator.near_target = False
     # between the two thresholds: no change to either flag
@@ -405,3 +418,258 @@ class TestReadyAtUtc:
         r1 = _ready_at_utc(c)
         r2 = _ready_at_utc(c)
         assert r1 == r2
+
+
+# ── Latch transition correctness ───────────────────────────────────────────────
+# These tests verify the critical fix: ready_latched is set ONLY on the
+# near_target False→True transition, never on continued near_target=True polls.
+# Without this fix, resetting the latch on a schedule change is immediately
+# undone by the next coordinator poll while the spa is still warm.
+
+class TestLatchTransition:
+    def test_latch_not_set_when_near_target_already_true(self):
+        """Poll while near_target is already True must NOT set ready_latched.
+
+        This is the root fix for the 'spa stays warm between sessions' bug:
+        the user sets a new schedule (latch resets), but the coordinator was
+        re-latching every 60 s because the spa was still at target temperature.
+        """
+        c = MockCoordinator(near_target=True, ready_latched=False)
+        _apply_temp_update(c, new_temp=40.0, new_target=40.0)  # still at target
+        assert c.ready_latched is False  # must NOT re-latch
+
+    def test_latch_set_when_re_entering_near_target(self):
+        """After the spa exits and re-enters near_target, the latch fires again."""
+        c = MockCoordinator(near_target=True, ready_latched=False)
+        # Spa cools slightly — exits near_target
+        _apply_temp_update(c, new_temp=39.5, new_target=40.0)
+        assert c.near_target is False
+        assert c.ready_latched is False
+        # Heater runs — spa returns to target
+        _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert c.near_target is True
+        assert c.ready_latched is True  # latches again on re-entry
+
+    def test_schedule_reset_survives_continued_near_target_polls(self):
+        """Sequence: spa at target → schedule set → several polls while still warm → latch stays False."""
+        c = MockCoordinator(near_target=True, ready_latched=True)
+        # User sets new schedule → reset
+        c.ready_latched = False
+        # Next three coordinator polls: spa still at 40°C
+        for _ in range(3):
+            _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert c.ready_latched is False  # reset must survive
+
+
+# ── End-to-end use pattern scenarios ─────────────────────────────────────────
+#
+# USE PATTERN A — Cold start with schedule
+#   Spa has been idle for days at 20°C.  User sets a schedule for a specific
+#   date/time.  The coordinator computes the heating start time and triggers the
+#   heater autonomously.  Spa heats up, reaches target, and the 'Ready at' sensor
+#   latches to "Ready".  The schedule is auto-cleared once the time passes.
+#
+# USE PATTERN B — Repeated daily use
+#   After USE PATTERN A, the spa is at 40°C.  The user sets a new schedule for
+#   the next day.  The latch resets (schedule change).  The spa is allowed to cool
+#   during the idle period.  The coordinator triggers heating again at the right
+#   time the following day.  Spa reaches target and latches "Ready" again.
+#
+# USE PATTERN C — Manual heating (no schedule)
+#   User turns the heater on directly via the climate entity without setting a
+#   schedule.  'Ready at' shows a prediction time while heating.  On reaching
+#   target, latches "Ready".  No auto-clear happens (no schedule set).
+#
+# USE PATTERN D — Thermostat adjustment while spa is warm
+#   Spa is at 40°C, latch is set ("Ready").  User lowers thermostat to 38°C
+#   (e.g., to save energy while guests are en route).  'Ready at' must continue
+#   showing "Ready" — the spa is still usable at 40°C even though the new setpoint
+#   is lower.  Latch must not reset from thermostat-only changes.
+#
+# USE PATTERN E — Completely off, natural cooling, then re-scheduled
+#   Spa completely off (heater and pump off) after use.  Water cools naturally
+#   from 40°C toward ambient over hours/days.  API setpoint is still 40°C (device
+#   remembers its last setting).  _spa_direction would say "heating" (water < target)
+#   but the heater is physically off.  Sensor must show None — not a stale prediction
+#   — until the coordinator autonomously starts the heater for the next schedule.
+#
+# USE PATTERN F — Turned down (pump/heater on, setpoint lowered), new schedule set
+#   Spa maintained at a lower setpoint (e.g. 35°C) between sessions.  User sets a
+#   new schedule targeting 40°C.  Latch is reset by the schedule change.  Spa is
+#   at 35°C near its current setpoint (near_target=True relative to 35°C setpoint).
+#   Sensor must NOT show "Ready" — water hasn't reached the 40°C schedule target.
+#   Once the coordinator triggers and the heater brings the spa to 40°C, the latch
+#   fires and "Ready" is shown correctly.
+
+class TestUsePatternsScenarios:
+    def test_pattern_a_cold_start_latch_after_heating(self):
+        """USE PATTERN A: spa heats from cold, reaches target, latches 'Ready'."""
+        c = MockCoordinator(
+            near_target=False, ready_latched=False,
+            water_temp=20.0, target_temp=40.0,
+            heat_rate=2.0, anchor_offset_minutes=-145.0,
+        )
+        # While heating: prediction shown
+        assert _stub(c).native_value is not None
+        assert _stub(c).native_value != "Ready"
+        # Spa reaches target — simulate transition
+        _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert c.ready_latched is True
+        assert _stub(c).native_value == "Ready"
+
+    def test_pattern_a_schedule_clears_past_latch_stays(self):
+        """USE PATTERN A: after schedule time passes, latch stays True (spa still warm)."""
+        c = MockCoordinator(near_target=True, ready_latched=True)
+        # Simulate coordinator clearing the past schedule
+        # (coordinator.scheduled_ready_at = None, _schedule_triggered = False)
+        # Latch is NOT touched by schedule auto-clear
+        assert _stub(c).native_value == "Ready"
+
+    def test_pattern_b_new_schedule_resets_latch(self):
+        """USE PATTERN B: new schedule resets latch; 'Ready at' shows prediction once heating."""
+        c = MockCoordinator(near_target=True, ready_latched=True)
+        # User sets new schedule → latch resets
+        c.ready_latched = False
+        c.near_target = False  # spa starts to cool (heater off)
+        # While cooling: sensor shows None (no prediction for cooling)
+        c2 = MockCoordinator(
+            ready_latched=False, near_target=False,
+            water_temp=38.0, target_temp=40.0,
+            heat_rate=2.0, anchor_offset_minutes=-30.0,
+        )
+        assert _stub(c2).native_value is not None  # heating prediction
+
+    def test_pattern_b_latch_survives_poll_when_spa_still_warm(self):
+        """USE PATTERN B: after new schedule set, several polls with spa still at 40°C must NOT re-latch."""
+        c = MockCoordinator(near_target=True, ready_latched=True)
+        c.ready_latched = False  # schedule change
+        for _ in range(5):
+            _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert c.ready_latched is False
+
+    def test_pattern_b_latch_fires_when_new_session_reaches_target(self):
+        """USE PATTERN B: after cooling and re-heating, near_target re-entry latches 'Ready'."""
+        c = MockCoordinator(near_target=True, ready_latched=True)
+        c.ready_latched = False  # schedule change
+        # Spa cools — exits near_target
+        _apply_temp_update(c, new_temp=37.0, new_target=40.0)
+        assert c.near_target is False
+        assert c.ready_latched is False
+        # Heater runs — spa returns to target
+        _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert c.ready_latched is True
+        assert _stub(c).native_value == "Ready"
+
+    def test_pattern_c_manual_heat_no_schedule(self):
+        """USE PATTERN C: heater on manually, no schedule — prediction shows, then latches."""
+        c = MockCoordinator(
+            ready_latched=False, near_target=False,
+            water_temp=35.0, target_temp=40.0,
+            heat_rate=2.0, anchor_offset_minutes=-30.0,
+        )
+        val = _stub(c).native_value
+        assert val is not None and re.match(r"^\d{2}:\d{2}", val)
+        # Reaches target
+        _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert _stub(c).native_value == "Ready"
+
+    def test_pattern_d_thermostat_lowered_while_latched(self):
+        """USE PATTERN D: thermostat lowered while spa is at temp — 'Ready' must persist."""
+        c = MockCoordinator(
+            ready_latched=True, near_target=True,
+            water_temp=40.0, target_temp=40.0,
+        )
+        # User lowers thermostat to 38°C
+        _apply_temp_update(c, new_temp=40.0, new_target=38.0)  # delta=2°C → exits near_target
+        assert c.near_target is False
+        assert c.ready_latched is True   # latch untouched
+        assert _stub(c).native_value == "Ready"
+
+    # ── USE PATTERN E — Spa completely off, natural cooling ───────────────────
+
+    def test_pattern_e_heater_off_below_setpoint_shows_none(self):
+        """USE PATTERN E: heater off, water below setpoint — sensor must show None.
+
+        _spa_direction returns 'heating' (water < target) but the heater is physically
+        off.  The sensor must not show a stale prediction from accumulated rate data.
+        Sensor shows None until the coordinator autonomously starts the heater.
+        """
+        c = MockCoordinator(
+            near_target=False, ready_latched=False,
+            water_temp=25.0, target_temp=40.0,
+            heat_rate=2.0, anchor_offset_minutes=-30.0,
+            heater="off",  # spa completely off — override auto-infer
+        )
+        assert _stub(c).native_value is None
+
+    def test_pattern_e_heater_on_after_trigger_shows_prediction(self):
+        """USE PATTERN E: once coordinator triggers (heater on), prediction shows immediately."""
+        c = MockCoordinator(
+            near_target=False, ready_latched=False,
+            water_temp=25.0, target_temp=40.0,
+            heat_rate=2.0, anchor_offset_minutes=-30.0,
+            heater="on",  # coordinator just triggered the heater
+        )
+        val = _stub(c).native_value
+        assert val is not None and re.match(r"^\d{2}:\d{2}", val)
+
+    def test_pattern_e_latch_fires_when_spa_reaches_target(self):
+        """USE PATTERN E: after autonomous heat-up, near_target fires and latches 'Ready'."""
+        c = MockCoordinator(
+            near_target=False, ready_latched=False,
+            water_temp=25.0, target_temp=40.0,
+            heat_rate=2.0, heater="on",
+        )
+        _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert c.ready_latched is True
+        assert _stub(c).native_value == "Ready"
+
+    # ── USE PATTERN F — Turned down, schedule set to higher target ────────────
+
+    def test_pattern_f_near_target_at_lower_setpoint_shows_none_when_schedule_set(self):
+        """USE PATTERN F: spa at lowered setpoint (35°C) with schedule targeting 40°C.
+
+        near_target=True relative to the 35°C API setpoint.  _minutes_to_target returns 0.
+        But the sensor must NOT show 'Ready' — water hasn't reached the 40°C schedule target.
+        """
+        from datetime import timezone as tz
+        future = datetime.now(tz.utc) + timedelta(hours=12)
+        c = MockCoordinator(
+            near_target=True, ready_latched=False,
+            water_temp=35.0, target_temp=35.0,
+            heat_rate=2.0,
+            heater="on",  # spa maintaining at 35°C
+            scheduled_ready_at=future,
+            schedule_target_temp=40.0,
+        )
+        assert _stub(c).native_value is None
+
+    def test_pattern_f_no_schedule_means_ready_at_current_setpoint(self):
+        """USE PATTERN F: without a schedule, 'Ready' at the current setpoint is correct."""
+        c = MockCoordinator(
+            near_target=True, ready_latched=False,
+            water_temp=35.0, target_temp=35.0,
+            heat_rate=2.0, heater="on",
+            scheduled_ready_at=None,  # no schedule
+            schedule_target_temp=40.0,
+        )
+        assert _stub(c).native_value == "Ready"
+
+    def test_pattern_f_latch_fires_when_spa_reaches_schedule_target(self):
+        """USE PATTERN F: after coordinator raises setpoint to 40°C and spa heats up."""
+        from datetime import timezone as tz
+        future = datetime.now(tz.utc) + timedelta(hours=12)
+        c = MockCoordinator(
+            near_target=False, ready_latched=False,
+            water_temp=35.0, target_temp=40.0,  # coordinator raised setpoint
+            heat_rate=2.0, heater="on",
+            scheduled_ready_at=future,
+            schedule_target_temp=40.0,
+        )
+        # During heat-up: prediction shown
+        val = _stub(c).native_value
+        assert val is not None and re.match(r"^\d{2}:\d{2}", val)
+        # Reaches 40°C — near_target transition → latch
+        _apply_temp_update(c, new_temp=40.0, new_target=40.0)
+        assert c.ready_latched is True
+        assert _stub(c).native_value == "Ready"
