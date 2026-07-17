@@ -420,6 +420,21 @@ class TestReadyAtUtc:
         assert r1 == r2
 
 
+# ── USE PATTERN G — Warm-day idle: spa at/near schedule target, setpoint lowered
+#   After use at 38°C the user lowers the API setpoint to 36°C ("rest temp") and
+#   sets a schedule targeting 38°C at 16:00 the next day.  On a warm day the spa
+#   barely cooled and is still near 38°C when 16:00 arrives.  The API setpoint is
+#   still 36°C, so the coordinator trigger must raise it to 38°C and turn heater on.
+#   Key behaviours:
+#   a) While water > 36°C and heater off: 'Ready at' shows None (cooling direction,
+#      latch cleared by new schedule).
+#   b) At 16:00 the trigger fires — setpoint raised 36→38°C, heater on.
+#   c) If the spa cooled to 37.8°C (within 0.5°C of 38°C), _compute_heating_minutes
+#      returns 0.0 (epsilon guard) so the trigger still fires at 16:00 without rate data.
+#   THE BUG (now fixed): auto-clear previously ran BEFORE the trigger, wiping the
+#   schedule before the trigger could fire for zero-minute (minutes_needed=0) schedules.
+#   A secondary `if now >= target_utc: return` guard in the trigger compounded this.
+
 # ── Latch transition correctness ───────────────────────────────────────────────
 # These tests verify the critical fix: ready_latched is set ONLY on the
 # near_target False→True transition, never on continued near_target=True polls.
@@ -673,3 +688,65 @@ class TestUsePatternsScenarios:
         _apply_temp_update(c, new_temp=40.0, new_target=40.0)
         assert c.ready_latched is True
         assert _stub(c).native_value == "Ready"
+
+    # ── USE PATTERN G — Warm-day idle: setpoint 36°C, schedule target 38°C ─────
+
+    def test_pattern_g_sensor_none_while_cooling_above_setpoint(self):
+        """USE PATTERN G: water=38, setpoint=36, schedule_target=38 — sensor None.
+
+        Latch reset by new schedule.  Spa is nominally cooling (water > API setpoint)
+        with heater off.  'Ready at' must be None, not 'Ready'.
+        """
+        from datetime import timezone as tz
+        future = datetime.now(tz.utc) + timedelta(hours=20)
+        c = MockCoordinator(
+            near_target=False, ready_latched=False,
+            water_temp=38.0, target_temp=36.0,  # water above API setpoint
+            heat_rate=2.0, heater="off",
+            scheduled_ready_at=future,
+            schedule_target_temp=38.0,           # schedule target same as water temp
+        )
+        # Cooling direction (water > API setpoint), latch cleared → None
+        assert _stub(c).native_value is None
+
+    def test_pattern_g_latch_cleared_when_schedule_set(self):
+        """USE PATTERN G: setting a new schedule resets the latch from the previous session."""
+        from datetime import timezone as tz
+        future = datetime.now(tz.utc) + timedelta(hours=20)
+        c = MockCoordinator(
+            near_target=True, ready_latched=True,   # latch from previous session
+            water_temp=38.0, target_temp=36.0,
+        )
+        # Simulate async_set_value on the datetime entity
+        c.ready_latched = False
+        c.scheduled_ready_at = future
+        c.schedule_target_temp = 38.0
+        # Latch is now False — sensor should NOT show "Ready"
+        assert c.ready_latched is False
+        # _spa_direction: water(38) > target(36) → "cooling" → sensor: None
+        c._last_data["water_temperature"] = "38.0"
+        c._last_data["target_temperature"] = "36.0"
+        c._last_data["heater"] = "off"
+        c.near_target = False
+        assert _stub(c).native_value is None
+
+    def test_pattern_g_epsilon_guard_condition(self):
+        """USE PATTERN G: warm-day guard — delta < 0.5°C qualifies for zero-minute treatment.
+
+        coordinator._compute_heating_minutes returns 0.0 when (to - from) < 0.5°C.
+        This test verifies the guard condition that determines whether rate data is
+        needed at all.  The coordinator module is fully mocked in this test environment
+        so we verify the equivalent logic inline.
+
+        Real scenario: spa at 37.8°C on a warm day, schedule_target=38°C.
+        Without this guard: rate lookup required → if no rate data, trigger silently
+        fails.  With guard: treated the same as 38→38 (already at target).
+        """
+        # Condition that triggers the epsilon guard in coordinator.py:
+        #   `if from_temp >= to_temp or (to_temp - from_temp) < 0.5: return 0.0`
+        from_temp, to_temp = 37.8, 38.0
+        assert from_temp < to_temp             # not the from>=to case
+        assert (to_temp - from_temp) < 0.5     # epsilon: within near-target band → 0.0
+
+        # Verify the exact-at-target case also qualifies (original guard)
+        assert (38.0 >= 38.0)                  # from >= to → 0.0

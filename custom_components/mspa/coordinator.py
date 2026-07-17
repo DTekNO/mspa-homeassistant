@@ -681,15 +681,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "active_prediction": self._prediction,
             })
 
+            # Trigger heating autonomously when the schedule window opens.
+            # Must run BEFORE the auto-clear so the trigger fires even when the
+            # schedule target is already reached and minutes_needed == 0 (the
+            # start_at == target_utc edge-case that the auto-clear would otherwise
+            # pre-empt by clearing scheduled_ready_at first).
+            await self._check_schedule_trigger(new_temp, new_target)
+
             # Auto-clear scheduled_ready_at once its time has passed.
             if (self.scheduled_ready_at is not None
                     and dt_util.utcnow() >= dt_util.as_utc(self.scheduled_ready_at)):
                 _LOGGER.debug("Heat schedule: scheduled time has passed — clearing")
                 self.scheduled_ready_at = None
                 self._schedule_triggered = False
-
-            # Trigger heating autonomously when the schedule window opens.
-            await self._check_schedule_trigger(new_temp, new_target)
 
             # Check for power cycle and restore state if enabled
             await self._check_power_cycle(transformed_data)
@@ -714,6 +718,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
         Fires at most once per schedule (guarded by _schedule_triggered).
         Skips if the heater is already running at the right temperature.
+        Also handles the case where the spa is at or above the schedule target
+        (cooling direction): minutes_needed == 0, so start_at == target_utc and
+        the trigger fires at the scheduled time to ensure the setpoint and heater
+        state are correct for maintenance once the water reaches target.
         """
         if self.scheduled_ready_at is None or self._schedule_triggered:
             return
@@ -723,9 +731,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         target_temp = self.schedule_target_temp
         target_utc  = dt_util.as_utc(self.scheduled_ready_at)
         now_utc     = dt_util.utcnow()
-
-        if now_utc >= target_utc:
-            return  # Past schedule — auto-clear handled above
 
         minutes_needed = self._compute_heating_minutes(current_temp, target_temp)
         if minutes_needed is None:
@@ -761,8 +766,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
         Mirrors the sensor's _segmented_heating_minutes so the coordinator can
         compute start times without a circular import.
+        Returns 0.0 when from_temp is within 0.5°C of to_temp (the near-target
+        hysteresis band) so the trigger fires at the scheduled time even when
+        rate data is absent or when the spa barely cooled on a warm day.
         """
-        if from_temp >= to_temp:
+        if from_temp >= to_temp or (to_temp - from_temp) < 0.5:
             return 0.0
         _T1, _T2 = 30.0, 37.0
         boundaries = [from_temp]
