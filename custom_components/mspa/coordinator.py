@@ -734,7 +734,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
         minutes_needed = self._compute_heating_minutes(current_temp, target_temp)
         if minutes_needed is None:
-            return  # No rate data yet; will retry next poll
+            # No learned rate data yet.  If the scheduled time has already arrived,
+            # fire immediately with 0 lead time — raising the setpoint now is
+            # preferable to missing the window entirely.  If the time hasn't arrived
+            # yet we can't know when to start, so wait for rate data.
+            if now_utc >= target_utc:
+                minutes_needed = 0.0
+            else:
+                return  # Will retry on next poll
 
         start_at = target_utc - timedelta(minutes=minutes_needed)
         if now_utc < start_at:

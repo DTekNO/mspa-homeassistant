@@ -443,6 +443,17 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     def native_value(self):
         if self.coordinator.ready_latched:
             return "Ready"
+        # When a future schedule is pending, surface the target time directly.
+        # The trigger will raise the setpoint and start heating at the right moment;
+        # there is nothing useful to show from rate-based ETA while the spa cools.
+        sra = self.coordinator.scheduled_ready_at
+        if sra is not None:
+            sra_utc = sra.astimezone(timezone.utc) if sra.tzinfo else sra.replace(tzinfo=timezone.utc)
+            if sra_utc > datetime.now(timezone.utc):
+                local_ready = sra_utc.astimezone()
+                days = (local_ready.date() - datetime.now().date()).days
+                suffix = f" +{days}d" if days > 0 else ""
+                return f"{local_ready.strftime('%H:%M')}{suffix}"
         direction = _spa_direction(self.coordinator)
         if direction == "cooling":
             return None

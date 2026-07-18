@@ -42,6 +42,7 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
         self.coordinator.ready_latched = False
         self.coordinator._schedule_triggered = False
         self.async_write_ha_state()
+        self.coordinator.async_update_listeners()  # push new state to sensor immediately
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
