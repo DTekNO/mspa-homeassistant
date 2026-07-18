@@ -641,11 +641,12 @@ class TestUsePatternsScenarios:
 
     # ── USE PATTERN F — Turned down, schedule set to higher target ────────────
 
-    def test_pattern_f_near_target_at_lower_setpoint_shows_none_when_schedule_set(self):
+    def test_pattern_f_near_target_at_lower_setpoint_shows_schedule_time_when_schedule_set(self):
         """USE PATTERN F: spa at lowered setpoint (35°C) with schedule targeting 40°C.
 
-        near_target=True relative to the 35°C API setpoint.  _minutes_to_target returns 0.
-        But the sensor must NOT show 'Ready' — water hasn't reached the 40°C schedule target.
+        near_target=True relative to the 35°C API setpoint.  The future-schedule
+        shortcut fires first — the sensor shows the scheduled ready time, not 'Ready',
+        so the user sees when the spa will actually reach the higher target.
         """
         from datetime import timezone as tz
         future = datetime.now(tz.utc) + timedelta(hours=12)
@@ -657,7 +658,8 @@ class TestUsePatternsScenarios:
             scheduled_ready_at=future,
             schedule_target_temp=40.0,
         )
-        assert _stub(c).native_value is None
+        val = _stub(c).native_value
+        assert val is not None and re.match(r"^\d{2}:\d{2}", val)  # scheduled time shown
 
     def test_pattern_f_no_schedule_means_ready_at_current_setpoint(self):
         """USE PATTERN F: without a schedule, 'Ready' at the current setpoint is correct."""
@@ -691,11 +693,12 @@ class TestUsePatternsScenarios:
 
     # ── USE PATTERN G — Warm-day idle: setpoint 36°C, schedule target 38°C ─────
 
-    def test_pattern_g_sensor_none_while_cooling_above_setpoint(self):
-        """USE PATTERN G: water=38, setpoint=36, schedule_target=38 — sensor None.
+    def test_pattern_g_sensor_shows_schedule_time_while_cooling(self):
+        """USE PATTERN G: water=38, setpoint=36, schedule_target=38, future schedule.
 
         Latch reset by new schedule.  Spa is nominally cooling (water > API setpoint)
-        with heater off.  'Ready at' must be None, not 'Ready'.
+        with heater off.  The future-schedule shortcut fires and shows the scheduled
+        time — the user sees when the spa will be ready, not a blank/Unknown.
         """
         from datetime import timezone as tz
         future = datetime.now(tz.utc) + timedelta(hours=20)
@@ -706,8 +709,8 @@ class TestUsePatternsScenarios:
             scheduled_ready_at=future,
             schedule_target_temp=38.0,           # schedule target same as water temp
         )
-        # Cooling direction (water > API setpoint), latch cleared → None
-        assert _stub(c).native_value is None
+        val = _stub(c).native_value
+        assert val is not None and re.match(r"^\d{2}:\d{2}", val)  # scheduled time shown
 
     def test_pattern_g_latch_cleared_when_schedule_set(self):
         """USE PATTERN G: setting a new schedule resets the latch from the previous session."""
@@ -721,14 +724,16 @@ class TestUsePatternsScenarios:
         c.ready_latched = False
         c.scheduled_ready_at = future
         c.schedule_target_temp = 38.0
-        # Latch is now False — sensor should NOT show "Ready"
+        # Latch is now False — sensor must NOT show "Ready"
         assert c.ready_latched is False
-        # _spa_direction: water(38) > target(36) → "cooling" → sensor: None
+        # Future schedule shortcut fires → shows scheduled time, not "Ready" or None
         c._last_data["water_temperature"] = "38.0"
         c._last_data["target_temperature"] = "36.0"
         c._last_data["heater"] = "off"
         c.near_target = False
-        assert _stub(c).native_value is None
+        val = _stub(c).native_value
+        assert val is not None and re.match(r"^\d{2}:\d{2}", val)
+        assert val != "Ready"
 
     def test_pattern_g_epsilon_guard_condition(self):
         """USE PATTERN G: warm-day guard — delta < 0.5°C qualifies for zero-minute treatment.
