@@ -691,7 +691,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Auto-clear scheduled_ready_at once its time has passed.
             if (self.scheduled_ready_at is not None
                     and dt_util.utcnow() >= dt_util.as_utc(self.scheduled_ready_at)):
-                _LOGGER.debug("Heat schedule: scheduled time has passed — clearing")
+                _LOGGER.info(
+                    "Heat schedule: session complete — clearing  "
+                    "[water=%.1f°C  sched=%.1f°C  triggered=%s]",
+                    new_temp or 0.0, self.schedule_target_temp or 0.0,
+                    self._schedule_triggered,
+                )
                 self.scheduled_ready_at = None
                 self._schedule_triggered = False
 
@@ -747,25 +752,26 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if now_utc < start_at:
             return  # Not yet time
 
-        heater_on    = self._last_data.get("heater") == "on"
-        temp_already = (current_target is not None
-                        and abs(current_target - target_temp) < 0.5)
-
-        if heater_on and temp_already:
-            self._schedule_triggered = True
-            return  # Already doing the right thing
+        heater_on = self._last_data.get("heater") == "on"
 
         _LOGGER.info(
-            "Heat schedule: starting conditioning — %.1f°C → %.1f°C, %.0f min before %s",
-            current_temp, target_temp, minutes_needed, target_utc.isoformat(),
+            "Heat schedule: confirming setpoint %.1f°C (water %.1f°C, %.0f min before %s)",
+            target_temp, current_temp, minutes_needed, target_utc.isoformat(),
         )
+        # Set the flag BEFORE the first await so that if the debounce commit for a
+        # new schedule fires during the API call (resetting the flag to False and
+        # updating scheduled_ready_at), the new schedule is not accidentally marked
+        # as already triggered once the awaits return.
+        self._schedule_triggered = True
         try:
-            if not temp_already:
-                await self.api.set_temperature_setting(target_temp)
+            # Always confirm the setpoint at the scheduled time regardless of current
+            # state — the setpoint must match the schedule target even when no heating
+            # was needed (spa already warm, or warm-day epsilon case).
+            await self.api.set_temperature_setting(target_temp)
             if not heater_on:
                 await self.set_feature_state("heater", "on")
-            self._schedule_triggered = True
         except Exception as err:
+            self._schedule_triggered = False  # allow retry on next poll
             _LOGGER.error("Heat schedule: failed to start conditioning: %s", err)
 
     def _compute_heating_minutes(self, from_temp: float, to_temp: float) -> float | None:

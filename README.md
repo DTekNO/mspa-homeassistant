@@ -149,42 +149,71 @@ On a brand-new installation the integration has no observed heating or cooling r
 
 **Cooling estimates**: There is no device-reported cooling rate. The cooling sensors (when the target is lower than the current temperature) remain **unavailable** until the integration has observed at least one passive cooling cycle.
 
-**How quickly does it improve?** After 2–3 full heating runs the EMA has enough data to start outperforming the device seed. The bucket-based model (which tracks rates separately for cold, mid, and hot temperature ranges) fills in over the first few weeks of normal use. The prediction bias correction — which adjusts for systematic over- or under-estimation — also needs a few completed heating sessions to calibrate.
+**How quickly does it improve?** After 2–3 full heating runs the EMA has enough data to start outperforming the device seed. The temperature-segmented model (three independent EMA rates) fills in over the first few weeks of normal use. The prediction bias correction — which adjusts for systematic over- or under-estimation using the last 10 completed sessions — also needs a few sessions to calibrate. See [How the model learns](#how-the-model-learns) for the full detail.
 
 **The device seed is replaced automatically** the first time the EMA produces a valid observation for the same temperature bucket. You do not need to do anything.
 
-### How the rate is learned
+### How the model learns
 
-The integration learns the heating and cooling rates by observing actual temperature changes over time:
+The integration uses an **adaptive machine learning model** to predict heating and cooling times. It updates continuously from observed data and corrects for changing conditions — season, ambient temperature, cover on or off, water fill level — without any configuration required.
 
-- **Heating rate** — sampled while the climate entity is in the `heating` action (full-heat mode). The first valid sample is taken after the water temperature has changed by 0.5 °C (one sensor step) and at least 3 minutes have elapsed.
-- **Cooling rate** — sampled passively whenever the heater is off and the temperature is actually dropping. Same minimum step and time requirements.
+#### Online learning with exponential smoothing
 
-Rates are fed into an **exponential moving average (EMA)** so that the estimate adapts gradually as conditions change (ambient temperature, water volume, lid on/off). Outliers — for example from adding hot or cold water — are rejected before they can distort the EMA.
+Heating and cooling rates are sampled from actual temperature changes observed during operation:
 
-The **Ready at** sensor shows as **unavailable** until at least one valid rate sample has been collected. On a typical heating cycle this means the sensor becomes active after the first 0.5 °C step that takes longer than 3 minutes (usually well within the first 30 minutes of heating).
+- **Heating rate** — sampled while the climate entity is in `heating` action (full-heat mode). The first valid sample is taken after the water has moved at least 0.5 °C and at least 3 minutes have elapsed.
+- **Cooling rate** — sampled passively when the heater is off and the temperature is actually dropping. Same minimum requirements.
 
-#### Temperature-bucketed heating rates
+Each sample is fed into an **exponential moving average (EMA)** with smoothing factor **α = 0.25**:
 
-A spa heats faster when the water is cold (small thermal losses) and slower near the set-point (large losses). To model this, the integration tracks the heating rate in three temperature buckets:
+```
+new_rate = 0.25 × observed_rate + 0.75 × stored_rate
+```
+
+This gives recent observations 25% weight while retaining the history of previous sessions. After 4–5 sessions the estimate has settled to a representative value; it continues to adapt gradually as seasonal conditions change. Outliers — rates below 0.05 °C/h (sensor noise) or above 3.0 °C/h (e.g. adding water) — are rejected before they can distort the EMA.
+
+The **Ready at** sensor shows as **unavailable** until at least one valid rate sample has been collected. On a typical heating cycle this means the sensor becomes active after the first 0.5 °C step (usually well within the first 30 minutes of heating).
+
+#### Temperature-segmented rates
+
+A spa does not heat at a constant rate across its full temperature range. Heat loss to the surroundings increases with water temperature, so the effective heating rate slows as the water warms. To model this non-linearity, the integration maintains **three independent EMA estimates** — one per temperature band:
 
 | Bucket | Range | Typical behaviour |
-|---|---|---|
+|--------|-------|-------------------|
 | Cold | < 30 °C | Fastest — minimal heat loss to surroundings |
 | Mid | 30–37 °C | Moderate — increasing loss as water warms |
 | Hot | ≥ 37 °C | Slowest — highest thermal loss, near set-point |
 
-When estimating time-to-target, the remaining temperature delta is split at the 30 °C and 37 °C boundaries, and each segment is calculated at its own observed rate. This gives substantially more accurate estimates for long heating runs (e.g. 20 °C → 40 °C) compared to using a single flat rate.
+Each bucket is updated only by observations made in that temperature range. When estimating time-to-target, the remaining delta is split at the 30 °C and 37 °C boundaries; each segment is calculated at its own observed rate; the results are summed. This gives substantially more accurate estimates for long heating runs (e.g. 20 °C → 40 °C) compared to a single flat rate.
 
-#### Ambient condition correction
+#### Ambient condition correction (session scalar)
 
-At the start of each new heating session (heater engages with delta > 2 °C), a **session scalar** is reset to 1.0. As soon as the first temperature bucket receives a live observation, the measured rate is compared to the stored base rate for that bucket to derive a ratio. This ratio is smoothed and applied to all other bucket predictions that have not yet been observed in the current session.
+Outdoor conditions — temperature, wind, whether the cover is on — can shift the effective heating rate by 20–40% between a cold winter morning and a warm summer afternoon. The model detects this within the first few minutes of a new heating session.
 
-The effect is that a particularly cold or warm day is reflected across the whole estimate within the first few minutes of heating, even before the spa has passed through all three temperature ranges.
+At the start of each session (heater engages with delta > 2 °C) the **session scalar** is reset to 1.0. As soon as the first bucket receives a live observation, the ratio of observed rate to stored base rate for that bucket is computed. This ratio is smoothed (weighted 40% new / 60% prior) and applied as a multiplier to any bucket that has not yet received direct observations in the current session.
+
+The effect: today's ambient conditions are reflected across the entire estimate within the first few minutes of heating, before the spa has passed through all three temperature ranges.
+
+#### Historical bias correction
+
+Individual EMA samples carry noise, and the model can develop a systematic over- or under-prediction tendency. The integration tracks the **last 10 completed heating sessions**, recording estimated vs actual duration for each. The mean ratio of actual to estimated time becomes the **prediction bias** scalar, clamped to [0.5, 2.0]:
+
+```
+final_prediction = segmented_estimate × prediction_bias
+```
+
+A bias above 1.0 means past predictions were too optimistic (actual heating took longer) and future estimates are stretched accordingly; below 1.0, estimates are compressed.
+
+If a weather entity is configured, historical sessions are weighted by a **Gaussian kernel similarity** over ambient temperature and wind speed — sessions recorded under conditions similar to today count more than sessions from very different conditions. This makes the bias correction contextual rather than a flat average over all past sessions.
 
 #### Time-decay on stored rates
 
-Bucket rates loaded from storage are decayed toward the global flat EMA over time (≈ 2 % per day, floor 40 % weight). This prevents stale seasonal data — for example rates learned in summer — from anchoring winter predictions indefinitely. After about two weeks of inactivity, stored buckets carry roughly 75 % of their original weight.
+Bucket rates loaded from storage decay gradually toward the global flat EMA over time:
+
+- **Without a weather entity**: ≈ 2% per day (floor: 40% weight). After two weeks of inactivity stored buckets carry about 75% of their original weight.
+- **With a weather entity**: ≈ 0.6% per day — a gentler decay, because the weather-weighted bias correction already accounts for ambient differences between sessions.
+
+This prevents stale seasonal data — for example rates learned in summer — from permanently anchoring winter predictions.
 
 ### Sensor attributes
 
@@ -414,7 +443,7 @@ Replace `climate.mspa_heater_control`, `sensor.mspa_heat_schedule`, and `notify.
 >
 > **Why use Ready at for the notification**: The Ready at sensor reflects the actual current water temperature and learned heating rate, so if the spa is already partially warm the estimated ready time will be sooner than the original schedule. It also already handles multi-day offsets (e.g. `10:34 +1d`). It will never show `Ready` in this context because the automation only fires when heating is needed.
 
-> **How the timing is calculated**: The sensor uses a temperature-bucketed rate model, accounting for how heating rate varies across the temperature range and applying the historical prediction bias correction.
+> **How the timing is calculated**: The sensor uses a temperature-segmented machine learning model — three independent EMA rates (one per temperature band), an ambient-condition scalar derived from the first live observation of each session, and a historical bias correction derived from the last 10 completed sessions. See [How the model learns](#how-the-model-learns) for the full detail.
 
 ### Syncing the schedule from a calendar (optional)
 

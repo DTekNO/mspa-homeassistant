@@ -755,3 +755,52 @@ class TestUsePatternsScenarios:
 
         # Verify the exact-at-target case also qualifies (original guard)
         assert (38.0 >= 38.0)                  # from >= to → 0.0
+
+    # ── USE PATTERN H — Latch stale: interim setpoint reached, higher schedule pending ──
+
+    def test_pattern_h_latched_with_future_schedule_below_target_shows_schedule_time(self):
+        """USE PATTERN H: latch set at interim setpoint, future schedule at higher temp.
+
+        Scenario: spa was running at setpoint 36°C, latched 'Ready' when water hit
+        36°C.  User then set a schedule (target 39°C, ready at +8h).  The latch is
+        stale — the spa is not ready for the schedule.  Sensor must show the scheduled
+        time, not 'Ready'.
+
+        Observed in production: water=35.5°C, sched_target=39°C, ready_latched=True,
+        sensor showed 'Ready' even though the scheduler showed 'Start at 12:50'.
+        """
+        from datetime import timezone as tz
+        future = datetime.now(tz.utc) + timedelta(hours=8)
+        c = MockCoordinator(
+            near_target=False, ready_latched=True,   # stale latch from interim setpoint
+            water_temp=35.5, target_temp=36.0,
+            heat_rate=2.0, heater="on",
+            scheduled_ready_at=future,
+            schedule_target_temp=39.0,               # 39 - 0.5 = 38.5 threshold; water=35.5 < 38.5
+        )
+        val = _stub(c).native_value
+        assert val is not None and re.match(r"^\d{2}:\d{2}", val), (
+            f"Expected scheduled time HH:MM, got {val!r}"
+        )
+        assert val != "Ready", "Stale latch must not show Ready when water is below schedule target"
+
+    def test_pattern_h_latched_with_future_schedule_at_target_shows_ready(self):
+        """USE PATTERN H: latch honored when water is at/near the schedule target.
+
+        Same setup as above, but water has reached the schedule target (≥ sched_temp − 0.5).
+        The schedule check falls through and the latch fires — 'Ready' is the correct answer
+        because the spa actually is ready for the schedule.
+        """
+        from datetime import timezone as tz
+        future = datetime.now(tz.utc) + timedelta(hours=2)
+        c = MockCoordinator(
+            near_target=True, ready_latched=True,
+            water_temp=38.8, target_temp=39.0,       # water >= sched_temp - 0.5 (38.5)
+            heat_rate=2.0, heater="on",
+            scheduled_ready_at=future,
+            schedule_target_temp=39.0,
+        )
+        val = _stub(c).native_value
+        assert val == "Ready", (
+            f"Latch should be honored when water is at schedule target, got {val!r}"
+        )

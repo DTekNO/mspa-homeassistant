@@ -43,6 +43,26 @@ class _RestoreEntity(_HAEntity):
     async def async_added_to_hass(self): pass
     async def async_get_last_state(self): return None
 
+class _DataUpdateCoordinator:
+    """Minimal real base class so MSpaUpdateCoordinator can subclass it."""
+    def __init__(self, hass, logger, *, config_entry=None, name=None, update_interval=None, **kwargs):
+        self.hass = hass
+        self.config_entry = config_entry
+        self.update_interval = update_interval
+        self.logger = logger
+        self.name = name
+        self.last_update_success = True
+    async def async_request_refresh(self): pass
+    def async_update_listeners(self): pass
+
+class _UpdateFailed(Exception): pass
+
+class _Store:
+    """Minimal real Store so coordinator can call async_load/async_save."""
+    def __init__(self, *args, **kwargs): pass
+    async def async_load(self): return None
+    async def async_save(self, data): pass
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2. Stub the homeassistant package tree
@@ -55,7 +75,8 @@ _number_mod          = MagicMock(); _number_mod.NumberEntity = _NumberEntity
 _binary_mod          = MagicMock(); _binary_mod.BinarySensorEntity = _BinarySensorEntity
 _climate_mod         = MagicMock(); _climate_mod.ClimateEntity = _ClimateEntity
 _datetime_mod        = MagicMock(); _datetime_mod.DateTimeEntity = _DateTimeEntity
-_coordinator_mod     = MagicMock(); _coordinator_mod.CoordinatorEntity = _CoordinatorEntity
+_coordinator_mod     = MagicMock(); _coordinator_mod.CoordinatorEntity = _CoordinatorEntity; _coordinator_mod.DataUpdateCoordinator = _DataUpdateCoordinator; _coordinator_mod.UpdateFailed = _UpdateFailed
+_storage_mod         = MagicMock(); _storage_mod.Store = _Store
 _restore_mod         = MagicMock(); _restore_mod.RestoreEntity = _RestoreEntity
 _entity_mod          = MagicMock(); _entity_mod.EntityCategory = _entity_cat
 _dr_mod              = MagicMock(); _dr_mod.CONNECTION_NETWORK_MAC = "mac"
@@ -73,6 +94,7 @@ _helpers_mod.update_coordinator = _coordinator_mod
 _helpers_mod.restore_state      = _restore_mod
 _helpers_mod.entity             = _entity_mod
 _helpers_mod.device_registry    = _dr_mod
+_helpers_mod.storage            = _storage_mod
 
 sys.modules.update({
     "voluptuous":                                   MagicMock(),
@@ -91,6 +113,7 @@ sys.modules.update({
     "homeassistant.helpers.entity":                 _entity_mod,
     "homeassistant.helpers.restore_state":          _restore_mod,
     "homeassistant.helpers.device_registry":        _dr_mod,
+    "homeassistant.helpers.storage":                _storage_mod,
     "homeassistant.helpers.event":                  MagicMock(),
     "homeassistant.helpers.config_validation":      MagicMock(),
     "homeassistant.helpers.entity_registry":        MagicMock(),
@@ -119,9 +142,12 @@ _mspa_pkg = _make_pkg("custom_components.mspa",  _PKG_ROOT)
 sys.modules["custom_components"]      = _cc_pkg
 sys.modules["custom_components.mspa"] = _mspa_pkg
 
-# Stub the coordinator — sensor.py does NOT import it directly, but entity.py
-# might pull it in transitively.  Pre-stubbing prevents surprises.
-sys.modules["custom_components.mspa.coordinator"] = MagicMock()
+# Stub mspa_api so coordinator.py can be imported in trigger tests without a
+# real API client.  The real coordinator module is NOT pre-stubbed here so that
+# tests/test_coordinator_trigger.py can import and exercise it directly.
+_mspa_api_mod = types.ModuleType("custom_components.mspa.mspa_api")
+_mspa_api_mod.MSpaApiClient = type("MSpaApiClient", (), {})
+sys.modules["custom_components.mspa.mspa_api"] = _mspa_api_mod
 
 # Ensure the repo root is on sys.path so absolute imports work.
 if str(_REPO_ROOT) not in sys.path:

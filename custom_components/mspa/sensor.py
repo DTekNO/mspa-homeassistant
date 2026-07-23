@@ -414,6 +414,164 @@ def _spa_direction(coordinator) -> str | None:
     return "at_target"
 
 
+# Sentinel: distinguishes "state never yet reported" from None (no data).
+_UNSET = object()
+
+
+def _compute_ready_at_value(coordinator) -> "str | None":
+    """Return the Ready at sensor display value for the current coordinator state.
+
+    Extracted from the property so the property can be a thin change-detection
+    wrapper without duplicating logic.
+    """
+    # A future schedule takes priority over a stale latch.  The latch may have
+    # fired when the spa reached an interim setpoint while the schedule targets
+    # a higher temperature not yet reached.  The schedule time is always shown
+    # for a future SRA — UNLESS the latch is active AND water has already
+    # reached the schedule target, in which case "Ready" is the correct answer.
+    sra = coordinator.scheduled_ready_at
+    if sra is not None:
+        sra_utc = sra.astimezone(timezone.utc) if sra.tzinfo else sra.replace(tzinfo=timezone.utc)
+        if sra_utc > datetime.now(timezone.utc):
+            try:
+                water = float(coordinator._last_data.get("water_temperature") or 0)
+            except (TypeError, ValueError):
+                water = None
+            sched_temp = coordinator.schedule_target_temp
+            # Only skip the schedule display when the latch is genuinely valid.
+            latch_valid = (
+                coordinator.ready_latched
+                and water is not None
+                and sched_temp is not None
+                and water >= sched_temp - 0.5
+            )
+            if not latch_valid:
+                local_ready = sra_utc.astimezone()
+                days = (local_ready.date() - datetime.now().date()).days
+                suffix = f" +{days}d" if days > 0 else ""
+                return f"{local_ready.strftime('%H:%M')}{suffix}"
+            # Latch is valid (water is at schedule target) — fall through to "Ready".
+
+    if coordinator.ready_latched:
+        return "Ready"
+    direction = _spa_direction(coordinator)
+    if direction == "cooling":
+        return None
+    if direction == "heating" and coordinator._last_data.get("heater") != "on":
+        return None
+    mins = _minutes_to_target(coordinator)
+    if mins is None:
+        return None
+    if mins <= 5:
+        if coordinator.scheduled_ready_at is not None:
+            try:
+                water = float(coordinator._last_data.get("water_temperature") or 0)
+                if water < coordinator.schedule_target_temp - 0.5:
+                    return None
+            except (ValueError, TypeError):
+                pass
+        return "Ready"
+    ready_at_utc = _ready_at_utc(coordinator)
+    if ready_at_utc is None:
+        return None
+    local_ready = ready_at_utc.astimezone()
+    days = (local_ready.date() - datetime.now().date()).days
+    suffix = f" +{days}d" if days > 0 else ""
+    return f"{local_ready.strftime('%H:%M')}{suffix}"
+
+
+def _log_readiness_change(coordinator, old_state: object, new_state: "str | None") -> None:
+    """Emit one INFO line when the Ready at sensor value transitions."""
+    data = coordinator._last_data
+    try:
+        water = f"{float(data.get('water_temperature')):.1f}"
+    except (TypeError, ValueError):
+        water = "?"
+    try:
+        setpoint = f"{float(data.get('target_temperature')):.1f}"
+    except (TypeError, ValueError):
+        setpoint = "?"
+
+    sched_at = getattr(coordinator, "scheduled_ready_at", None)
+    sched_temp = getattr(coordinator, "schedule_target_temp", None)
+    if sched_at is not None and sched_temp is not None:
+        sched_ctx = f"sched={sched_temp:.1f}°C@{sched_at.strftime('%H:%M')}"
+    elif sched_temp is not None:
+        sched_ctx = f"sched={sched_temp:.1f}°C"
+    else:
+        sched_ctx = "no-sched"
+
+    rate = _effective_heat_rate(coordinator)
+    rate_str = f"{rate:.2f}°C/h" if rate is not None else "no-rate"
+    heater = data.get("heater", "?")
+    latched = getattr(coordinator, "ready_latched", False)
+    near = getattr(coordinator, "near_target", False)
+    old_label = "BOOT" if old_state is _UNSET else repr(old_state)
+
+    _LOGGER.info(
+        "Ready at: %s → %s  [water=%s  sp=%s  %s  heater=%s  rate=%s  latched=%s  near=%s]",
+        old_label, repr(new_state),
+        water, setpoint, sched_ctx, heater, rate_str, latched, near,
+    )
+
+
+def _compute_schedule_value(result) -> str:
+    """Return the Heat Schedule display value from a _schedule_data() result."""
+    if result is None:
+        return "Not scheduled"
+    if result == "ready":
+        return "Ready"
+    _, _, start_at_utc = result
+    now_utc = dt_util.utcnow()
+    if now_utc >= start_at_utc:
+        return "Start now"
+    local_start = dt_util.as_local(start_at_utc)
+    days = (local_start.date() - dt_util.now().date()).days
+    suffix = f" +{days}d" if days > 0 else ""
+    return f"Start at {local_start.strftime('%H:%M')}{suffix}"
+
+
+def _log_schedule_change(
+    coordinator, old_state: object, new_state: str, schedule_data
+) -> None:
+    """Emit one INFO line when the Heat Schedule sensor value transitions."""
+    data = coordinator._last_data
+    try:
+        water = f"{float(data.get('water_temperature')):.1f}"
+    except (TypeError, ValueError):
+        water = "?"
+
+    sched_at = getattr(coordinator, "scheduled_ready_at", None)
+    sched_temp = getattr(coordinator, "schedule_target_temp", None)
+    if sched_at is not None and sched_temp is not None:
+        sched_ctx = f"sched={sched_temp:.1f}°C@{sched_at.strftime('%H:%M')}"
+    elif sched_temp is not None:
+        sched_ctx = f"sched={sched_temp:.1f}°C"
+    else:
+        sched_ctx = "no-sched"
+
+    rate = _effective_heat_rate(coordinator)
+    rate_str = f"{rate:.2f}°C/h" if rate is not None else "no-rate"
+    triggered = getattr(coordinator, "_schedule_triggered", False)
+
+    if isinstance(schedule_data, tuple):
+        _, _, start_at_utc = schedule_data
+        try:
+            start_local = start_at_utc.astimezone()
+            extra = f"start={start_local.strftime('%H:%M')}"
+        except Exception:
+            extra = "start=?"
+    else:
+        extra = f"data={schedule_data!r}"
+
+    old_label = "BOOT" if old_state is _UNSET else repr(old_state)
+    _LOGGER.info(
+        "Heat Schedule: %s → %s  [water=%s  %s  %s  rate=%s  triggered=%s]",
+        old_label, repr(new_state),
+        water, sched_ctx, extra, rate_str, triggered,
+    )
+
+
 class MSpaReadinessSensor(MSpaSensorEntity):
     """Human-readable spa readiness sensor.
 
@@ -441,49 +599,12 @@ class MSpaReadinessSensor(MSpaSensorEntity):
 
     @property
     def native_value(self):
-        if self.coordinator.ready_latched:
-            return "Ready"
-        # When a future schedule is pending, surface the target time directly.
-        # The trigger will raise the setpoint and start heating at the right moment;
-        # there is nothing useful to show from rate-based ETA while the spa cools.
-        sra = self.coordinator.scheduled_ready_at
-        if sra is not None:
-            sra_utc = sra.astimezone(timezone.utc) if sra.tzinfo else sra.replace(tzinfo=timezone.utc)
-            if sra_utc > datetime.now(timezone.utc):
-                local_ready = sra_utc.astimezone()
-                days = (local_ready.date() - datetime.now().date()).days
-                suffix = f" +{days}d" if days > 0 else ""
-                return f"{local_ready.strftime('%H:%M')}{suffix}"
-        direction = _spa_direction(self.coordinator)
-        if direction == "cooling":
-            return None
-        # Water is below setpoint but the heater is not running — spa is idle/off.
-        # Don't show a stale rate-based prediction; wait until heating actually starts.
-        if direction == "heating" and self.coordinator._last_data.get("heater") != "on":
-            return None
-        mins = _minutes_to_target(self.coordinator)
-        if mins is None:
-            return None
-        if mins <= 5:
-            # Spa may be maintaining at a lowered interim setpoint while the schedule
-            # targets a higher temperature.  Don't claim "Ready" until water is also
-            # near the schedule target, otherwise the sensor shows "Ready" at 35°C
-            # when the user wants 40°C.
-            if self.coordinator.scheduled_ready_at is not None:
-                try:
-                    water = float(self.coordinator._last_data.get("water_temperature") or 0)
-                    if water < self.coordinator.schedule_target_temp - 0.5:
-                        return None
-                except (ValueError, TypeError):
-                    pass
-            return "Ready"
-        ready_at_utc = _ready_at_utc(self.coordinator)
-        if ready_at_utc is None:
-            return None
-        local_ready = ready_at_utc.astimezone()
-        days = (local_ready.date() - datetime.now().date()).days
-        suffix = f" +{days}d" if days > 0 else ""
-        return f"{local_ready.strftime('%H:%M')}{suffix}"
+        val = _compute_ready_at_value(self.coordinator)
+        prev = getattr(self, "_logged_state", _UNSET)
+        if val != prev:
+            _log_readiness_change(self.coordinator, prev, val)
+            self._logged_state = val
+        return val
 
     @property
     def icon(self):
@@ -612,22 +733,30 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 
     @property
     def native_value(self):
+        # Once triggered, hold "Start now" until the spa reaches the schedule
+        # target — prevents a shortening ETA from pushing the recalculated
+        # start time into the future and flickering back to "Start at HH:MM".
+        if self.coordinator._schedule_triggered:
+            sched_temp = self.coordinator.schedule_target_temp
+            try:
+                water = float(self.coordinator._last_data.get("water_temperature") or 0)
+            except (TypeError, ValueError):
+                water = None
+            if sched_temp is None or water is None or water < sched_temp - 0.5:
+                val = "Start now"
+                prev = getattr(self, "_logged_state", _UNSET)
+                if val != prev:
+                    _log_schedule_change(self.coordinator, prev, val, None)
+                    self._logged_state = val
+                return val
+
         result = self._schedule_data()
-        if result is None:
-            return "Not scheduled"
-        if result == "ready":
-            return "Ready"
-
-        _, _, start_at_utc = result
-        now_utc = dt_util.utcnow()
-
-        if now_utc >= start_at_utc:
-            return "Start now"
-
-        local_start = dt_util.as_local(start_at_utc)
-        days = (local_start.date() - dt_util.now().date()).days
-        suffix = f" +{days}d" if days > 0 else ""
-        return f"Start at {local_start.strftime('%H:%M')}{suffix}"
+        val = _compute_schedule_value(result)
+        prev = getattr(self, "_logged_state", _UNSET)
+        if val != prev:
+            _log_schedule_change(self.coordinator, prev, val, result)
+            self._logged_state = val
+        return val
 
     @property
     def extra_state_attributes(self):
