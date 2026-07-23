@@ -1,0 +1,59 @@
+name: Update and release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version without 'v' prefix
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Set manifest.json version
+        uses: jossef/action-set-json-field@v2
+        with:
+          file: custom_components/mspa/manifest.json
+          field: version
+          value: ${{ steps.get_version.outputs.VERSION }}
+
+      - name: Commit the updated manifest and push changes
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add custom_components/mspa/manifest.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update manifest version to ${{ steps.get_version.outputs.VERSION }}"
+            # Push to the current branch (not hardcoded to main)
+            git push origin HEAD:${{ github.event.release.target_commitish }}
+          fi
+
+          # Move the tag to this commit and force-push
+          git tag -f ${{ github.ref_name }}
+          git push origin ${{ github.ref_name }} --force
+
+  release:
+    needs: update-manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - run: echo "(zipped artifact)" > ${{ github.workspace }}/custom_components/mspa/README.md
+        
+      # Pack the MSPA dir as a zip and upload to the release
+      - name: 📦 ZIP MSPA Dir
+        run: |
+          cd ${{ github.workspace }}/custom_components/mspa
+          zip mspa.zip -r ./
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/custom_components/mspa/mspa.zip
