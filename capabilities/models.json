@@ -1,0 +1,13 @@
+
+{
+  "F-TU062W": {
+    "supports_heater": true,
+    "supports_filter": true,
+    "supports_bubble": true,
+    "supports_bubble_level": true,
+    "supports_jet": false,
+    "supports_uvc": true,
+    "supports_ozone": true,
+    "notes": "Derived from field testing; API does not implement server-side capability checks."
+  }
+}

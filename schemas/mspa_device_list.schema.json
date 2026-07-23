@@ -1,0 +1,89 @@
+
+{
+  "$id": "https://example.com/schemas/mspa_device_list.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MSpa Device List Response",
+  "type": "object",
+  "required": ["code", "message", "request_id", "data"],
+  "properties": {
+    "code": { "type": "integer", "enum": [0, 1, 2, 3] },
+    "message": { "type": "string" },
+    "request_id": { "type": "string", "minLength": 1 },
+    "data": {
+      "type": "object",
+      "required": ["list"],
+      "properties": {
+        "list": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "enduser_id",
+              "device_id",
+              "app_id",
+              "binding_role",
+              "is_current",
+              "software_version",
+              "device_alias",
+              "binding_time",
+              "activate_time",
+              "product_series",
+              "product_model",
+              "name",
+              "record_time",
+              "is_online",
+              "is_connect",
+              "service_region",
+              "url",
+              "sn",
+              "mac",
+              "product_tub_pk",
+              "product_id",
+              "wifi_version",
+              "mcu_version",
+              "is_cloud_activated"
+            ],
+            "properties": {
+              "enduser_id": { "type": "string" },
+              "device_id": { "type": "string" },
+              "app_id": { "type": "string" },
+              "registration_id": { "type": ["string", "null"] },
+              "binding_role": { "type": "integer" },
+              "is_current": { "type": "boolean" },
+              "software_version": { "type": "string" },
+              "device_alias": { "type": "string" },
+              "binding_time": { "type": "string" },
+              "activate_time": { "type": "string" },
+              "modelid": { "type": ["string", "null"] },
+              "product_series": { "type": "string" },
+              "product_model": { "type": "string" },
+              "name": { "type": "string" },
+              "record_time": { "type": "string" },
+              "type": { "type": ["string", "null"] },
+              "is_online": { "type": "boolean" },
+              "is_connect": { "type": "boolean" },
+              "service_region": { "type": "string" },
+              "activate_ip": { "type": "string", "format": "ipv4" },
+              "url": { "type": "string", "format": "uri" },
+              "sn": { "type": "string" },
+              "mac": {
+                "type": "string",
+                "pattern": "^[0-9A-Fa-f]{12}$"
+              },
+              "product_tub_pk": { "type": "string" },
+              "product_id": { "type": "string" },
+              "wifi_version": { "type": "string" },
+              "mcu_version": { "type": "string" },
+              "device_uuid": { "type": "string" },
+              "is_cloud_activated": { "type": "integer", "enum": [0, 1] }
+            },
+            "additionalProperties": true
+          },
+          "minItems": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,45 @@
+
+{
+  "$id": "https://example.com/schemas/mspa_thing_shadow.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MSpa Thing Shadow (Status)",
+  "type": "object",
+  "properties": {
+    "wifivertion": { "type": "integer" },
+    "otastatus": { "type": "integer" },
+    "mcuversion": { "type": "string" },
+    "ConnectType": { "type": "string", "enum": ["online", "offline"] },
+    "heater_state": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "filter_state": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "bubble_state": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "ozone_state": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "uvc_state": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "jet_state": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "temperature_unit": { "type": "integer", "enum": [0, 1] },
+    "temperature_setting": { "type": "integer", "multipleOf": 1 },
+    "water_temperature": { "type": "integer", "multipleOf": 1 },
+    "auto_inflate": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "filter_current": { "type": "integer" },
+    "safety_lock": { "type": "integer", "minimum": 0, "maximum": 1 },
+    "heat_time_switch": { "type": "integer" },
+    "heat_state": { "type": "integer" },
+    "bubble_level": { "type": "integer", "minimum": 0, "maximum": 3 },
+    "multimcuotainfo": { "type": "string" },
+    "heat_time": { "type": "integer" },
+    "filter_life": { "type": "integer" },
+    "trdversion": { "type": "string" },
+    "is_online": { "type": "boolean" },
+    "fault": { "type": "string" },
+    "warning": { "type": "string" },
+    "device_heat_perhour": { "type": "integer" }
+  },
+  "required": [
+    "heater_state",
+    "filter_state",
+    "bubble_state",
+    "temperature_setting",
+    "water_temperature",
+    "is_online"
+  ],
+  "additionalProperties": true
+}
