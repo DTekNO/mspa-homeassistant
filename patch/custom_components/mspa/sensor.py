@@ -452,7 +452,7 @@ def _compute_ready_at_value(coordinator) -> "str | None":
     │ 7 │ fallback                                    │ None (unavailable)       │
     └───┴─────────────────────────────────────────────┴──────────────────────────┘
     """
-    # ── Gather facts ───────────────────────────────────────────────────────────
+    # ── Gather facts ───────────────────────────────────────────────────────
     now_utc      = datetime.now(timezone.utc)
     sra_utc_val  = _sra_utc(coordinator)
     sra_future   = sra_utc_val is not None and sra_utc_val > now_utc
@@ -480,21 +480,19 @@ def _compute_ready_at_value(coordinator) -> "str | None":
         and anchor_target >= sched_temp - 0.5
     )
 
-    # ── Rule 1: spa is physically at/near its current setpoint ─────────────────
-    # Suppressed when a future schedule targets a higher temperature — the user
-    # needs to see when the spa will reach that target, not a premature "Ready".
-    if (coordinator.near_target or direction == "at_target") and (not sra_future or at_sched):
+    # ── Rule 1: spa is physically at/near its current setpoint ─────────────
+    if coordinator.near_target or direction == "at_target":
         return "Ready"
 
-    # ── Rule 2: latch valid — spa reached the schedule target this session ─────
+    # ── Rule 2: latch valid — spa reached the schedule target this session ─
     if coordinator.ready_latched and sra_future and at_sched:
         return "Ready"
 
-    # ── Rule 3: spa is hotter than setpoint with no pending schedule ───────────
+    # ── Rule 3: spa is hotter than setpoint with no pending schedule ────────
     if direction == "cooling" and not sra_future:
         return "Ready"
 
-    # ── Rule 4: schedule pending AND heater running toward its target ──────────
+    # ── Rule 4: schedule pending AND heater running toward its target ───────
     if sra_future and heating_to_sched:
         eta_utc = _ready_at_utc(coordinator)
         if eta_utc is not None:
@@ -503,7 +501,7 @@ def _compute_ready_at_value(coordinator) -> "str | None":
             return _fmt_local(eta_utc)
         # No rate data yet — fall through to rule 6 (show the schedule time)
 
-    # ── Rule 5: no schedule, heater on, heating toward setpoint ───────────────
+    # ── Rule 5: no schedule, heater on, heating toward setpoint ────────────
     if not sra_future and heater_on and direction == "heating":
         eta_utc = _ready_at_utc(coordinator)
         if eta_utc is None:
@@ -512,11 +510,11 @@ def _compute_ready_at_value(coordinator) -> "str | None":
             return "Ready"
         return _fmt_local(eta_utc)
 
-    # ── Rule 6: future schedule, waiting or cooling toward lower target ────────
+    # ── Rule 6: future schedule, waiting or cooling toward lower target ─────
     if sra_future:
         return _fmt_local(sra_utc_val)
 
-    # ── Rule 7: nothing useful to show ────────────────────────────────────────
+    # ── Rule 7: nothing useful to show ─────────────────────────────────────
     return None
 
 

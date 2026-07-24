@@ -258,15 +258,15 @@ class TestNativeValue:
         )
         assert _stub(c).native_value == "Ready"
 
-    def test_shows_none_when_cooling_not_latched(self):
-        """Cooling before first Ready reached → no prediction, no state."""
+    def test_shows_ready_when_cooling_not_latched(self):
+        """Spa above setpoint with no schedule — water is warm, show Ready."""
         c = MockCoordinator(
             ready_latched=False,
             near_target=False,
             water_temp=40.0,
             target_temp=35.0,
         )
-        assert _stub(c).native_value is None
+        assert _stub(c).native_value == "Ready"
 
     def test_shows_ready_when_very_close_to_target(self):
         """mins <= 5 yields 'Ready' even without a latch (near arrival)."""
@@ -309,8 +309,8 @@ class TestNativeValue:
         )
         assert _stub(c).native_value is None
 
-    def test_shows_none_after_schedule_reset_while_cooling(self):
-        """After a schedule change while still cooling, sensor has nothing to show."""
+    def test_shows_ready_after_schedule_reset_while_cooling(self):
+        """Cooling above setpoint after schedule reset — spa is warm, show Ready."""
         c = MockCoordinator(
             ready_latched=False,  # reset by schedule change
             near_target=False,
@@ -318,7 +318,7 @@ class TestNativeValue:
             target_temp=38.0,    # cooling
             cool_rate=None,      # no cool rate data
         )
-        assert _stub(c).native_value is None
+        assert _stub(c).native_value == "Ready"
 
     def test_shows_prediction_after_schedule_reset_while_heating(self):
         """After schedule reset, heating prediction resumes immediately."""

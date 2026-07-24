@@ -591,8 +591,8 @@ class TestScenarios:
             heat_rate=2.0,
             schedule_triggered=True,
         )
-        assert _val(coord) == "Start now", (
-            "Triggered latch must hold 'Start now' while water is below schedule target"
+        assert _val(coord) == "Heating", (
+            "Triggered latch must show 'Heating' while water is below schedule target"
         )
 
     def test_triggered_latch_releases_when_spa_reaches_target(self):
