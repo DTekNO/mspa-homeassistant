@@ -11,3 +11,4 @@ MSpa_Hot_Tub_HA_integration.iml
 .idea/modules.xml
 .idea/vcs.xml
 custom_components/mspa.zip
+*.log
