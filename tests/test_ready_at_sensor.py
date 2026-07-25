@@ -270,14 +270,13 @@ class TestNativeValue:
 
     def test_shows_ready_when_very_close_to_target(self):
         """mins <= 5 yields 'Ready' even without a latch (near arrival)."""
-        # Anchor set 145 min ago, 5°C to heat at 2°C/h = 150 min total → 5 min left
+        # 0.1°C remaining at 2°C/h = 3 min → ≤ 5 min threshold → "Ready"
         c = MockCoordinator(
             ready_latched=False,
             near_target=False,
-            water_temp=35.0,
+            water_temp=39.9,
             target_temp=40.0,
             heat_rate=2.0,
-            anchor_offset_minutes=-145.0,
         )
         assert _stub(c).native_value == "Ready"
 

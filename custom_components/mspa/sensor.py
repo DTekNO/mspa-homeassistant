@@ -495,19 +495,33 @@ def _compute_ready_at_value(coordinator) -> "str | None":
         return "Ready"
 
     # ── Rule 4: schedule pending AND heater running toward its target ──────────
+    # Calculate exactly as the scheduler does: _segmented_heating_minutes from
+    # the live water temperature to the schedule target.  Using the anchor here
+    # diverges from the scheduler because anchor_target is the thermostat
+    # setpoint (which may differ from sched_temp) and anchor_temp can be stale.
     if sra_future and heating_to_sched:
-        eta_utc = _ready_at_utc(coordinator)
-        if eta_utc is not None:
-            if (eta_utc - now_utc).total_seconds() <= 300:   # ≤ 5 min
-                return "Ready"
-            return _fmt_local(eta_utc)
+        if water is not None and sched_temp is not None:
+            mins = _segmented_heating_minutes(water, sched_temp, coordinator)
+            if mins is not None:
+                eta_utc = now_utc + timedelta(minutes=mins)
+                if (eta_utc - now_utc).total_seconds() <= 300:   # ≤ 5 min
+                    return "Ready"
+                return _fmt_local(eta_utc)
         # No rate data yet — fall through to rule 6 (show the schedule time)
 
-    # ── Rule 5: no schedule, heater on, heating toward setpoint ───────────────
+    # ── Rule 5: no schedule, heater on, heating toward thermostat setpoint ─────
+    # Same direct approach: no anchor, no elapsed-time subtraction.
     if not sra_future and heater_on and direction == "heating":
-        eta_utc = _ready_at_utc(coordinator)
-        if eta_utc is None:
+        try:
+            thermo_target = float(coordinator._last_data.get("target_temperature") or 0)
+        except (TypeError, ValueError):
+            thermo_target = None
+        if water is None or thermo_target is None:
             return None
+        mins = _segmented_heating_minutes(water, thermo_target, coordinator)
+        if mins is None:
+            return None
+        eta_utc = now_utc + timedelta(minutes=mins)
         if (eta_utc - now_utc).total_seconds() <= 300:
             return "Ready"
         return _fmt_local(eta_utc)
