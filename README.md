@@ -671,7 +671,7 @@ Delete each demo entry the same way as a real one: **Settings** > **Devices & Se
 For issues or feature requests, please open an issue in this repository.
 
 <!-- Badge definitions -->
-[hacs-badge]: https://img.shields.io/badge/HACS-Custom-orange.svg
+[hacs-badge]: https://img.shields.io/badge/HACS-Default-blue.svg
 [hacs-url]: https://github.com/DTekNO/mspa-homeassistant
 [hacs-validation-badge]: https://github.com/DTekNO/mspa-homeassistant/actions/workflows/validate.yaml/badge.svg
 [hacs-validation-url]: https://github.com/DTekNO/mspa-homeassistant/actions/workflows/validate.yaml
