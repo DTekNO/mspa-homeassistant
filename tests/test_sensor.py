@@ -29,9 +29,9 @@ _NOW_LOCAL = datetime(2026, 7, 22, 14, 0, 0)   # UTC+2, no tzinfo (local naive)
 def _make_coordinator(**overrides):
     """Minimal mock coordinator with sensible defaults."""
     c = MagicMock()
-    c.near_target = False
-    c.ready_latched = False
-    c._schedule_triggered = False
+    c.near_target = overrides.get("near_target", False)
+    c.ready_latched = overrides.get("ready_latched", False)
+    c._schedule_triggered = overrides.get("_schedule_triggered", False)
     c.scheduled_ready_at = None
     c.schedule_target_temp = 40.0
     c.temp_anchor_time = _NOW_UTC
@@ -133,26 +133,32 @@ class TestReadyAtValue(unittest.TestCase):
         self.assertEqual(_compute_ready_at_value(c), "Ready")
 
     def test_latched_valid_water_at_schedule_target_returns_ready(self):
-        """Latch honored when water is within 0.5°C of schedule target."""
+        """Latch honored when water is within 1°C of schedule target, with future SRA."""
         future = datetime.now(timezone.utc) + timedelta(hours=2)
         c = _make_coordinator(ready_latched=True)
         c.scheduled_ready_at = future
         c.schedule_target_temp = 40.0
-        # water=39.5 ≥ 40.0-0.5=39.5 → latch_valid → "Ready"
         c._last_data = {"water_temperature": 39.5, "target_temperature": 35.0, "heater": "off"}
         self.assertEqual(_compute_ready_at_value(c), "Ready")
 
-    def test_latched_stale_water_below_schedule_target_shows_schedule_time(self):
-        """Stale latch — water far below schedule target — shows scheduled time, not 'Ready'."""
-        future = datetime.now(timezone.utc) + timedelta(hours=2)
+    def test_latched_valid_after_sra_cleared(self):
+        """Latch works even after scheduled_ready_at is cleared (schedule just completed)."""
         c = _make_coordinator(ready_latched=True)
-        c.scheduled_ready_at = future
+        c.scheduled_ready_at = None   # coordinator already cleared it at the scheduled time
         c.schedule_target_temp = 40.0
-        # water=35.0 < 40.0-0.5=39.5 → latch_valid=False → show schedule time
-        c._last_data = {"water_temperature": 35.0, "target_temperature": 35.0, "heater": "off"}
-        result = _compute_ready_at_value(c)
-        self.assertIsNotNone(result)
-        self.assertIn(":", result)
+        # water=39.5 — within 1°C of sched_temp → latch fires
+        c._last_data = {"water_temperature": 39.5, "target_temperature": 40.0, "heater": "off"}
+        self.assertEqual(_compute_ready_at_value(c), "Ready")
+
+    def test_latched_stale_water_below_schedule_target_shows_none(self):
+        """Stale latch with water far below schedule target — at_sched guard blocks Rule 2."""
+        c = _make_coordinator(ready_latched=True)
+        c.scheduled_ready_at = None
+        c.schedule_target_temp = 40.0
+        # water=30, thermostat=35, heater off, no rate data → no rule matches → None
+        c._last_data = {"water_temperature": 30.0, "target_temperature": 35.0, "heater": "off"}
+        c.computed_heat_rate = None
+        self.assertIsNone(_compute_ready_at_value(c))
 
     def test_at_target_direction_returns_ready_without_near_target(self):
         """direction=='at_target' → 'Ready' even when near_target flag is False."""

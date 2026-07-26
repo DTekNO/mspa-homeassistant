@@ -47,6 +47,7 @@ class MockCoordinator:
     ):
         self.near_target = near_target
         self.ready_latched = ready_latched
+        self._schedule_triggered = False
         self.computed_cool_rate = cool_rate
         self.prediction_bias = 1.0
         self._session_scalar = 1.0

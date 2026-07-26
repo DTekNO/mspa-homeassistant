@@ -487,7 +487,11 @@ def _compute_ready_at_value(coordinator) -> "str | None":
         return "Ready"
 
     # ── Rule 2: latch valid — spa reached the schedule target this session ─────
-    if coordinator.ready_latched and sra_future and at_sched:
+    # sra_future intentionally omitted: the coordinator auto-clears scheduled_ready_at
+    # once the scheduled time passes, so requiring sra_future here would make the latch
+    # invisible exactly when it matters most (spa at temp, schedule just completed).
+    # at_sched (±1°C of schedule target) is the sufficient freshness guard.
+    if coordinator.ready_latched and at_sched:
         return "Ready"
 
     # ── Rule 3: spa is hotter than setpoint with no pending schedule ───────────
@@ -506,6 +510,15 @@ def _compute_ready_at_value(coordinator) -> "str | None":
                 eta_utc = now_utc + timedelta(minutes=mins)
                 if (eta_utc - now_utc).total_seconds() <= 300:   # ≤ 5 min
                     return "Ready"
+                # The MSpa API caches the water temperature reading, so between
+                # updates the live ETA is `now + constant` — it drifts forward at
+                # 1 min/min instead of counting down toward the scheduled time.
+                # Clamp to the SRA as an upper bound: only show an earlier time if
+                # heating is genuinely ahead of schedule; never show later than planned.
+                # (If heating is genuinely delayed past SRA, the coordinator clears
+                # scheduled_ready_at and Rule 5 takes over with a fresh live ETA.)
+                if coordinator._schedule_triggered and sra_utc_val is not None:
+                    eta_utc = min(eta_utc, sra_utc_val)
                 return _fmt_local(eta_utc)
         # No rate data yet — fall through to rule 6 (show the schedule time)
 
