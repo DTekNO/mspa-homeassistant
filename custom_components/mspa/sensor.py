@@ -443,11 +443,10 @@ def _compute_ready_at_value(coordinator) -> "str | None":
     ├───┼─────────────────────────────────────────────┼──────────────────────────┤
     │ 1 │ near_target OR direction == at_target       │ "Ready"                  │
     │ 2 │ ready_latched AND water ≈ sched_temp (±1°C) │ "Ready"                  │
-    │   │ AND future schedule                         │                          │
     │ 3 │ direction == cooling AND no future schedule │ "Ready" (already hot)    │
-    │ 4 │ future schedule AND heating toward it       │ Computed ETA (→ SRA      │
-    │   │                                             │ fallback if no rate)      │
-    │ 5 │ no future schedule AND heater on, heating   │ Computed ETA             │
+    │ 4 │ future schedule AND heating toward it       │ Anchor-based ETA (→ SRA  │
+    │   │                                             │ fallback if stale/past)  │
+    │ 5 │ no future schedule AND heater on, heating   │ Anchor-based ETA         │
     │ 6 │ future schedule (all other cases)           │ SRA time string          │
     │ 7 │ fallback                                    │ None (unavailable)       │
     └───┴─────────────────────────────────────────────┴──────────────────────────┘
@@ -499,42 +498,43 @@ def _compute_ready_at_value(coordinator) -> "str | None":
         return "Ready"
 
     # ── Rule 4: schedule pending AND heater running toward its target ──────────
-    # Calculate exactly as the scheduler does: _segmented_heating_minutes from
-    # the live water temperature to the schedule target.  Using the anchor here
-    # diverges from the scheduler because anchor_target is the thermostat
-    # setpoint (which may differ from sched_temp) and anchor_temp can be stale.
+    # The ETA is anchored to the last confirmed temperature change, so it only
+    # updates when the API reports a new reading — not every poll.  If no update
+    # arrives within the time to heat 0.5°C + a small margin, heating is running
+    # slower than predicted and we push the ETA forward proportionally.
+    # The result may be earlier OR later than the scheduled time — that is correct.
     if sra_future and heating_to_sched:
-        if water is not None and sched_temp is not None:
-            mins = _segmented_heating_minutes(water, sched_temp, coordinator)
+        anc_time = coordinator.temp_anchor_time
+        anc_temp = coordinator.temp_anchor_temp
+        if anc_time is not None and anc_temp is not None and sched_temp is not None:
+            mins = _segmented_heating_minutes(anc_temp, sched_temp, coordinator)
             if mins is not None:
-                eta_utc = now_utc + timedelta(minutes=mins)
-                if (eta_utc - now_utc).total_seconds() <= 300:   # ≤ 5 min
+                elapsed_mins = (now_utc - anc_time).total_seconds() / 60.0
+                # Smallest step the API is expected to report: 0.5°C worth of heating.
+                step_mins = _segmented_heating_minutes(
+                    anc_temp, min(anc_temp + 0.5, sched_temp), coordinator
+                ) or 1.0
+                if elapsed_mins > step_mins + 2.0:
+                    # Temperature should have updated by now — push ETA forward
+                    # by the overrun to reflect slower-than-expected heating.
+                    overrun = elapsed_mins - step_mins
+                    eta_utc = anc_time + timedelta(minutes=mins + overrun)
+                else:
+                    eta_utc = anc_time + timedelta(minutes=mins)
+                remaining = (eta_utc - now_utc).total_seconds()
+                if remaining <= 300:
                     return "Ready"
-                # The MSpa API caches the water temperature reading, so between
-                # updates the live ETA is `now + constant` — it drifts forward at
-                # 1 min/min instead of counting down toward the scheduled time.
-                # Clamp to the SRA as an upper bound: only show an earlier time if
-                # heating is genuinely ahead of schedule; never show later than planned.
-                # (If heating is genuinely delayed past SRA, the coordinator clears
-                # scheduled_ready_at and Rule 5 takes over with a fresh live ETA.)
-                if coordinator._schedule_triggered and sra_utc_val is not None:
-                    eta_utc = min(eta_utc, sra_utc_val)
-                return _fmt_local(eta_utc)
-        # No rate data yet — fall through to rule 6 (show the schedule time)
+                if remaining > 0:
+                    return _fmt_local(eta_utc)
+        # No anchor/rate or prediction already passed — fall through to Rule 6
 
     # ── Rule 5: no schedule, heater on, heating toward thermostat setpoint ─────
-    # Same direct approach: no anchor, no elapsed-time subtraction.
+    # _ready_at_utc() is anchor-based: it uses the last confirmed temperature
+    # reading, so the ETA is stable between API updates.
     if not sra_future and heater_on and direction == "heating":
-        try:
-            thermo_target = float(coordinator._last_data.get("target_temperature") or 0)
-        except (TypeError, ValueError):
-            thermo_target = None
-        if water is None or thermo_target is None:
+        eta_utc = _ready_at_utc(coordinator)
+        if eta_utc is None:
             return None
-        mins = _segmented_heating_minutes(water, thermo_target, coordinator)
-        if mins is None:
-            return None
-        eta_utc = now_utc + timedelta(minutes=mins)
         if (eta_utc - now_utc).total_seconds() <= 300:
             return "Ready"
         return _fmt_local(eta_utc)
