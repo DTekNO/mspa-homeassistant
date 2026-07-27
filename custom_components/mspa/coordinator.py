@@ -459,6 +459,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if delta < _NEAR_TARGET_DEACTIVATE:
                     if not self.near_target:   # latch only on the False→True transition
                         self.ready_latched = True
+                        _LOGGER.debug("ready_latched set (near_target True, delta=%.2f°C)", delta)
                     self.near_target = True
                 elif delta >= _NEAR_TARGET_ACTIVATE:
                     self.near_target = False

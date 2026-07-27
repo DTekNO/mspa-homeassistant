@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 
 from custom_components.mspa.sensor import (
     _spa_direction,
-    _ready_at_utc,
+    _anchor_eta_utc,
     _minutes_to_target,
     MSpaReadinessSensor,
 )
@@ -105,9 +105,7 @@ class _SensorStub:
     def available(self) -> bool:
         if not self._base_available():
             return False
-        if self.coordinator.ready_latched:
-            return True
-        return _minutes_to_target(self.coordinator) is not None
+        return _spa_direction(self.coordinator) is not None or self.coordinator.ready_latched
 
     @property
     def native_value(self):
@@ -259,15 +257,15 @@ class TestNativeValue:
         )
         assert _stub(c).native_value == "Ready"
 
-    def test_shows_ready_when_cooling_not_latched(self):
-        """Spa above setpoint with no schedule — water is warm, show Ready."""
+    def test_shows_none_when_cooling_not_latched(self):
+        """Spa cooling above setpoint, no latch, no schedule → None (no ETA for cooling)."""
         c = MockCoordinator(
             ready_latched=False,
             near_target=False,
             water_temp=40.0,
             target_temp=35.0,
         )
-        assert _stub(c).native_value == "Ready"
+        assert _stub(c).native_value is None
 
     def test_shows_ready_when_very_close_to_target(self):
         """mins <= 5 yields 'Ready' even without a latch (near arrival)."""
@@ -309,16 +307,16 @@ class TestNativeValue:
         )
         assert _stub(c).native_value is None
 
-    def test_shows_ready_after_schedule_reset_while_cooling(self):
-        """Cooling above setpoint after schedule reset — spa is warm, show Ready."""
+    def test_shows_none_after_schedule_reset_while_cooling(self):
+        """Cooling, no latch, no schedule → None (no ETA for cooling direction)."""
         c = MockCoordinator(
             ready_latched=False,  # reset by schedule change
             near_target=False,
             water_temp=40.0,
             target_temp=38.0,    # cooling
-            cool_rate=None,      # no cool rate data
+            cool_rate=None,
         )
-        assert _stub(c).native_value == "Ready"
+        assert _stub(c).native_value is None
 
     def test_shows_prediction_after_schedule_reset_while_heating(self):
         """After schedule reset, heating prediction resumes immediately."""
@@ -352,7 +350,8 @@ class TestAvailable:
         c = MockCoordinator(ready_latched=False, near_target=False, heat_rate=2.0)
         assert _stub(c).available is True
 
-    def test_not_available_when_no_rate_and_not_latched(self):
+    def test_available_when_no_rate_and_not_latched(self):
+        """Available whenever direction is known, even with no rate data (value may be None)."""
         c = MockCoordinator(
             ready_latched=False,
             near_target=False,
@@ -361,7 +360,7 @@ class TestAvailable:
             heat_rate=None,
             device_heat_perhour=0,
         )
-        assert _stub(c).available is False
+        assert _stub(c).available is True
 
     def test_not_available_when_coordinator_offline_even_if_latched(self):
         """Coordinator offline (last_update_success=False) makes the entity unavailable
@@ -370,17 +369,16 @@ class TestAvailable:
         assert _stub(c).available is False
 
 
-# ── _ready_at_utc helper ──────────────────────────────────────────────────────
+# ── _anchor_eta_utc helper ────────────────────────────────────────────────────
 
-class TestReadyAtUtc:
-    def test_returns_none_when_near_target(self):
-        c = MockCoordinator(near_target=True, ready_latched=True)
-        assert _ready_at_utc(c) is None
+class TestAnchorEtaUtc:
+    def _now(self):
+        return datetime.now(timezone.utc)
 
     def test_returns_none_when_no_anchor(self):
         c = MockCoordinator(near_target=False)
         c.temp_anchor_time = None
-        assert _ready_at_utc(c) is None
+        assert _anchor_eta_utc(c, 40.0, self._now()) is None
 
     def test_returns_none_when_no_rate(self):
         c = MockCoordinator(
@@ -388,7 +386,7 @@ class TestReadyAtUtc:
             heat_rate=None,
             device_heat_perhour=0,
         )
-        assert _ready_at_utc(c) is None
+        assert _anchor_eta_utc(c, 40.0, self._now()) is None
 
     def test_returns_future_utc_datetime_when_heating(self):
         # 5°C at 2°C/h = 150 min; anchor 30 min ago → ready in 120 min
@@ -399,15 +397,15 @@ class TestReadyAtUtc:
             heat_rate=2.0,
             anchor_offset_minutes=-30.0,
         )
-        result = _ready_at_utc(c)
+        now_utc = self._now()
+        result = _anchor_eta_utc(c, 40.0, now_utc)
         assert result is not None
-        now_utc = datetime.now(timezone.utc)
-        # Should be roughly 120 minutes in the future (within ±2 min for test timing)
         diff_minutes = (result - now_utc).total_seconds() / 60
+        # 150 min total − 30 min elapsed = 120 min remaining (±2 min for test timing)
         assert 100 < diff_minutes < 140, f"Expected ~120 min ahead, got {diff_minutes:.1f}"
 
     def test_stable_anchor_does_not_drift(self):
-        """Two calls with the same anchor return identical timestamps (no now() drift)."""
+        """Two calls with the same now_utc and anchor return identical timestamps."""
         c = MockCoordinator(
             near_target=False,
             water_temp=35.0,
@@ -415,8 +413,9 @@ class TestReadyAtUtc:
             heat_rate=2.0,
             anchor_offset_minutes=-30.0,
         )
-        r1 = _ready_at_utc(c)
-        r2 = _ready_at_utc(c)
+        now_utc = self._now()
+        r1 = _anchor_eta_utc(c, 40.0, now_utc)
+        r2 = _anchor_eta_utc(c, 40.0, now_utc)
         assert r1 == r2
 
 
@@ -693,47 +692,46 @@ class TestUsePatternsScenarios:
 
     # ── USE PATTERN G — Warm-day idle: setpoint 36°C, schedule target 38°C ─────
 
-    def test_pattern_g_sensor_shows_schedule_time_while_cooling(self):
+    def test_pattern_g_sensor_shows_ready_when_at_sched_temp(self):
         """USE PATTERN G: water=38, setpoint=36, schedule_target=38, future schedule.
 
-        Latch reset by new schedule.  Spa is nominally cooling (water > API setpoint)
-        with heater off.  The future-schedule shortcut fires and shows the scheduled
-        time — the user sees when the spa will be ready, not a blank/Unknown.
+        Spa is at the schedule target temperature (water ≈ sched_temp).
+        SCHEDULE_PENDING fires but near_sched=True → shows "Ready".
+        The spa IS ready for its scheduled use; no need to wait.
         """
         from datetime import timezone as tz
         future = datetime.now(tz.utc) + timedelta(hours=20)
         c = MockCoordinator(
             near_target=False, ready_latched=False,
-            water_temp=38.0, target_temp=36.0,  # water above API setpoint
+            water_temp=38.0, target_temp=36.0,
             heat_rate=2.0, heater="off",
             scheduled_ready_at=future,
-            schedule_target_temp=38.0,           # schedule target same as water temp
+            schedule_target_temp=38.0,           # spa already at schedule target
         )
         val = _stub(c).native_value
-        assert val is not None and re.match(r"^\d{2}:\d{2}", val)  # scheduled time shown
+        assert val == "Ready"
 
-    def test_pattern_g_latch_cleared_when_schedule_set(self):
-        """USE PATTERN G: setting a new schedule resets the latch from the previous session."""
+    def test_pattern_g_latch_cleared_when_schedule_set_but_spa_at_temp(self):
+        """USE PATTERN G: after schedule set, latch=False but spa at sched_temp → Ready.
+
+        Even without the latch, being within 1°C of schedule target shows Ready.
+        """
         from datetime import timezone as tz
         future = datetime.now(tz.utc) + timedelta(hours=20)
         c = MockCoordinator(
-            near_target=True, ready_latched=True,   # latch from previous session
+            near_target=True, ready_latched=True,
             water_temp=38.0, target_temp=36.0,
         )
-        # Simulate async_set_value on the datetime entity
         c.ready_latched = False
         c.scheduled_ready_at = future
         c.schedule_target_temp = 38.0
-        # Latch is now False — sensor must NOT show "Ready"
-        assert c.ready_latched is False
-        # Future schedule shortcut fires → shows scheduled time, not "Ready" or None
         c._last_data["water_temperature"] = "38.0"
         c._last_data["target_temperature"] = "36.0"
         c._last_data["heater"] = "off"
         c.near_target = False
         val = _stub(c).native_value
-        assert val is not None and re.match(r"^\d{2}:\d{2}", val)
-        assert val != "Ready"
+        # near_sched=True (|38-38|≤1) → Ready in schedule-pending context
+        assert val == "Ready"
 
     def test_pattern_g_epsilon_guard_condition(self):
         """USE PATTERN G: warm-day guard — delta < 0.5°C qualifies for zero-minute treatment.

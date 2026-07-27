@@ -120,88 +120,129 @@ class TestEffectiveCoolRate(unittest.TestCase):
 
 # ─────────────────────────────────────────────────────────────────────────────
 class TestReadyAtValue(unittest.TestCase):
-    """Priority logic in _compute_ready_at_value."""
+    """Six-state logic in _compute_ready_at_value."""
 
-    def test_near_target_returns_ready(self):
-        c = _make_coordinator(near_target=True)
-        self.assertEqual(_compute_ready_at_value(c), "Ready")
+    # ── SCHEDULE PENDING context (sra_future, not triggered) ─────────────────
+    # In this context the display is driven by sched_temp, not the thermostat.
 
-    def test_at_target_returns_ready(self):
-        """When water == target the coordinator sets near_target=True."""
-        c = _make_coordinator(near_target=True)
-        c._last_data = {"water_temperature": 40.0, "target_temperature": 40.0, "heater": "off"}
-        self.assertEqual(_compute_ready_at_value(c), "Ready")
-
-    def test_latched_valid_water_at_schedule_target_returns_ready(self):
-        """Latch honored when water is within 1°C of schedule target, with future SRA."""
+    def test_schedule_pending_shows_scheduled_time_when_cold(self):
+        """Schedule pending, spa cold: show the scheduled time."""
         future = datetime.now(timezone.utc) + timedelta(hours=2)
-        c = _make_coordinator(ready_latched=True)
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
+        c.scheduled_ready_at = future
+        c.schedule_target_temp = 40.0
+        c._last_data = {"water_temperature": 30.0, "target_temperature": 40.0, "heater": "off"}
+        result = _compute_ready_at_value(c)
+        self.assertIsNotNone(result)
+        self.assertIn(":", result)
+        self.assertNotEqual(result, "Ready")
+
+    def test_schedule_pending_shows_ready_when_near_sched_temp(self):
+        """Schedule pending, spa already at schedule target (±1°C): Ready."""
+        future = datetime.now(timezone.utc) + timedelta(hours=2)
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
         c.scheduled_ready_at = future
         c.schedule_target_temp = 40.0
         c._last_data = {"water_temperature": 39.5, "target_temperature": 35.0, "heater": "off"}
         self.assertEqual(_compute_ready_at_value(c), "Ready")
 
-    def test_latched_valid_after_sra_cleared(self):
-        """Latch works even after scheduled_ready_at is cleared (schedule just completed)."""
-        c = _make_coordinator(ready_latched=True)
-        c.scheduled_ready_at = None   # coordinator already cleared it at the scheduled time
+    def test_schedule_pending_ignores_near_target_for_lower_thermostat(self):
+        """near_target=True at maintenance setpoint must NOT override schedule-pending display."""
+        future = datetime.now(timezone.utc) + timedelta(hours=2)
+        c = _make_coordinator(near_target=True, ready_latched=False, _schedule_triggered=False)
+        c.scheduled_ready_at = future
         c.schedule_target_temp = 40.0
-        # water=39.5 — within 1°C of sched_temp → latch fires
+        # water at 35 (near thermostat=35), but sched_temp=40 → not near sched
+        c._last_data = {"water_temperature": 35.0, "target_temperature": 35.0, "heater": "off"}
+        result = _compute_ready_at_value(c)
+        # near_target is irrelevant — schedule drives display
+        self.assertIn(":", result)
+        self.assertNotEqual(result, "Ready")
+
+    # ── SCHEDULED HEATING (triggered) ────────────────────────────────────────
+
+    def test_scheduled_heating_shows_eta_to_sched_temp(self):
+        """triggered=True → anchor-based ETA to schedule_target_temp."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=True)
+        c.scheduled_ready_at = None  # auto-clear may have already run
+        c.schedule_target_temp = 40.0
+        c.temp_anchor_time = datetime.now(timezone.utc)
+        c.temp_anchor_temp = 35.0
+        c._last_data = {"water_temperature": 35.0, "target_temperature": 40.0, "heater": "on"}
+        result = _compute_ready_at_value(c)
+        self.assertIsNotNone(result)
+        self.assertIn(":", result)
+
+    def test_scheduled_heating_near_done_shows_ready(self):
+        """Triggered, ≤5min remaining → Ready."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=True)
+        c.schedule_target_temp = 40.0
+        c.temp_anchor_time = datetime.now(timezone.utc) - timedelta(minutes=2)
+        c.temp_anchor_temp = 39.95
+        c._last_data = {"water_temperature": 39.95, "target_temperature": 40.0, "heater": "on"}
+        self.assertEqual(_compute_ready_at_value(c), "Ready")
+
+    # ── FREE context (no schedule, not triggered) ─────────────────────────────
+
+    def test_free_near_target_returns_ready(self):
+        """Free context: near_target flag → Ready."""
+        c = _make_coordinator(near_target=True, ready_latched=False, _schedule_triggered=False)
+        c.scheduled_ready_at = None
+        self.assertEqual(_compute_ready_at_value(c), "Ready")
+
+    def test_free_latched_returns_ready(self):
+        """Free context: latch persists Ready (e.g. after schedule auto-clears)."""
+        c = _make_coordinator(near_target=False, ready_latched=True, _schedule_triggered=False)
+        c.scheduled_ready_at = None
         c._last_data = {"water_temperature": 39.5, "target_temperature": 40.0, "heater": "off"}
         self.assertEqual(_compute_ready_at_value(c), "Ready")
 
-    def test_latched_stale_water_below_schedule_target_shows_none(self):
-        """Stale latch with water far below schedule target — at_sched guard blocks Rule 2."""
-        c = _make_coordinator(ready_latched=True)
+    def test_free_at_target_returns_ready(self):
+        """Free context: water == thermostat (at_target direction) → Ready."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
         c.scheduled_ready_at = None
-        c.schedule_target_temp = 40.0
-        # water=30, thermostat=35, heater off, no rate data → no rule matches → None
-        c._last_data = {"water_temperature": 30.0, "target_temperature": 35.0, "heater": "off"}
-        c.computed_heat_rate = None
-        self.assertIsNone(_compute_ready_at_value(c))
-
-    def test_at_target_direction_returns_ready_without_near_target(self):
-        """direction=='at_target' → 'Ready' even when near_target flag is False."""
-        c = _make_coordinator(near_target=False)
         c._last_data = {"water_temperature": 40.0, "target_temperature": 40.0, "heater": "off"}
         self.assertEqual(_compute_ready_at_value(c), "Ready")
 
-    def test_cooling_no_schedule_returns_ready(self):
-        """Spa cooling above setpoint with no schedule — warm enough for use."""
-        c = _make_coordinator()
-        c._last_data = {"water_temperature": 42.0, "target_temperature": 40.0, "heater": "off"}
-        self.assertEqual(_compute_ready_at_value(c), "Ready")
-
-    def test_future_schedule_pending_shows_time(self):
-        future = datetime.now(timezone.utc) + timedelta(hours=2)
-        c = _make_coordinator()
-        c.scheduled_ready_at = future
-        c.schedule_target_temp = 40.0
-        c._last_data = {"water_temperature": 35.0, "target_temperature": 40.0, "heater": "on"}
-        c.temp_anchor_target = 40.0
-        result = _compute_ready_at_value(c)
-        self.assertIsNotNone(result)
-
-    def test_no_schedule_heater_on_shows_eta(self):
-        c = _make_coordinator()
+    def test_free_cooling_returns_none(self):
+        """Free context: cooling direction → None (no ETA for cooling)."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
         c.scheduled_ready_at = None
-        c._last_data = {"water_temperature": 35.0, "target_temperature": 40.0, "heater": "on"}
+        c._last_data = {"water_temperature": 42.0, "target_temperature": 40.0, "heater": "off"}
+        self.assertIsNone(_compute_ready_at_value(c))
+
+    def test_free_no_data_returns_none(self):
+        """Free context: missing temperature data → None."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
+        c.scheduled_ready_at = None
+        c._last_data = {"water_temperature": None, "target_temperature": 40.0, "heater": "off"}
+        self.assertIsNone(_compute_ready_at_value(c))
+
+    def test_free_heating_shows_eta(self):
+        """Free context: heater on, direction=heating → anchor ETA to thermostat."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
+        c.scheduled_ready_at = None
         c.temp_anchor_time = datetime.now(timezone.utc)
         c.temp_anchor_temp = 35.0
         c.temp_anchor_target = 40.0
+        c._last_data = {"water_temperature": 35.0, "target_temperature": 40.0, "heater": "on"}
         result = _compute_ready_at_value(c)
         self.assertIsNotNone(result)
-
-    def test_future_schedule_no_latch_shows_scheduled_time(self):
-        future = datetime.now(timezone.utc) + timedelta(hours=2)
-        c = _make_coordinator()
-        c.scheduled_ready_at = future
-        c._last_data = {"water_temperature": 35.0, "target_temperature": 35.0, "heater": "off"}
-        result = _compute_ready_at_value(c)
         self.assertIn(":", result)
 
-    def test_no_schedule_heater_off_returns_none(self):
-        c = _make_coordinator()
+    def test_free_heating_no_rate_returns_none(self):
+        """Free context: heater on but no rate data → None."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
+        c.scheduled_ready_at = None
+        c.computed_heat_rate = None
+        c.heat_rate_buckets = [None, None, None]
+        c._last_data = {"water_temperature": 35.0, "target_temperature": 40.0,
+                        "heater": "on", "device_heat_perhour": 0}
+        self.assertIsNone(_compute_ready_at_value(c))
+
+    def test_free_heater_off_returns_none(self):
+        """Free context: heater off, direction=heating → None."""
+        c = _make_coordinator(near_target=False, ready_latched=False, _schedule_triggered=False)
         c.scheduled_ready_at = None
         c._last_data = {"water_temperature": 35.0, "target_temperature": 40.0, "heater": "off"}
         c.computed_heat_rate = None

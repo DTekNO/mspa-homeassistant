@@ -155,21 +155,6 @@ class MSpaSensor(MSpaSensorEntity):
     def native_value(self):
         return self.coordinator._last_data.get(self._key)
 
-# This sensor is used for diagnostic purposes.
-# It retrieves various diagnostic information from the MSpa system.
-# The keys are defined in the DIAGNOSTIC_KEYS list.
-# Each sensor has a unique ID based on its key and the device ID.
-# The state class is set to MEASUREMENT for keys that are measurements.
-# The entity category is set to DIAGNOSTIC.
-# The entity registry is disabled by default for these sensors.
-# The entity picture is set to None.
-# The state is retrieved from the coordinator's last data based on the key.
-# The icon is not set, but can be customized if needed.
-# The entity name is derived from the key, replacing underscores with spaces and capitalizing.
-# The entity is registered with the Home Assistant entity registry.
-# The entity is used to provide diagnostic information about the MSpa system.
-# It can be used to monitor the status of the MSpa system and troubleshoot issues.
-# The entity is not intended for user interaction, but rather for monitoring and diagnostics.
 class MSpaDiagnosticSensor(MSpaSensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_entity_registry_enabled_default = False
@@ -342,32 +327,51 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
     return total_minutes * bias
 
 
-def _ready_at_utc(coordinator) -> "datetime | None":
-    """Return the stable absolute UTC datetime when the spa will reach target.
+def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | None":
+    """Return the anchor-based UTC ETA to reach target_temp when heating, or None.
 
-    Derived from the coordinator anchor (set when temperature last changed),
-    so the timestamp only shifts when real conditions change — not every poll.
-    Returns None when no rate data is available or spa is already at target.
+    Uses the last confirmed temperature anchor (set whenever water_temp or
+    target_temp changes), so the ETA is stable between API readings.
+
+    If no temperature update arrives within the expected time for 0.5°C of
+    heating plus a 2-minute margin, the anchor is stale and the ETA is pushed
+    forward proportionally to communicate slower-than-predicted heating.
     """
-    if coordinator.near_target:
+    anc_time = coordinator.temp_anchor_time
+    anc_temp = coordinator.temp_anchor_temp
+    if anc_time is None or anc_temp is None or target_temp is None:
+        _LOGGER.debug("ready_at anchor: missing data (anc_time=%s anc_temp=%s target=%.1f) → None",
+                      anc_time, anc_temp, target_temp or 0)
         return None
-    anchor_time   = coordinator.temp_anchor_time
-    anchor_temp   = coordinator.temp_anchor_temp
-    anchor_target = coordinator.temp_anchor_target
-    if anchor_time is None or anchor_temp is None or anchor_target is None:
+
+    mins = _segmented_heating_minutes(anc_temp, target_temp, coordinator)
+    if mins is None:
+        _LOGGER.debug("ready_at anchor: no rate for %.1f→%.1f → None", anc_temp, target_temp)
         return None
-    if anchor_target > anchor_temp:
-        anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, coordinator)
-    elif anchor_target < anchor_temp:
-        rate = _effective_cool_rate(coordinator)
-        if rate is None:
-            return None
-        anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
+    if mins == 0.0:
+        _LOGGER.debug("ready_at anchor: already at target (%.1f→%.1f)", anc_temp, target_temp)
+        return anc_time
+
+    eta_utc = anc_time + timedelta(minutes=mins)
+    elapsed_mins = (now_utc - anc_time).total_seconds() / 60.0
+
+    # Staleness: if no temp update for longer than expected 0.5°C step + 2-min margin,
+    # push ETA forward proportionally to communicate slower-than-predicted heating.
+    step_mins = _segmented_heating_minutes(anc_temp, min(anc_temp + 0.5, target_temp), coordinator) or 1.0
+    if elapsed_mins > step_mins + 2.0:
+        overrun = elapsed_mins - step_mins
+        eta_utc = anc_time + timedelta(minutes=mins + overrun)
+        _LOGGER.debug(
+            "ready_at anchor: stale (elapsed=%.1fmin > step=%.1fmin+2) overrun=%.1fmin → eta=%s",
+            elapsed_mins, step_mins, overrun, eta_utc.isoformat(),
+        )
     else:
-        return None
-    if anchor_minutes is None:
-        return None
-    return anchor_time + timedelta(minutes=anchor_minutes)
+        _LOGGER.debug(
+            "ready_at anchor: anc=%.1f°C target=%.1f°C total=%.1fmin elapsed=%.1fmin → eta=%s",
+            anc_temp, target_temp, mins, elapsed_mins, eta_utc.isoformat(),
+        )
+
+    return eta_utc
 
 
 def _minutes_to_target(coordinator) -> int | None:
@@ -436,114 +440,119 @@ def _sra_utc(coordinator) -> "datetime | None":
 def _compute_ready_at_value(coordinator) -> "str | None":
     """Return the Ready at sensor display value.
 
-    Rules are evaluated in priority order; the first matching rule wins.
+    Context determines which target drives the display:
 
-    ┌───┬─────────────────────────────────────────────┬──────────────────────────┐
-    │ # │ Condition                                   │ Output                   │
-    ├───┼─────────────────────────────────────────────┼──────────────────────────┤
-    │ 1 │ near_target OR direction == at_target       │ "Ready"                  │
-    │ 2 │ ready_latched AND water ≈ sched_temp (±1°C) │ "Ready"                  │
-    │ 3 │ direction == cooling AND no future schedule │ "Ready" (already hot)    │
-    │ 4 │ future schedule AND heating toward it       │ Anchor-based ETA (→ SRA  │
-    │   │                                             │ fallback if stale/past)  │
-    │ 5 │ no future schedule AND heater on, heating   │ Anchor-based ETA         │
-    │ 6 │ future schedule (all other cases)           │ SRA time string          │
-    │ 7 │ fallback                                    │ None (unavailable)       │
-    └───┴─────────────────────────────────────────────┴──────────────────────────┘
+      SCHEDULE context (sra_future, not triggered):
+        - If spa is within 1°C of sched_temp  → "Ready" (already there)
+        - Otherwise                            → show scheduled time
+        near_target/latch are thermostat-relative and irrelevant here —
+        the schedule may target a higher temperature than the current setpoint.
+
+      SCHEDULED HEATING (triggered):
+        - Anchor-based ETA to sched_temp (real-time, ignores original plan)
+
+      FREE context (no schedule, not triggered):
+        - near_target OR latched OR at_target  → "Ready"
+        - direction=cooling                    → None (no ETA for cooling)
+        - direction=heating AND heater on      → anchor ETA to thermostat
+        - otherwise                            → None
     """
-    # ── Gather facts ───────────────────────────────────────────────────────────
-    now_utc      = datetime.now(timezone.utc)
-    sra_utc_val  = _sra_utc(coordinator)
-    sra_future   = sra_utc_val is not None and sra_utc_val > now_utc
-
-    direction    = _spa_direction(coordinator)
-    heater_on    = coordinator._last_data.get("heater") == "on"
+    now_utc    = datetime.now(timezone.utc)
+    latched    = coordinator.ready_latched
+    near       = coordinator.near_target
+    direction  = _spa_direction(coordinator)
+    triggered  = coordinator._schedule_triggered
+    sra        = _sra_utc(coordinator)
+    sra_future = sra is not None and sra > now_utc
+    heater_on  = coordinator._last_data.get("heater") == "on"
+    sched_temp = coordinator.schedule_target_temp
 
     try:
         water = float(coordinator._last_data.get("water_temperature") or 0)
     except (TypeError, ValueError):
         water = None
 
-    sched_temp   = coordinator.schedule_target_temp
-    at_sched     = (
-        water is not None and sched_temp is not None
-        and abs(water - sched_temp) <= 1.0
+    _LOGGER.debug(
+        "ready_at eval: latched=%s near=%s direction=%s triggered=%s "
+        "sra_future=%s heater=%s sched_temp=%s water=%s",
+        latched, near, direction, triggered, sra_future, heater_on, sched_temp, water,
     )
 
-    anchor_target = coordinator.temp_anchor_target
-    heating_to_sched = (
-        heater_on
-        and direction == "heating"
-        and anchor_target is not None
-        and sched_temp is not None
-        and anchor_target >= sched_temp - 0.5
-    )
-
-    # ── Rule 1: spa is physically at/near its current setpoint ─────────────────
-    # Suppressed when a future schedule targets a higher temperature — the user
-    # needs to see when the spa will reach that target, not a premature "Ready".
-    if (coordinator.near_target or direction == "at_target") and (not sra_future or at_sched):
-        return "Ready"
-
-    # ── Rule 2: latch valid — spa reached the schedule target this session ─────
-    # sra_future intentionally omitted: the coordinator auto-clears scheduled_ready_at
-    # once the scheduled time passes, so requiring sra_future here would make the latch
-    # invisible exactly when it matters most (spa at temp, schedule just completed).
-    # at_sched (±1°C of schedule target) is the sufficient freshness guard.
-    if coordinator.ready_latched and at_sched:
-        return "Ready"
-
-    # ── Rule 3: spa is hotter than setpoint with no pending schedule ───────────
-    if direction == "cooling" and not sra_future:
-        return "Ready"
-
-    # ── Rule 4: schedule pending AND heater running toward its target ──────────
-    # The ETA is anchored to the last confirmed temperature change, so it only
-    # updates when the API reports a new reading — not every poll.  If no update
-    # arrives within the time to heat 0.5°C + a small margin, heating is running
-    # slower than predicted and we push the ETA forward proportionally.
-    # The result may be earlier OR later than the scheduled time — that is correct.
-    if sra_future and heating_to_sched:
-        anc_time = coordinator.temp_anchor_time
-        anc_temp = coordinator.temp_anchor_temp
-        if anc_time is not None and anc_temp is not None and sched_temp is not None:
-            mins = _segmented_heating_minutes(anc_temp, sched_temp, coordinator)
-            if mins is not None:
-                elapsed_mins = (now_utc - anc_time).total_seconds() / 60.0
-                # Smallest step the API is expected to report: 0.5°C worth of heating.
-                step_mins = _segmented_heating_minutes(
-                    anc_temp, min(anc_temp + 0.5, sched_temp), coordinator
-                ) or 1.0
-                if elapsed_mins > step_mins + 2.0:
-                    # Temperature should have updated by now — push ETA forward
-                    # by the overrun to reflect slower-than-expected heating.
-                    overrun = elapsed_mins - step_mins
-                    eta_utc = anc_time + timedelta(minutes=mins + overrun)
-                else:
-                    eta_utc = anc_time + timedelta(minutes=mins)
-                remaining = (eta_utc - now_utc).total_seconds()
-                if remaining <= 300:
-                    return "Ready"
-                if remaining > 0:
-                    return _fmt_local(eta_utc)
-        # No anchor/rate or prediction already passed — fall through to Rule 6
-
-    # ── Rule 5: no schedule, heater on, heating toward thermostat setpoint ─────
-    # _ready_at_utc() is anchor-based: it uses the last confirmed temperature
-    # reading, so the ETA is stable between API updates.
-    if not sra_future and heater_on and direction == "heating":
-        eta_utc = _ready_at_utc(coordinator)
-        if eta_utc is None:
-            return None
-        if (eta_utc - now_utc).total_seconds() <= 300:
+    # ── SCHEDULE PENDING ──────────────────────────────────────────────────────
+    # Schedule is the display driver when set and trigger not yet fired.
+    # near_target is thermostat-based and may refer to a lower maintenance setpoint,
+    # so we only use proximity to the schedule target here.
+    if sra_future and not triggered:
+        near_sched = (
+            sched_temp is not None and water is not None
+            and abs(water - sched_temp) <= 1.0
+        )
+        if near_sched:
+            _LOGGER.debug(
+                "ready_at → Ready (schedule_pending spa at sched_temp=%.1f water=%.1f)",
+                sched_temp, water,
+            )
             return "Ready"
-        return _fmt_local(eta_utc)
+        result = _fmt_local(sra)
+        _LOGGER.debug("ready_at → %s (schedule_pending sra=%s)", result, sra.isoformat())
+        return result
 
-    # ── Rule 6: future schedule, waiting or cooling toward lower target ────────
-    if sra_future:
-        return _fmt_local(sra_utc_val)
+    # ── SCHEDULED HEATING ─────────────────────────────────────────────────────
+    # Trigger fired — predict ETA to schedule target from current anchor.
+    # Tracks real heating progress; independent of the original planned lead time.
+    if triggered and sched_temp is not None:
+        eta = _anchor_eta_utc(coordinator, sched_temp, now_utc)
+        if eta is not None:
+            remaining = (eta - now_utc).total_seconds()
+            if remaining <= 300:
+                _LOGGER.debug("ready_at → Ready (scheduled_heating ≤5min)")
+                return "Ready"
+            result = _fmt_local(eta)
+            _LOGGER.debug(
+                "ready_at → %s (scheduled_heating sched_temp=%.1f remaining=%.0fs)",
+                result, sched_temp, remaining,
+            )
+            return result
+        _LOGGER.debug("ready_at → None (scheduled_heating no anchor/rate)")
+        return None
 
-    # ── Rule 7: nothing useful to show ────────────────────────────────────────
+    # ── FREE CONTEXT ──────────────────────────────────────────────────────────
+    # No schedule pending or triggered.  Use thermostat-relative state.
+
+    # READY: coordinator confirms near target or spa is exactly at target
+    if latched or near or direction == "at_target":
+        reason = "latched" if latched else ("near_target" if near else "at_target")
+        _LOGGER.debug("ready_at → Ready (free ctx: %s)", reason)
+        return "Ready"
+
+    # COOLING: spa above setpoint, no useful ETA
+    if direction in ("cooling", None):
+        _LOGGER.debug("ready_at → None (free ctx: direction=%s)", direction)
+        return None
+
+    # FREE HEATING: heater on, predict ETA to thermostat setpoint
+    if heater_on:
+        try:
+            thermostat = float(coordinator._last_data.get("target_temperature") or 0)
+        except (TypeError, ValueError):
+            thermostat = None
+        if thermostat is not None:
+            eta = _anchor_eta_utc(coordinator, thermostat, now_utc)
+            if eta is not None:
+                remaining = (eta - now_utc).total_seconds()
+                if remaining <= 300:
+                    _LOGGER.debug("ready_at → Ready (free_heating ≤5min)")
+                    return "Ready"
+                result = _fmt_local(eta)
+                _LOGGER.debug(
+                    "ready_at → %s (free_heating thermostat=%.1f remaining=%.0fs)",
+                    result, thermostat, remaining,
+                )
+                return result
+        _LOGGER.debug("ready_at → None (free_heating no anchor/rate/thermostat)")
+        return None
+
+    _LOGGER.debug("ready_at → None (free ctx: heater_off no applicable state)")
     return None
 
 
@@ -573,12 +582,14 @@ def _log_readiness_change(coordinator, old_state: object, new_state: "str | None
     heater = data.get("heater", "?")
     latched = getattr(coordinator, "ready_latched", False)
     near = getattr(coordinator, "near_target", False)
+    triggered = getattr(coordinator, "_schedule_triggered", False)
     old_label = "BOOT" if old_state is _UNSET else repr(old_state)
 
     _LOGGER.info(
-        "Ready at: %s → %s  [water=%s  sp=%s  %s  heater=%s  rate=%s  latched=%s  near=%s]",
+        "Ready at: %s → %s  [water=%s  sp=%s  %s  heater=%s  rate=%s  "
+        "latched=%s  near=%s  triggered=%s]",
         old_label, repr(new_state),
-        water, setpoint, sched_ctx, heater, rate_str, latched, near,
+        water, setpoint, sched_ctx, heater, rate_str, latched, near, triggered,
     )
 
 
@@ -662,19 +673,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     def available(self):
         if not super().available:
             return False
-        if self.coordinator.ready_latched:
-            return True
-        if self.coordinator.near_target:
-            return True
-        direction = _spa_direction(self.coordinator)
-        # At target or above target (cooling) — spa is usable, always available.
-        if direction in ("at_target", "cooling"):
-            return True
-        # Available when there is a future schedule to display.
-        sra_utc_val = _sra_utc(self.coordinator)
-        if sra_utc_val is not None and sra_utc_val > datetime.now(timezone.utc):
-            return True
-        return _minutes_to_target(self.coordinator) is not None
+        # Available whenever we have enough data to determine a state.
+        return _spa_direction(self.coordinator) is not None or self.coordinator.ready_latched
 
     @property
     def native_value(self):
@@ -704,7 +704,13 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             color = "light-blue"
         else:
             color = "green"
-        ready_at_utc = _ready_at_utc(self.coordinator) if not latched and not cooling else None
+        now_utc = datetime.now(timezone.utc)
+        if latched or cooling:
+            ready_at_utc = None
+        elif target_temp is not None and direction == "heating":
+            ready_at_utc = _anchor_eta_utc(self.coordinator, target_temp, now_utc)
+        else:
+            ready_at_utc = None
         ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
 
         data = self.coordinator._last_data
