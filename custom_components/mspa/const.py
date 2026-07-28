@@ -92,3 +92,39 @@ CONF_SCHEDULE_TARGET_TEMP = "schedule_target_temp"
 CONF_SCHEDULE_LOOKAHEAD_DAYS = "schedule_lookahead_days"
 DEFAULT_SCHEDULE_TARGET_TEMP = 40.0
 DEFAULT_SCHEDULE_LOOKAHEAD_DAYS = 5
+
+# --- Ambient-condition heating-rate correction ---------------------------------
+# Colder-than-baseline outdoor air slows heating, most strongly near the setpoint
+# (the "hot" bucket) where the water-to-air temperature difference — and thus the
+# convective/evaporative heat loss — is greatest.  This is a linear model:
+#
+#   factor_i = clamp(1 + sensitivity_i * (ambient_now - ambient_baseline))
+#   rate_adjusted_i = rate_learned_i * factor_i
+#
+# Per-bucket sensitivity is a fraction of the bucket's learned rate lost per °C
+# below the learned baseline.  Cold water is nearly insensitive; the near-setpoint
+# bucket is the most affected — matching observed cold-night behaviour where cold
+# and mid buckets track their learned rates but the hot bucket collapses.
+# (cold: T < 30°C, mid: 30-37°C, hot: T ≥ 37°C)
+AMBIENT_SENSITIVITY = (0.0, 0.02, 0.06)
+AMBIENT_FACTOR_MIN = 0.3   # never slow a bucket below 30% of its learned rate
+AMBIENT_FACTOR_MAX = 1.5   # never speed a bucket beyond 150% of its learned rate
+AMBIENT_BASELINE_ALPHA = 0.05    # slow EMA so the baseline tracks the seasonal norm
+AMBIENT_BASELINE_DEFAULT = 15.0  # °C, used until enough samples have been learned
+
+
+def ambient_rate_factor(bucket_idx, ambient_now, ambient_baseline):
+    """Multiplicative heating-rate correction for current outdoor conditions.
+
+    Returns 1.0 (no change) when ambient data is unavailable, so the estimate
+    degrades gracefully to the plain learned rate.  Otherwise scales the bucket
+    rate linearly with how far the current outdoor temperature is from the
+    learned baseline, using a per-bucket sensitivity that is strongest near the
+    setpoint.  The result is clamped to keep predictions stable.
+    """
+    if ambient_now is None or ambient_baseline is None:
+        return 1.0
+    if bucket_idx < 0 or bucket_idx > 2:
+        return 1.0
+    factor = 1.0 + AMBIENT_SENSITIVITY[bucket_idx] * (ambient_now - ambient_baseline)
+    return max(AMBIENT_FACTOR_MIN, min(AMBIENT_FACTOR_MAX, factor))

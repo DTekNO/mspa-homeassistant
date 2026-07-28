@@ -32,6 +32,9 @@ from .const import (
     CONF_WEATHER_ENTITY,
     CONF_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_TARGET_TEMP,
+    AMBIENT_BASELINE_ALPHA,
+    AMBIENT_BASELINE_DEFAULT,
+    ambient_rate_factor,
 )
 
 import time
@@ -253,11 +256,20 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # True once the autonomous heat-start command has been sent for the current
         # schedule.  Prevents re-triggering on every poll.  Reset when schedule clears.
         self._schedule_triggered: bool = False
+        # Last computed autonomous start time, tracked only to log meaningful shifts
+        # in the planned start as outdoor conditions change while waiting.
+        self._last_computed_start_at: datetime | None = None
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.
         self.ambient_temp: float | None = None
         self.ambient_wind: float | None = None
+
+        # Learned baseline outdoor temperature under which the heating rates were
+        # observed.  Slow EMA updated on each accepted heat-rate sample.  Used by
+        # the ambient correction to know what "normal" outdoor conditions look
+        # like for this spa, so colder-than-baseline nights slow the estimate.
+        self.ambient_baseline: float | None = None
 
         # Prediction accuracy tracker.  Records the initial estimate at the
         # start of a big heating session and compares it to the actual elapsed
@@ -472,6 +484,27 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if stored:
                     self.computed_heat_rate = stored.get("heat_rate")
                     self.computed_cool_rate = stored.get("cool_rate")
+                    self.ambient_baseline = stored.get("ambient_baseline")
+                    # Restore the temperature anchor so a restart mid-step doesn't
+                    # discard the elapsed heating time and jump the ETA forward.
+                    # A fresh "now" anchor was already set earlier this poll; only
+                    # override it back to the persisted time when the water temp
+                    # and target still match — otherwise the step advanced while
+                    # HA was down and the fresh anchor is the correct one.
+                    anchor_iso = stored.get("temp_anchor_time")
+                    if (anchor_iso is not None
+                            and stored.get("temp_anchor_temp") == new_temp
+                            and stored.get("temp_anchor_target") == new_target):
+                        try:
+                            self.temp_anchor_time   = datetime.fromisoformat(anchor_iso)
+                            self.temp_anchor_temp   = new_temp
+                            self.temp_anchor_target = new_target
+                            _LOGGER.debug(
+                                "Restored temp anchor: %.1f°C → %.1f°C at %s",
+                                new_temp or 0.0, new_target or 0.0, anchor_iso,
+                            )
+                        except (ValueError, TypeError):
+                            pass
                     stored_buckets = stored.get("heat_rate_buckets")
                     self._prediction_history = stored.get("prediction_history", [])
                     self._update_prediction_bias()
@@ -595,6 +628,24 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                 _EMA_ALPHA * rate + (1 - _EMA_ALPHA) * _bp
                             ) if _bp is not None else rate
                             self._session_fresh_buckets.add(_bi)
+                            # Track the baseline outdoor temperature under which
+                            # rates are being learned, so the ambient correction
+                            # knows what "normal" looks like for this spa.  Slow
+                            # EMA so it reflects the seasonal norm, not one night.
+                            # Seed from a neutral default (not the first, possibly
+                            # cold, reading) so a cold night registers as
+                            # below-normal immediately rather than after the EMA
+                            # slowly drifts up.
+                            if self.ambient_temp is not None:
+                                base = (
+                                    self.ambient_baseline
+                                    if self.ambient_baseline is not None
+                                    else AMBIENT_BASELINE_DEFAULT
+                                )
+                                self.ambient_baseline = (
+                                    AMBIENT_BASELINE_ALPHA * self.ambient_temp
+                                    + (1 - AMBIENT_BASELINE_ALPHA) * base
+                                )
                             # The first bucket to receive data in this session becomes
                             # the scalar source.  Its observations are compared against
                             # the stored base to derive an ambient-condition factor that
@@ -680,6 +731,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "bucket_save_ts": time.time(),
                 "prediction_history": self._prediction_history,
                 "active_prediction": self._prediction,
+                "ambient_baseline": self.ambient_baseline,
+                "temp_anchor_time": (
+                    self.temp_anchor_time.isoformat()
+                    if self.temp_anchor_time is not None else None
+                ),
+                "temp_anchor_temp": self.temp_anchor_temp,
+                "temp_anchor_target": self.temp_anchor_target,
             })
 
             # Trigger heating autonomously when the schedule window opens.
@@ -700,6 +758,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 )
                 self.scheduled_ready_at = None
                 self._schedule_triggered = False
+                self._last_computed_start_at = None
 
             # Check for power cycle and restore state if enabled
             await self._check_power_cycle(transformed_data)
@@ -750,6 +809,24 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 return  # Will retry on next poll
 
         start_at = target_utc - timedelta(minutes=minutes_needed)
+
+        # Log a meaningful shift in the planned start time (e.g. as the outdoor
+        # temperature changes while waiting), so the ambient-driven rescheduling
+        # is visible.  Recomputed every poll; only shifts > 15 min are logged.
+        prev_start = self._last_computed_start_at
+        if prev_start is None or abs((start_at - prev_start).total_seconds()) > 900:
+            if prev_start is not None:
+                _LOGGER.info(
+                    "Heat schedule: start time moved %s → %s (%.0f min heat, "
+                    "outdoor=%s°C, baseline=%s°C)",
+                    prev_start.isoformat(timespec="minutes"),
+                    start_at.isoformat(timespec="minutes"),
+                    minutes_needed,
+                    f"{self.ambient_temp:.1f}" if self.ambient_temp is not None else "n/a",
+                    f"{self.ambient_baseline:.1f}" if self.ambient_baseline is not None else "n/a",
+                )
+            self._last_computed_start_at = start_at
+
         if now_utc < start_at:
             return  # Not yet time
 
@@ -841,9 +918,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 pass
             return None
 
-        if session_scalar != 1.0 and source_idx not in fresh:
+        # Correction precedence for the bucket the water is actually in (idx):
+        #   1. A bucket observed this session already reflects today's real
+        #      conditions — use it verbatim.
+        #   2. Otherwise the empirical session scalar (observed vs. base rate)
+        #      supersedes the weather model when it is active.
+        #   3. Otherwise apply the ambient (weather-model) correction, which is
+        #      what drives the pre-start estimate before any observation exists.
+        if source_idx in fresh:
+            return rate
+        if session_scalar != 1.0:
             return rate * session_scalar
-        return rate
+        return rate * ambient_rate_factor(idx, self.ambient_temp, self.ambient_baseline)
 
     # Map of features to their respective API methods
     FEATURE_API_MAP = {

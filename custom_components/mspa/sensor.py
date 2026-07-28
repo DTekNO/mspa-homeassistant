@@ -17,6 +17,7 @@ from .const import (
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
     DEFAULT_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_LOOKAHEAD_DAYS,
+    ambient_rate_factor,
 )
 from .entity import MSpaSensorEntity, MSpaBinarySensorEntity
 
@@ -287,12 +288,21 @@ def _heat_bucket_rate(coordinator, temp: float) -> float | None:
                 break
     if rate is None:
         rate = _effective_heat_rate(coordinator)
-    # Only apply the session scalar to buckets not yet observed this session.
-    # Fresh buckets already contain today's real data — scaling them would be
-    # double-counting the ambient correction.
-    if rate is not None and session_scalar != 1.0 and source_idx not in fresh:
+    if rate is None:
+        return None
+    # Correction precedence (mirrors coordinator._bucket_rate_at):
+    #   1. A bucket observed this session already reflects today's real data.
+    #   2. Otherwise the empirical session scalar supersedes the weather model.
+    #   3. Otherwise apply the ambient (weather-model) correction.
+    if source_idx in fresh:
+        return rate
+    if session_scalar != 1.0:
         return rate * session_scalar
-    return rate
+    return rate * ambient_rate_factor(
+        idx,
+        getattr(coordinator, "ambient_temp", None),
+        getattr(coordinator, "ambient_baseline", None),
+    )
 
 
 def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) -> float | None:
@@ -732,6 +742,17 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         session_scalar = getattr(self.coordinator, "_session_scalar", 1.0)
         prediction_bias = getattr(self.coordinator, "prediction_bias", 1.0)
 
+        # Ambient (weather-model) correction visibility.  ambient_factor is the
+        # multiplier currently applied to the bucket the water is in, so a value
+        # < 1.0 means colder-than-baseline air is slowing the estimate.
+        ambient_temp = getattr(self.coordinator, "ambient_temp", None)
+        ambient_baseline = getattr(self.coordinator, "ambient_baseline", None)
+        if water_temp is not None:
+            amb_idx = 0 if water_temp < _HEAT_BUCKET_T1 else 1 if water_temp < _HEAT_BUCKET_T2 else 2
+            ambient_factor = round(ambient_rate_factor(amb_idx, ambient_temp, ambient_baseline), 3)
+        else:
+            ambient_factor = None
+
         return {
             "direction": direction,
             "minutes_remaining": rounded,
@@ -745,6 +766,9 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             "heat_rate_hot_deg_per_hour": round(buckets[2], 3) if buckets[2] is not None else None,
             "session_condition_scalar": round(session_scalar, 3),
             "prediction_bias": round(prediction_bias, 3),
+            "ambient_temp_deg_c": round(ambient_temp, 1) if ambient_temp is not None else None,
+            "ambient_baseline_deg_c": round(ambient_baseline, 2) if ambient_baseline is not None else None,
+            "ambient_factor": ambient_factor,
             "device_rate_deg_per_hour": device_rate,
             "current_temperature": water_temp,
             "target_temperature": target_temp,
