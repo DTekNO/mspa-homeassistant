@@ -204,3 +204,76 @@ class TestFilterHeaterCoupling:
         c = _trigger_coord()
         _run(c.set_feature_state("heater", "on"))
         assert "filter" not in c._pending_changes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bubble level→on coupling
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBubbleLevelOnCoupling:
+
+    def test_bubble_on_with_zero_level_uses_level_1(self):
+        """Turn-on with bubble_level=0 in last_data must send level 1, not 0.
+
+        The device ignores bubble_state=1 when level=0; the fix clamps to ≥1
+        so the switch always works regardless of what the device last reported.
+        Also updates _last_data immediately so the slider reflects the chosen level.
+        """
+        c = _trigger_coord()
+        c._last_data["bubble_level"] = 0
+        _run(c.set_feature_state("bubble", "on"))
+        args = c.api.set_bubble_state.call_args
+        state, level = args[0]
+        assert state == 1
+        assert level >= 1
+        assert c._last_data["bubble_level"] == level
+
+    def test_bubble_on_with_missing_level_uses_level_1(self):
+        """Turn-on with no bubble_level key in last_data defaults to level 1."""
+        c = _trigger_coord()
+        del c._last_data["bubble_level"]
+        _run(c.set_feature_state("bubble", "on"))
+        args = c.api.set_bubble_state.call_args
+        _, level = args[0]
+        assert level == 1
+
+    def test_bubble_on_preserves_last_known_level(self):
+        """Turn-on when bubble_level=2 was last known must use level 2."""
+        c = _trigger_coord()
+        c._last_data["bubble_level"] = 2
+        _run(c.set_feature_state("bubble", "on"))
+        args = c.api.set_bubble_state.call_args
+        _, level = args[0]
+        assert level == 2
+
+    def test_set_bubble_level_sends_bubble_state_on(self):
+        """set_bubble_level must send bubble_state=1 so the device activates.
+
+        The device activates bubbles when it receives a level command; HA should
+        be explicit rather than relying on that side-effect.
+        """
+        c = _trigger_coord()
+        svc = type("ServiceCall", (), {"data": {"level": 3}})()
+        _run(c.set_bubble_level(svc))
+        c.api.set_bubble_state.assert_called_once_with(1, 3)
+
+    def test_set_bubble_level_registers_bubble_on_in_pending(self):
+        """set_bubble_level must register bubble='on' in _pending_changes.
+
+        Without this, the bubble switch stays 'off' in HA even after the device
+        activates — the user would see the switch snap back to off on next poll.
+        """
+        c = _trigger_coord()
+        svc = type("ServiceCall", (), {"data": {"level": 2}})()
+        _run(c.set_bubble_level(svc))
+        assert c._pending_changes.get("bubble") == "on"
+        assert c._pending_changes.get("bubble_level") == 2
+
+    def test_set_bubble_level_updates_last_data_immediately(self):
+        """set_bubble_level must write the new level into _last_data before the API
+        call so the slider reflects it on the next render cycle."""
+        c = _trigger_coord()
+        c._last_data["bubble_level"] = 1
+        svc = type("ServiceCall", (), {"data": {"level": 3}})()
+        _run(c.set_bubble_level(svc))
+        assert c._last_data["bubble_level"] == 3

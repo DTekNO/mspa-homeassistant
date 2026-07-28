@@ -952,7 +952,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             # Build raw command for potential retry
             if feature == "bubble":
-                bubble_level = self._last_data.get("bubble_level", 1)
+                bubble_level = max(1, self._last_data.get("bubble_level") or 1)
+                self._last_data["bubble_level"] = bubble_level
                 await api_method(numerical_state, bubble_level)
                 raw_command = {"bubble_state": numerical_state, "bubble_level": bubble_level}
             else:
@@ -999,7 +1000,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             bubble_state = service.data.get(ATTR_STATE)
             _LOGGER.debug("Setting bubble state to %s", bubble_state)
             numerical_state = 1 if bubble_state.lower() == "on" else 0
-            bubble_level = self._last_data.get("bubble_level", 1)
+            bubble_level = max(1, self._last_data.get("bubble_level") or 1)
             await self.api.set_bubble_state(numerical_state, bubble_level)
 
             # Enable rapid polling to quickly detect the change
@@ -1016,12 +1017,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         try:
             bubble_level = service.data.get("level")
             _LOGGER.debug("Setting bubble level to %s", bubble_level)
-            await self.api.set_bubble_level(bubble_level)
+            self._last_data["bubble_level"] = bubble_level
+            # Setting a level activates the bubbles on the device — send state+level
+            # together so HA's pending-change tracking stays consistent.
+            await self.api.set_bubble_state(1, bubble_level)
 
             # Enable rapid polling to quickly detect the change
             self._enable_rapid_polling(
-                {"bubble_level": bubble_level},
-                {"bubble_level": bubble_level},
+                {"bubble_level": bubble_level, "bubble": "on"},
+                {"bubble_state": 1, "bubble_level": bubble_level},
             )
             await self.async_request_refresh()
         except Exception as err:
