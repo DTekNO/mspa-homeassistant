@@ -704,6 +704,13 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             color = "light-blue"
         else:
             color = "green"
+        data = self.coordinator._last_data
+        try:
+            water_temp = float(data.get("water_temperature"))
+            target_temp = float(data.get("target_temperature"))
+        except (TypeError, ValueError):
+            water_temp = target_temp = None
+
         now_utc = datetime.now(timezone.utc)
         if latched or cooling:
             ready_at_utc = None
@@ -712,13 +719,6 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         else:
             ready_at_utc = None
         ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
-
-        data = self.coordinator._last_data
-        try:
-            water_temp = float(data.get("water_temperature"))
-            target_temp = float(data.get("target_temperature"))
-        except (TypeError, ValueError):
-            water_temp = target_temp = None
 
         effective = _effective_rate(self.coordinator, water_temp, target_temp) if water_temp is not None and target_temp is not None else None
         computed_heat = getattr(self.coordinator, "computed_heat_rate", None)
