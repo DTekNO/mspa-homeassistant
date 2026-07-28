@@ -20,6 +20,7 @@ from custom_components.mspa.sensor import (
     _heat_bucket_rate,
     _minutes_to_target,
 )
+from custom_components.mspa.const import ambient_rate_factor, AMBIENT_FACTOR_MIN, AMBIENT_FACTOR_MAX
 
 # Fixed reference time used by dt_util patches in this module.
 _NOW_UTC   = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -43,6 +44,8 @@ def _make_coordinator(**overrides):
     c._session_scalar = 1.0
     c._session_fresh_buckets = set()
     c.prediction_bias = 1.0
+    c.ambient_temp = None
+    c.ambient_baseline = None
     c._last_data = {
         "water_temperature": 35.0,
         "target_temperature": 40.0,
@@ -367,6 +370,71 @@ class TestMinutesToTarget(unittest.TestCase):
         c.temp_anchor_temp = 40.0
         c.temp_anchor_target = 40.0
         self.assertEqual(_minutes_to_target(c), 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestAmbientRateFactor(unittest.TestCase):
+
+    def test_no_data_returns_one(self):
+        """Without weather data factor is always 1.0 (no correction)."""
+        self.assertEqual(ambient_rate_factor(2, None, None), 1.0)
+        self.assertEqual(ambient_rate_factor(2, None, 15.0), 1.0)
+        self.assertEqual(ambient_rate_factor(2, 5.0, None), 1.0)
+
+    def test_at_baseline_returns_one(self):
+        """When ambient equals baseline, factor is exactly 1.0."""
+        self.assertAlmostEqual(ambient_rate_factor(2, 15.0, 15.0), 1.0)
+
+    def test_cold_bucket_insensitive(self):
+        """Cold bucket (idx 0) has zero sensitivity — factor always 1.0."""
+        self.assertAlmostEqual(ambient_rate_factor(0, 0.0, 15.0), 1.0)
+        self.assertAlmostEqual(ambient_rate_factor(0, 30.0, 15.0), 1.0)
+
+    def test_hot_bucket_cold_night_slows(self):
+        """Hot bucket (idx 2) slows on cold night: sensitivity=0.06/°C.
+        Baseline 15°C, outdoor 5°C → delta=-10 → factor=1+0.06*(-10)=0.4."""
+        self.assertAlmostEqual(ambient_rate_factor(2, 5.0, 15.0), 0.4)
+
+    def test_hot_bucket_warm_night_speeds(self):
+        """Hot bucket speeds on warm night: 25°C vs baseline 15°C → factor=1+0.06*10=1.6 → clamped to 1.5."""
+        self.assertAlmostEqual(ambient_rate_factor(2, 25.0, 15.0), AMBIENT_FACTOR_MAX)
+
+    def test_extreme_cold_clamped(self):
+        """Extreme cold is clamped at AMBIENT_FACTOR_MIN."""
+        # Would be 1 + 0.06 * (-100) = -5, clamped to 0.3
+        self.assertAlmostEqual(ambient_rate_factor(2, -85.0, 15.0), AMBIENT_FACTOR_MIN)
+
+    def test_mid_bucket_moderate_sensitivity(self):
+        """Mid bucket (idx 1) has 0.02/°C sensitivity.
+        Baseline 15°C, outdoor 5°C → factor=1+0.02*(-10)=0.8."""
+        self.assertAlmostEqual(ambient_rate_factor(1, 5.0, 15.0), 0.8)
+
+    def test_invalid_bucket_returns_one(self):
+        self.assertEqual(ambient_rate_factor(-1, 5.0, 15.0), 1.0)
+        self.assertEqual(ambient_rate_factor(3, 5.0, 15.0), 1.0)
+
+    def test_ambient_correction_applied_in_heat_bucket_rate(self):
+        """_heat_bucket_rate applies ambient factor when no fresh session data."""
+        c = _make_coordinator()
+        c.heat_rate_buckets = [None, None, 1.0]  # only hot bucket set
+        c._session_fresh_buckets = set()          # no fresh data
+        c._session_scalar = 1.0
+        c.ambient_temp = 5.0      # cold night
+        c.ambient_baseline = 15.0  # 10°C below baseline
+        # hot bucket rate = 1.0 * (1 + 0.06 * -10) = 0.4
+        rate = _heat_bucket_rate(c, 38.0)
+        self.assertAlmostEqual(rate, 0.4)
+
+    def test_fresh_session_data_bypasses_ambient(self):
+        """Fresh session observations are used verbatim — ambient model not applied."""
+        c = _make_coordinator()
+        c.heat_rate_buckets = [None, None, 1.0]
+        c._session_fresh_buckets = {2}   # hot bucket observed this session
+        c._session_scalar = 1.0
+        c.ambient_temp = 5.0
+        c.ambient_baseline = 15.0
+        rate = _heat_bucket_rate(c, 38.0)
+        self.assertAlmostEqual(rate, 1.0)  # no correction applied
 
 
 if __name__ == "__main__":

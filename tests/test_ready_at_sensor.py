@@ -52,6 +52,8 @@ class MockCoordinator:
         self.prediction_bias = 1.0
         self._session_scalar = 1.0
         self._session_fresh_buckets = {0, 1, 2}
+        self.ambient_temp = None
+        self.ambient_baseline = None
         self.last_update_success = last_update_success
         self.scheduled_ready_at = scheduled_ready_at
         self.schedule_target_temp = schedule_target_temp
