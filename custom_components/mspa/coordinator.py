@@ -419,6 +419,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         "session_scalar": self._session_scalar,
                         "ambient_temp": self.ambient_temp,
                         "ambient_wind": self.ambient_wind,
+                        "ambient_baseline": self.ambient_baseline,
+                        # Hot-bucket (near-setpoint) ambient correction at start —
+                        # the dominant factor; the others are derivable from
+                        # ambient_temp/baseline via ambient_rate_factor().
+                        "ambient_factor_hot": round(
+                            ambient_rate_factor(2, self.ambient_temp, self.ambient_baseline), 3
+                        ),
                     }
                     _LOGGER.info(
                         "PREDICTION_START: %.1f°C → %.1f°C, raw=%.0f min, biased=%.0f min"

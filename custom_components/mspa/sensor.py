@@ -495,7 +495,7 @@ def _compute_ready_at_value(coordinator) -> "str | None":
     if sra_future and not triggered:
         near_sched = (
             sched_temp is not None and water is not None
-            and abs(water - sched_temp) <= 1.0
+            and abs(water - sched_temp) <= 0.5
         )
         if near_sched:
             _LOGGER.debug(
@@ -823,7 +823,10 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         except (TypeError, ValueError):
             return None
 
-        if abs(current_temp - target_temp) <= 1.0:
+        # Single source of truth: the Heat Schedule is "ready" exactly when the
+        # Ready at sensor is — same code path, so the two always converge (during
+        # heating this uses Ready-at's tight ETA<=5min rule, not a loose band).
+        if _compute_ready_at_value(self.coordinator) == "Ready":
             return "ready"
 
         # Once the trigger has fired the heater is on and working toward the
