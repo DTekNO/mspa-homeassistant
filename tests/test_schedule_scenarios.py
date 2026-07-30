@@ -292,12 +292,35 @@ class TestHeatScheduleDisplay:
         c = MockCoordinator(scheduled_ready_at=None)
         assert _heat_schedule(c) == "Not scheduled"
 
-    def test_spa_within_1c_of_target_shows_ready(self):
+    def test_heat_schedule_and_ready_at_both_show_ready_when_triggered(self):
+        """Heat Schedule now uses _compute_ready_at_value as single source of truth,
+        so both sensors show 'Ready' at the same time — never one hour apart.
+
+        The SCHEDULE_PENDING near_sched path (spa already at target temperature
+        before the trigger fires) is covered by test_g_warm_day_spa_at_sched_temp_shows_ready
+        in TestReadyAtPatterns; it cannot be exercised through _heat_schedule because
+        _compute_ready_at_value uses datetime.now() while _schedule_data uses dt_util.utcnow().
+        """
         c = MockCoordinator(
-            scheduled_ready_at=_NOW_UTC + timedelta(hours=4),
-            schedule_target_temp=39.0, water_temp=38.5,
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=1),
+            schedule_target_temp=39.0, water_temp=38.8,
+            schedule_triggered=True,
         )
         assert _heat_schedule(c) == "Ready"
+        assert _ready_at(c) == "Ready"
+
+    def test_heat_schedule_no_longer_has_1c_ready_shortcut(self):
+        """Previously Heat Schedule had its own abs(water - sched_temp) <= 1.0 shortcut.
+        After the fix it delegates to _compute_ready_at_value, so a 1°C gap before
+        the trigger fires shows a start time, not Ready."""
+        c = MockCoordinator(
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=4),
+            schedule_target_temp=39.0, water_temp=38.0,  # 1.0°C gap — old threshold
+            schedule_triggered=False,
+        )
+        val = _heat_schedule(c)
+        assert val != "Ready"
+        assert re.match(r"^Start at \d{2}:\d{2}", val), f"expected 'Start at HH:MM', got {val!r}"
 
     def test_cold_start_shows_start_at(self):
         """20°C → 40°C at 2°C/h = 600 min; target 12h away → 'Start at HH:MM +Nd'."""
