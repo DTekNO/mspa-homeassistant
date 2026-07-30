@@ -12,8 +12,6 @@ Run with: python -m pytest tests/test_scheduled_for.py -v
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from custom_components.mspa.datetime import MSpaScheduledReadyAt, _same_instant
 
 _T = datetime(2026, 8, 1, 15, 0, tzinfo=timezone.utc)

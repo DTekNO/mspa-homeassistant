@@ -37,13 +37,16 @@ Two sensors tell you what is happening:
 
 | Display | Meaning |
 |---------|---------|
-| `Not scheduled` | No schedule set, the scheduled time has passed, or it is beyond the lookahead horizon (default 5 days) |
+| `Not scheduled` | No schedule set, or the scheduled time has passed |
+| `Scheduled +14d` | A schedule exists but is beyond the lookahead horizon (default 5 days) — too far out for a start time |
 | `Ready` | The spa is already at the scheduled temperature — no lead time needed right now |
 | `Start at 14:00` | The scheduler will start the heater at this time |
 | `Heating` | The scheduler has fired and the spa is working toward the target |
 | `Start now` | The start moment has arrived but the heater has not been commanded yet — normally invisible (see below) |
 
 Both sensors derive `Ready` from the same function, so they always agree — one can never claim the spa is ready while the other is still counting down.
+
+> **`Not scheduled` means you forgot.** It is deliberately distinct from `Scheduled +Nd`, which means a schedule exists but is too far out to plan a start time for yet. If you set sessions weeks ahead, an empty dashboard tile genuinely tells you the calendar entry is missing.
 
 > **You will rarely see `Start now`.** The scheduler fires during the same update cycle in which the start moment is detected, so by the time the sensor renders it has already moved to `Heating`. Seeing `Start now` persist means the start command did not get through — worth checking the log for an API error, since the integration will retry on the next poll.
 

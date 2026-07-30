@@ -91,6 +91,7 @@ class _HeatScheduleStub:
         self._config_entry = config_entry
 
     _schedule_data = MSpaHeatScheduleSensor._schedule_data
+    extra_state_attributes = MSpaHeatScheduleSensor.extra_state_attributes
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -102,6 +103,11 @@ def _ready_at(c) -> "str | None":
 def _heat_schedule(c, entry=None) -> str:
     stub = _HeatScheduleStub(c, entry or MockConfigEntry())
     return MSpaHeatScheduleSensor.native_value.fget(stub)
+
+
+def _heat_schedule_attrs(c, entry=None) -> dict:
+    stub = _HeatScheduleStub(c, entry or MockConfigEntry())
+    return MSpaHeatScheduleSensor.extra_state_attributes.fget(stub)
 
 
 def _apply_temp_update(c, new_temp: float, new_target: float) -> None:
@@ -357,9 +363,60 @@ class TestHeatScheduleDisplay:
         )
         assert _heat_schedule(c) == "Ready"
 
-    def test_beyond_lookahead_shows_not_scheduled(self):
+    def test_beyond_lookahead_confirms_schedule_exists(self):
+        """A far-out schedule must not read 'Not scheduled'.
+
+        'Not scheduled' means "you forgot to set one" — the opposite situation.
+        Beyond the horizon the sensor confirms a schedule exists without
+        projecting a start time that far ahead.
+        """
         c = MockCoordinator(
             scheduled_ready_at=_NOW_UTC + timedelta(days=6),
             schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0,
         )
-        assert _heat_schedule(c) == "Not scheduled"
+        val = _heat_schedule(c)
+        assert val != "Not scheduled"
+        assert re.match(r"^Scheduled( \+\d+d)?$", val), f"got {val!r}"
+
+    def test_weeks_ahead_still_confirms_schedule(self):
+        """Planning two or three weeks out is normal and must be visible."""
+        for days in (14, 21):
+            c = MockCoordinator(
+                scheduled_ready_at=_NOW_UTC + timedelta(days=days),
+                schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0,
+            )
+            assert _heat_schedule(c).startswith("Scheduled")
+
+    def test_no_schedule_still_reads_not_scheduled(self):
+        """The distinction that matters: nothing set is different from far off."""
+        assert _heat_schedule(MockCoordinator(scheduled_ready_at=None)) == "Not scheduled"
+
+    def test_beyond_lookahead_attributes_expose_target_without_start(self):
+        c = MockCoordinator(
+            scheduled_ready_at=_NOW_UTC + timedelta(days=21),
+            schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0,
+        )
+        attrs = _heat_schedule_attrs(c)
+        assert attrs["start_at"] is None
+        assert attrs["target_temperature"] == 40.0
+        assert attrs["target_time"] is not None
+
+    def test_beyond_lookahead_does_not_raise_on_state_logging(self):
+        """_log_schedule_change unpacks the result tuple — the 2-tuple must not break it."""
+        c = MockCoordinator(
+            scheduled_ready_at=_NOW_UTC + timedelta(days=21),
+            schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0,
+        )
+        stub = _HeatScheduleStub(c, MockConfigEntry())
+        # native_value calls _log_schedule_change on every state transition.
+        assert MSpaHeatScheduleSensor.native_value.fget(stub).startswith("Scheduled")
+
+    def test_at_target_beats_lookahead_so_sensors_agree(self):
+        """Readiness is evaluated before the horizon check, so a far-off schedule
+        with the spa already at temperature does not disagree with Ready at."""
+        c = MockCoordinator(
+            scheduled_ready_at=_NOW_UTC + timedelta(days=21),
+            schedule_target_temp=39.0, water_temp=39.0,
+            near_target=True, ready_latched=True,
+        )
+        assert _heat_schedule(c) == "Ready"

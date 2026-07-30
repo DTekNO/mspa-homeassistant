@@ -238,32 +238,36 @@ You can watch the correction in the `ambient_temp_deg_c`, `ambient_baseline_deg_
 
 Configure one under **Settings → Devices & Services → MSpa → ⚙️ Configure → Weather entity**. Any entity in the `weather` domain works — Met.no (built in, no API key) is a good default; OpenWeatherMap and similar also work. The integration reads the entity's `temperature` and `wind_speed` attributes.
 
-Configuring one enables three things:
+Configuring one enables two things:
 
 - the **outdoor-temperature rate correction** described above, which improves the heating start time before any of today's data exists;
-- **weather-weighted bias correction** — historical sessions are weighted by a Gaussian kernel over ambient temperature and wind-speed similarity to current conditions, so the bias reflects sessions that actually resembled today (see below);
-- **gentler decay on stored rates** — ≈ 0.6 %/day instead of ≈ 2 %/day, because ambient variation between sessions is already accounted for.
+- **gentler decay on stored rates** — ≈ 0.6 %/day instead of ≈ 2 %/day, because that correction explains some of the seasonal variation directly, so stored rates stay useful for longer.
 
 It is entirely optional. Everything degrades gracefully to the plain learned rates if no entity is set, or if the one you set becomes unavailable.
 
 #### Historical bias correction
 
-Individual EMA samples carry noise, and the model can develop a systematic over- or under-prediction tendency. The integration tracks the **last 10 completed heating sessions**, recording estimated vs actual duration for each. The mean ratio of actual to estimated time becomes the **prediction bias** scalar, clamped to [0.5, 2.0]:
+Individual EMA samples carry noise, and the model can develop a systematic over- or under-prediction tendency. Each time a heating session completes, the ratio of actual to estimated duration is folded into the **prediction bias** scalar as an exponential moving average (α = 0.3), and the result is applied as a final multiplier:
 
 ```
 final_prediction = segmented_estimate × prediction_bias
 ```
 
-A bias above 1.0 means past predictions were too optimistic (actual heating took longer) and future estimates are stretched accordingly; below 1.0, estimates are compressed.
+A bias above 1.0 means past predictions were too optimistic (actual heating took longer) and future estimates are stretched accordingly; below 1.0, estimates are compressed. The ratio is always measured against the *raw* segmented estimate, so the bias converges on the rate model's true error rather than chasing its own previous output.
 
-If a weather entity is configured, historical sessions are weighted by a **Gaussian kernel similarity** over ambient temperature and wind speed — sessions recorded under conditions similar to today count more than sessions from very different conditions. This makes the bias correction contextual rather than a flat average over all past sessions.
+Two deliberate constraints:
+
+- **It changes only when a session completes.** The bias is persisted rather than recomputed, so a restart cannot alter it. An earlier implementation re-derived it from history on every load and could shift with no new data.
+- **It is clamped to [0.9, 1.1].** The segmented rate model and the weather correction do the substantive work; the bias exists to absorb a small residual, and a tight clamp stops it double-correcting for something the rate model has already learned.
+
+Runs with a temperature delta below 3 °C are ignored (too much variance to learn from), as are ratios outside [0.3, 3.0] — the signature of water being added mid-session.
 
 #### Time-decay on stored rates
 
 Bucket rates loaded from storage decay gradually toward the global flat EMA over time:
 
 - **Without a weather entity**: ≈ 2% per day (floor: 40% weight). After two weeks of inactivity stored buckets carry about 75% of their original weight.
-- **With a weather entity**: ≈ 0.6% per day — a gentler decay, because the weather-weighted bias correction already accounts for ambient differences between sessions.
+- **With a weather entity**: ≈ 0.6% per day — a gentler decay, because the outdoor-temperature correction already explains part of the ambient difference between sessions, so the stored rates stay useful for longer.
 
 This prevents stale seasonal data — for example rates learned in summer — from permanently anchoring winter predictions.
 
@@ -449,12 +453,15 @@ Replace `datetime.mspa_scheduled_for` with your actual entity ID. Clicking the t
 
 | State | Meaning |
 |-------|---------|
-| `Not scheduled` | No target time set, the set time has passed, or it is beyond the lookahead horizon |
+| `Not scheduled` | No target time set, or the set time has passed |
+| `Scheduled +Nd` | A schedule exists but is beyond the lookahead horizon — too far out to compute a start time |
 | `Ready` | The spa is at the scheduled temperature — same definition the Ready at sensor uses |
 | `Heating` | The schedule has fired and the spa is working toward the target |
 | `Start at HH:MM` | Conditioning will start at this time today |
 | `Start at HH:MM +Nd` | Conditioning will start in N days at this time |
 | `Start now` | The start moment has arrived but the heater has not been commanded yet — normally invisible |
+
+> **`Not scheduled` means you have not set one.** Beyond the lookahead horizon (default 5 days, configurable in the integration options) the sensor shows `Scheduled +14d` instead — it will not project a start time that far ahead, because the water temperature and the learned rates will both have moved by then, but it does confirm the schedule exists. That keeps the two states meaningfully different: if you plan sessions weeks in advance, `Not scheduled` genuinely tells you the calendar entry is missing.
 
 > **The two sensors agree by construction.** `Ready` here is not a separate rule — the Heat Schedule sensor asks the Ready at sensor's own readiness function. Earlier versions applied an independent "within 1 °C" shortcut here, which could declare the spa ready up to an hour before the Ready at sensor agreed. Both entities now flip to `Ready` at the same moment.
 

@@ -7,27 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Re-asserting the same scheduled time re-armed the scheduler** *(Experimental)* — `datetime.set_value` on **Scheduled for** committed unconditionally, and committing deliberately clears the trigger and readiness latches so a genuine reschedule takes effect. Any automation run that recomputed the same time therefore re-armed the scheduler: mid-heat-up the trigger would re-fire, the target temperature would be resent, and the Heat Schedule sensor would drop out of `Heating` back to a start-time state.
-
-  This is easy to hit with the documented calendar-sync automation. A `state` trigger on a calendar entity fires on attribute-only changes, so an edit to `end_time`, `message` or `location` re-runs the automation while `start_time` — and hence the computed ready time — is unchanged.
-
-  Setting a time that matches the one already set is now a no-op. A genuine change still re-arms the scheduler exactly as before.
-
-- **Prediction bias drifted on restart and could move away from recent accuracy** *(Experimental)* — `prediction_bias` was recomputed from stored session history every time the integration loaded, using a Gaussian kernel that weighted past sessions by how closely their weather matched *current* conditions. Two consequences: the bias changed on restart with no new data (observed moving 1.072 → 1.060 across a restart), and because the weights were re-derived against instantaneous wind, it could rise after a session whose accuracy should have lowered it (observed 1.055 → 1.060 → 1.063 while the two sessions in question came in at ratios of 1.016 and 0.964).
-
-  The effect was a systematic over-estimate: on the sessions analysed, the raw rate model was accurate to ±2.6% while the biased estimate was out by 6.9% — the correction was making predictions 2.6× worse, and starting scheduled heat-ups roughly 30 minutes earlier than needed.
-
-  The bias is now an incremental EMA (α = 0.3) folded in **once per completed session** and persisted directly, so it only changes when there is new evidence, and a session below the current bias always pulls it down. Weather no longer participates: adjusting for conditions is `ambient_rate_factor`'s job in the rate model itself. The clamp is tightened from [0.5, 2.0] to [0.9, 1.1], since the segmented rate model now does the real work and the bias should only ever be a small residual.
-
-  On upgrade, stored history is replayed through the new EMA so accumulated learning is preserved rather than reset.
-
-### Internal
-
-- Removed `_weather_weight` (the Gaussian weather-similarity kernel), now unused. A properly learned weather model is planned — see [ROADMAP](ROADMAP.md#learned-weather-factor).
-- 12 new tests covering bias monotonicity, clamping, admissible-sample filtering, and the history-replay upgrade path — including a regression test built from the production sequence that exposed the drift.
-
 ---
 
 ## [2026.7.1] - 2026-07-30
@@ -48,7 +27,7 @@ Three new entities (**Ready at**, **Heat Schedule**, **Scheduled for**) replace 
 - **Heat Schedule sensor** — predicts when to *start* conditioning to hit a planned session time (`Start at 04:15`, `Start now`, `Heating`, `Ready`, `Not scheduled`). Uses the learned temperature-bucketed rates and works for both heating and cooling. Requires the **Scheduled for** datetime control to be set.
 - **Scheduled for** datetime control — a datetime entity owned by the device (appears in the device panel), so no external `input_datetime` helper is needed. Set it to when you want the spa ready and the schedule recalculates automatically.
 - **Automatic schedule trigger** — when the computed start time arrives the integration sets the target temperature and turns the heater on by itself. The schedule is re-evaluated continuously until it fires, so an overnight cool-down that slows the spa moves the start time earlier rather than silently missing the target.
-- **Schedule lookahead limit** — schedules further out than the configured horizon (default 5 days) report `Not scheduled` instead of projecting an implausibly precise start time.
+- **Schedule lookahead horizon** — beyond the configured horizon (default 5 days) the Heat Schedule sensor reports `Scheduled +Nd` rather than projecting a start time that far out, since the water temperature and learned rates will both have moved by then. Planning weeks ahead therefore still shows on a dashboard as a confirmed schedule, and `Not scheduled` keeps its distinct meaning: no schedule is set. Raise the horizon in the integration options if you want precise start times sooner.
 
 #### Ambient-aware heating-rate correction *(Experimental)*
 
@@ -62,8 +41,7 @@ Three new entities (**Ready at**, **Heat Schedule**, **Scheduled for**) replace 
 - **Self-learning ambient baseline** — a slow EMA (α = 0.05) of observed session temperatures establishes what "normal" outdoor conditions look like for your location and season, so the correction is relative to your own climate rather than a hard-coded assumption. Seeded at 15 °C until enough samples accumulate.
 - **Correction precedence** — a bucket already observed during the current session is used verbatim (real data beats any model); otherwise the empirical session scalar wins if active; otherwise the weather model applies. This makes the weather model matter exactly where it is needed — the pre-start estimate, before any observation for today exists.
 - **Graceful degradation** — with no weather entity configured, or when the weather entity is unavailable, the correction factor is `1.0` and estimates fall back to the plain learned rates. Nothing is required to opt out.
-- **Weather-weighted bias correction** — historical sessions used for the prediction-bias scalar are weighted by a Gaussian kernel over ambient temperature and wind-speed similarity to current conditions, so the bias reflects sessions that resembled today rather than an undifferentiated average.
-- **Gentler rate decay with weather data** — stored bucket rates decay ≈ 0.6%/day with a weather entity configured versus ≈ 2%/day without, since ambient variation between sessions is already accounted for.
+- **Gentler rate decay with weather data** — stored bucket rates decay ≈ 0.6%/day with a weather entity configured versus ≈ 2%/day without, since `ambient_rate_factor` explains some of the seasonal variation directly and the stored rates therefore stay useful for longer.
 - New diagnostic fields recorded per session: `ambient_temp`, `ambient_wind`, `ambient_baseline`, and `ambient_factor_hot`.
 
 #### Other additions
@@ -88,6 +66,16 @@ Three new entities (**Ready at**, **Heat Schedule**, **Scheduled for**) replace 
 - **Setting a bubble level started the bubbles without the switch following** — setting a level activates the blower as a device-side effect, but Home Assistant did not know. The level service now sends the state explicitly and registers `bubble = on` for command confirmation, so the switch no longer snaps back to off on the next poll.
 - **Bubble level slider did not update until the next poll** — the new level is written to the local state cache immediately, so the slider reflects the chosen value on the next render instead of waiting for cloud confirmation.
 - **`UnboundLocalError` in Ready at attributes after a schedule trigger** — reading the sensor's attributes immediately after the schedule fired could raise instead of returning values.
+- **Prediction bias could drift on restart and move away from recent accuracy** — the bias was recomputed from stored session history on every load, weighting past sessions by how closely their weather matched *current* conditions. That made it change on restart with no new data (observed moving 1.072 → 1.060 across a restart), and because the weights were re-derived against instantaneous wind it could rise after a session whose accuracy should have lowered it (observed 1.055 → 1.060 → 1.063 while the two sessions concerned came in at ratios of 1.016 and 0.964).
+
+  The effect was systematic over-estimation: on the sessions analysed the raw rate model was accurate to ±2.6% while the biased estimate was out by 6.9% — the correction was making predictions 2.6× worse and starting scheduled heat-ups roughly 30 minutes earlier than necessary.
+
+  The bias is now an incremental EMA (α = 0.3) folded in **once per completed session** and persisted directly, so it changes only when there is new evidence and a session below the current bias always pulls it down. Weather no longer participates — adjusting for conditions is the rate model's job via `ambient_rate_factor`. The clamp is tightened from [0.5, 2.0] to [0.9, 1.1], since the segmented model does the real work and the bias should only ever be a small residual. On upgrade, stored history is replayed through the new EMA so accumulated learning is preserved rather than discarded.
+- **Re-asserting the same scheduled time re-armed the scheduler** — `datetime.set_value` on **Scheduled for** committed unconditionally, and committing deliberately clears the trigger and readiness latches so that a genuine reschedule takes effect. Any automation run that recomputed the same time therefore re-armed the scheduler: mid-heat-up the trigger would re-fire, the target temperature would be resent, and the Heat Schedule sensor would drop out of `Heating` back to a start-time state.
+
+  This is easy to hit with the calendar-sync automation in the README, because a `state` trigger on a calendar entity fires on attribute-only changes — so an edit to `end_time`, `message` or `location` re-runs the automation while `start_time`, and hence the computed ready time, is unchanged.
+
+  Setting a time that matches the one already set is now a no-op. A genuine change still re-arms the scheduler exactly as before.
 
 ### Removed
 - **⚠️ BREAKING: "Ready At" timestamp sensor removed** *(Experimental)* — the `sensor.mspa_xxx_ready_at` timestamp entity (device class: timestamp) has been removed. It is replaced by the new **Ready at** sensor.
@@ -108,7 +96,9 @@ Three new entities (**Ready at**, **Heat Schedule**, **Scheduled for**) replace 
 
 ### Internal
 
-- **Scheduling test suite rebuilt** — the three large per-sensor test files are replaced by scenario-based suites covering the named use patterns (cold start, stale latch with a higher pending schedule, thermostat lowered while at temperature, warm day at scheduled temperature), the readiness latch state machine, trigger firing and guard conditions, the ambient-rate correction, and spa control coupling (filter→heater, bubble level→on). 77 tests, ~0.2 s.
+- **Scheduling test suite rebuilt** — the three large per-sensor test files are replaced by scenario-based suites covering the named use patterns (cold start, stale latch with a higher pending schedule, thermostat lowered while at temperature, warm day at scheduled temperature), the readiness latch state machine, trigger firing and guard conditions, the ambient-rate correction, prediction-bias monotonicity and clamping, the schedule re-assert guard, the lookahead horizon, and spa control coupling (filter→heater, bubble level→on). 107 tests, ~0.2 s.
+- **Weather affects the rate model, not the bias.** A development iteration weighted the bias by weather similarity to current conditions; that proved unstable and was dropped in favour of `ambient_rate_factor`, which is where conditions belong. A properly learned weather model is planned — see [ROADMAP](ROADMAP.md#learned-weather-factor).
+- `homeassistant.core.callback` is now stubbed as an identity decorator in the test harness. As a bare mock it replaced every decorated method with a mock, silently turning them into no-ops and making them untestable.
 
 ---
 

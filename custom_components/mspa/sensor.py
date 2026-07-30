@@ -603,6 +603,13 @@ def _log_readiness_change(coordinator, old_state: object, new_state: "str | None
     )
 
 
+def _day_offset_suffix(dt_utc) -> str:
+    """' +Nd' when dt_utc falls N local days after today, else ''."""
+    local = dt_util.as_local(dt_utc)
+    days = (local.date() - dt_util.now().date()).days
+    return f" +{days}d" if days > 0 else ""
+
+
 def _compute_schedule_value(result) -> str:
     """Return the Heat Schedule display value from a _schedule_data() result."""
     if result is None:
@@ -611,14 +618,16 @@ def _compute_schedule_value(result) -> str:
         return "Ready"
     if result == "triggered":
         return "Heating"
+    if isinstance(result, tuple) and len(result) == 2:
+        # Schedule set, but too far out to compute a meaningful start time.
+        _, target_utc = result
+        return f"Scheduled{_day_offset_suffix(target_utc)}"
     _, _, start_at_utc = result
     now_utc = dt_util.utcnow()
     if now_utc >= start_at_utc:
         return "Start now"
     local_start = dt_util.as_local(start_at_utc)
-    days = (local_start.date() - dt_util.now().date()).days
-    suffix = f" +{days}d" if days > 0 else ""
-    return f"Start at {local_start.strftime('%H:%M')}{suffix}"
+    return f"Start at {local_start.strftime('%H:%M')}{_day_offset_suffix(start_at_utc)}"
 
 
 def _log_schedule_change(
@@ -644,13 +653,15 @@ def _log_schedule_change(
     rate_str = f"{rate:.2f}°C/h" if rate is not None else "no-rate"
     triggered = getattr(coordinator, "_schedule_triggered", False)
 
-    if isinstance(schedule_data, tuple):
+    if isinstance(schedule_data, tuple) and len(schedule_data) == 3:
         _, _, start_at_utc = schedule_data
         try:
             start_local = start_at_utc.astimezone()
             extra = f"start={start_local.strftime('%H:%M')}"
         except Exception:
             extra = "start=?"
+    elif isinstance(schedule_data, tuple) and len(schedule_data) == 2:
+        extra = "start=beyond-horizon"
     else:
         extra = f"data={schedule_data!r}"
 
@@ -809,12 +820,6 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         if target_utc <= now_utc:
             return None
 
-        days_until = (target_utc - now_utc).total_seconds() / 86400
-        options = self._config_entry.options
-        lookahead = int(options.get(CONF_SCHEDULE_LOOKAHEAD_DAYS, DEFAULT_SCHEDULE_LOOKAHEAD_DAYS))
-        if days_until > lookahead:
-            return None
-
         target_temp = float(self.coordinator.schedule_target_temp)
 
         data = self.coordinator._last_data
@@ -826,6 +831,8 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         # Single source of truth: the Heat Schedule is "ready" exactly when the
         # Ready at sensor is — same code path, so the two always converge (during
         # heating this uses Ready-at's tight ETA<=5min rule, not a loose band).
+        # Checked before the lookahead horizon so the two sensors cannot disagree
+        # about readiness just because the session is a long way off.
         if _compute_ready_at_value(self.coordinator) == "Ready":
             return "ready"
 
@@ -835,6 +842,17 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         # HH:MM" as the temperature fluctuates ±0.5°C during thermostat cycling.
         if self.coordinator._schedule_triggered:
             return "triggered"
+
+        days_until = (target_utc - now_utc).total_seconds() / 86400
+        options = self._config_entry.options
+        lookahead = int(options.get(CONF_SCHEDULE_LOOKAHEAD_DAYS, DEFAULT_SCHEDULE_LOOKAHEAD_DAYS))
+        if days_until > lookahead:
+            # Beyond the horizon, deliberately do not project a start time: the
+            # water temperature and the learned rates will both have moved by
+            # then.  But still confirm that a schedule *exists* — reporting
+            # "Not scheduled" here is indistinguishable from having forgotten to
+            # set one, which is the opposite situation.
+            return ("beyond", target_utc)
 
         if target_temp > current_temp:
             minutes_needed = _segmented_heating_minutes(current_temp, target_temp, self.coordinator)
@@ -865,6 +883,16 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         result = self._schedule_data()
         if not isinstance(result, tuple):
             return {}
+        if len(result) == 2:
+            # Beyond the lookahead horizon — the target is known, the start is not.
+            _, target_utc = result
+            return {
+                "target_time": target_utc.isoformat(),
+                "start_at": None,
+                "target_temperature": getattr(
+                    self.coordinator, "schedule_target_temp", None
+                ),
+            }
         target_utc, target_temp, start_at_utc = result
         return {
             "target_time": target_utc.isoformat(),
