@@ -138,12 +138,14 @@ This section covers two sensors and one control entity that work together:
 | Entity | Type | Purpose |
 |--------|------|---------|
 | **Ready at** | Sensor | Estimated ready time — "10:34", "10:34 +1d", or "Ready". `minutes_remaining` available as attribute. |
-| **Heat Schedule** | Sensor | When to start heating for a planned session |
+| **Heat Schedule** | Sensor | Predicts when to start heating for a planned session |
 | **Scheduled for** | Control (datetime) | Set when you want the spa ready |
 
-**How it fits together:** set **Scheduled for** to when you want to use the spa. The **Heat Schedule** sensor works backwards through the learned heating rates — corrected for tonight's weather — to compute when heating must start, and the integration **starts the spa itself** when that moment arrives. The **Ready at** sensor then tracks the live estimate through to `Ready`. The start time is re-evaluated continuously until it fires, so if the spa cools faster than expected overnight the start moves earlier rather than quietly missing your target.
+**How it fits together:** set **Scheduled for** to when you want to use the spa. The **Heat Schedule** sensor works backwards through the learned heating rates — corrected for any available weather data while waiting to start — to compute when heating must start, and the integration **starts the spa itself** when that moment arrives. The **Ready at** sensor then tracks the live estimate through to `Ready` and can be used on your dashboard to let you know how long you have to wait! The start time is re-evaluated continuously until it fires, so if the spa cools faster than expected, the start moves earlier rather than quietly missing your target.
 
 Optionally configure a [weather entity](#optional-weather-entity) to make the pre-start estimate account for outdoor conditions.
+
+> 📖 **[Heat Scheduler walkthrough](docs/heat_scheduler.md)** — worked examples showing exactly what both sensors display at each stage of a cold start, a cool-down-and-recover session, and a warm day where no heating is needed.
 
 ### First-time use — no learning data yet
 
@@ -450,13 +452,13 @@ Replace `datetime.mspa_scheduled_for` with your actual entity ID. Clicking the t
 | `Not scheduled` | No target time set, the set time has passed, or it is beyond the lookahead horizon |
 | `Ready` | The spa is at the scheduled temperature — same definition the Ready at sensor uses |
 | `Heating` | The schedule has fired and the spa is working toward the target |
-| `Start now` | Conditioning should begin immediately to reach the target in time |
-| `Start at HH:MM` | Conditioning should start at this time today |
-| `Start at HH:MM +Nd` | Conditioning should start in N days at this time |
+| `Start at HH:MM` | Conditioning will start at this time today |
+| `Start at HH:MM +Nd` | Conditioning will start in N days at this time |
+| `Start now` | The start moment has arrived but the heater has not been commanded yet — normally invisible |
 
 > **The two sensors agree by construction.** `Ready` here is not a separate rule — the Heat Schedule sensor asks the Ready at sensor's own readiness function. Earlier versions applied an independent "within 1 °C" shortcut here, which could declare the spa ready up to an hour before the Ready at sensor agreed. Both entities now flip to `Ready` at the same moment.
 
-Once the schedule has fired the sensor holds a steady `Heating` rather than flickering between `Start now` and `Start at HH:MM` as the water temperature oscillates during thermostat cycling.
+Once the schedule has fired the sensor holds a steady `Heating` rather than flickering between `Start now` and `Start at HH:MM` as the water temperature oscillates during thermostat cycling. The normal progression is therefore `Start at HH:MM` → `Heating` → `Ready` → `Not scheduled`; `Start now` appears only if the start command failed to reach the spa, and clears on the next successful poll.
 
 The sensor works in both directions: if the spa needs to heat up it uses the learned bucket heating rates; if it needs to cool down it uses the learned cooling rate.
 
@@ -468,62 +470,25 @@ The sensor works in both directions: if the spa needs to heat up it uses the lea
 | `start_at` | ISO 8601 timestamp when heating should begin |
 | `target_temperature` | The configured target temperature (°C) |
 
-### Automation example
+### No automation required
 
-Trigger the spa automatically when it is time to start heating for the next planned session.
+The integration starts the session itself. When the computed start time arrives it sets the target temperature and turns the heater on — you do not need an automation to watch for `Start now` and act on it.
 
-The `Start now` state is the clean trigger — the sensor transitions to it at exactly the right moment based on the learned rates, so no polling or conditions are needed.
+If you want to be told when things happen, trigger a notification off the sensor states instead: `sensor.mspa_heat_schedule` going to `Heating` means conditioning has begun, and `sensor.mspa_ready_at` going to `Ready` means the spa is up to temperature (see [Availability](#availability) for that example).
 
-```yaml
-alias: "MSpa – Start conditioning for planned session"
-description: ""
-mode: single
-triggers:
-  - trigger: state
-    entity_id: sensor.mspa_heat_schedule
-    to: "Start now"
-  - trigger: homeassistant
-    event: start
-conditions:
-  - condition: state
-    entity_id: sensor.mspa_heat_schedule
-    state: "Start now"
-actions:
-  - action: climate.set_hvac_mode
-    target:
-      entity_id: climate.mspa_heater_control
-    data:
-      hvac_mode: heat
-  - action: climate.set_temperature
-    target:
-      entity_id: climate.mspa_heater_control
-    data:
-      temperature: "{{ state_attr('sensor.mspa_heat_schedule', 'target_temperature') }}"
-  - delay:
-      seconds: 30
-  - action: notify.mobile_app_your_phone
-    data:
-      message: "MSpa conditioning started – ready at {{ states('sensor.mspa_readiness') }}"
-```
-
-Replace `climate.mspa_heater_control`, `sensor.mspa_heat_schedule`, and `notify.mobile_app_your_phone` with your actual entity IDs — **including inside the template string in the notify action**.
-
-> **Two triggers, one condition**: The `state` trigger handles the normal case — it fires once when the sensor transitions to `Start now`. The `homeassistant.start` trigger is a safety net: if HA restarts while the sensor is already `Start now`, the state never *changes* so the first trigger won't fire; `homeassistant.start` catches that. The condition on both triggers ensures the action only runs if the sensor is genuinely in the `Start now` state. `mode: single` prevents both triggers from double-firing in edge cases.
->
-> **Why the 30-second delay before notify**: The integration confirms commands via rapid polling (every 1 s for 15 s after a command). The delay gives the coordinator time to poll the updated device state and recalculate the **Ready at** estimate with the correct target temperature before the notification is sent. Without it, the notification may read a stale value.
->
-> **Why use Ready at for the notification**: The Ready at sensor reflects the actual current water temperature and learned heating rate, so if the spa is already partially warm the estimated ready time will be sooner than the original schedule. It also already handles multi-day offsets (e.g. `10:34 +1d`). It will never show `Ready` in this context because the automation only fires when heating is needed.
-
-> **How the timing is calculated**: The sensor uses a temperature-segmented machine learning model — three independent EMA rates (one per temperature band), an ambient-condition scalar derived from the first live observation of each session, and a historical bias correction derived from the last 10 completed sessions. See [How the model learns](#how-the-model-learns) for the full detail.
+> **How the timing is calculated**: a temperature-segmented model — three independent EMA rates (one per temperature band), the weather-model correction for current outdoor conditions, an in-session scalar from the first live observation, and a historical bias correction over the last 10 sessions. See [How the model learns](#how-the-model-learns).
 
 ### Syncing the schedule from a calendar (optional)
 
-If you use a Home Assistant calendar to track spa sessions, you can automatically set **Scheduled for** from the next calendar event. This automation fires when the calendar state changes or when HA restarts, and sets the target time so that the heating is complete 4 hours before you need it. This gives the MSpa time to heat the water with some buffer so it is ready before you need it. Adjust the offset to match your preference.
+If you use a Home Assistant calendar to track spa sessions, you can set **Scheduled for** automatically from the next calendar event. This automation fires when the calendar state changes or when HA restarts, and sets the ready time a fixed margin *before* the event starts, so the spa is up to temperature by the time you arrive.
 
 ```yaml
 alias: "MSpa – Sync schedule from calendar"
 description: ""
 mode: single
+variables:
+  # Ready this long before the event starts. Adjust to taste.
+  margin_hours: 1
 triggers:
   - trigger: state
     entity_id: calendar.your_calendar
@@ -533,20 +498,25 @@ conditions:
   - condition: template
     value_template: >
       {% set start = state_attr('calendar.your_calendar', 'start_time') %}
-      {{ start is not none and as_local(as_datetime(start)) > now() + timedelta(hours=4) }}
+      {{ start is not none
+         and as_local(as_datetime(start)) > now() + timedelta(hours=margin_hours) }}
 actions:
   - action: datetime.set_value
     target:
       entity_id: datetime.mspa_scheduled_for
     data:
       datetime: >
-        {{ (as_local(as_datetime(state_attr('calendar.your_calendar', 'start_time'))) - timedelta(hours=4))
-           .strftime('%Y-%m-%d %H:%M:%S') }}
+        {{ (as_local(as_datetime(state_attr('calendar.your_calendar', 'start_time')))
+            - timedelta(hours=margin_hours)).strftime('%Y-%m-%d %H:%M:%S') }}
 ```
 
-Replace `calendar.your_calendar` and `datetime.mspa_scheduled_for` with your actual entity IDs.  Once the integration has learned your heating rates, the Heat Schedule sensor will more accurately predict the heating time and a high "safety margin" will not be needed. You can use to fine-tune this value.
+Replace `calendar.your_calendar` and `datetime.mspa_scheduled_for` with your actual entity IDs.
 
-> **Timezone note**: `as_local()` is required around `as_datetime()` here. Home Assistant calendar integrations return start times as timezone-naive strings; without `as_local()` the comparison with `now()` (which is always timezone-aware) will raise a template error.
+> **Why the margin is small**: the integration already works backwards from the learned heating rates to pick the start time, and keeps re-evaluating it until it fires — so the margin here is only insurance against a bad prediction, not the mechanism that gets the spa warm. Start at an hour while the model is still learning, and reduce it once you see the predictions landing accurately.
+>
+> **The condition guards against a past target**: it only sets the schedule if the event is at least `margin_hours` away, since a ready time in the past would be rejected. If your events are often closer than that, lower the margin.
+>
+> **Timezone note**: `as_local()` is required around `as_datetime()`. Home Assistant calendar integrations return start times as timezone-naive strings; without it the comparison against `now()` (always timezone-aware) raises a template error.
 
 ---
 
