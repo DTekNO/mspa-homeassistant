@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Re-asserting the same scheduled time re-armed the scheduler** *(Experimental)* — `datetime.set_value` on **Scheduled for** committed unconditionally, and committing deliberately clears the trigger and readiness latches so a genuine reschedule takes effect. Any automation run that recomputed the same time therefore re-armed the scheduler: mid-heat-up the trigger would re-fire, the target temperature would be resent, and the Heat Schedule sensor would drop out of `Heating` back to a start-time state.
 
-  This is easy to hit with the documented calendar-sync automation. A `state` trigger on a calendar entity fires on attribute-only changes, so an edit to `end_time`, `message` or `location` re-runs the automation while `start_time` — and hence the computed ready time — is unchanged. Adding a periodic trigger for robustness multiplies it further.
+  This is easy to hit with the documented calendar-sync automation. A `state` trigger on a calendar entity fires on attribute-only changes, so an edit to `end_time`, `message` or `location` re-runs the automation while `start_time` — and hence the computed ready time — is unchanged.
 
   Setting a time that matches the one already set is now a no-op. A genuine change still re-arms the scheduler exactly as before.
 

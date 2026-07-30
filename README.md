@@ -494,8 +494,6 @@ triggers:
     entity_id: calendar.your_calendar
   - trigger: homeassistant
     event: start
-  - trigger: time_pattern
-    minutes: /15
 conditions:
   - condition: template
     value_template: >
@@ -514,15 +512,13 @@ actions:
 
 Replace `calendar.your_calendar` and `datetime.mspa_scheduled_for` with your actual entity IDs.
 
-> **What each trigger is for**: the `state` trigger carries the normal case. A `state` trigger with no `to:`/`from:` fires on *any* state change including attribute-only ones, so editing or moving the next event in your calendar is picked up as soon as the calendar integration polls (the entity's `last_updated` moves even though its state string stays `off`). The `homeassistant: start` trigger covers changes made while HA was down. The `time_pattern` trigger is for self-healing — it recovers if the `datetime.set_value` call failed because the integration happened to be reloading, if something else overwrote **Scheduled for**, or if a restart restored a stale value. Fifteen minutes is a reasonable cadence; it costs nothing, for the reason below.
->
-> **Re-asserting the same time is a no-op**: the integration ignores a `datetime.set_value` that matches the time already set. This matters more than it first appears, because committing a *new* time deliberately re-arms the scheduler — clearing the trigger and readiness latches. Without that guard, any run that recomputed the same value would reset the scheduler mid-heat-up and resend the setpoint. That happens on the periodic trigger, and also on the `state` trigger whenever an unrelated calendar attribute changes (`end_time`, `message`, `location`) while `start_time` stays put.
->
 > **Why the margin is small**: the integration already works backwards from the learned heating rates to pick the start time, and keeps re-evaluating it until it fires — so the margin here is only insurance against a bad prediction, not the mechanism that gets the spa warm. Start at an hour while the model is still learning, and reduce it once you see the predictions landing accurately.
 >
 > **The condition guards against a past target**: it only sets the schedule if the event is at least `margin_hours` away, since a ready time in the past would be rejected. If your events are often closer than that, lower the margin.
 >
 > **Timezone note**: `as_local()` is required around `as_datetime()`. Home Assistant calendar integrations return start times as timezone-naive strings; without it the comparison against `now()` (always timezone-aware) raises a template error.
+>
+> **Cancelling your last planned session**: deleting a calendar event normally just rolls the sync on to the next one. But if you delete the only remaining event, the calendar reports no start time, the condition above is false, and **Scheduled for** keeps its previous value — so the spa still heats for a session that is no longer planned. To park it, set **Scheduled for** well past the lookahead horizon (a date next year, say): it sits dormant until something replaces it, which the next real calendar event will do. Setting a time in the *past* does not cancel it — that makes the scheduler fire immediately.
 
 ---
 
