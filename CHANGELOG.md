@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Re-asserting the same scheduled time re-armed the scheduler** *(Experimental)* — `datetime.set_value` on **Scheduled for** committed unconditionally, and committing deliberately clears the trigger and readiness latches so a genuine reschedule takes effect. Any automation run that recomputed the same time therefore re-armed the scheduler: mid-heat-up the trigger would re-fire, the target temperature would be resent, and the Heat Schedule sensor would drop out of `Heating` back to a start-time state.
+
+  This is easy to hit with the documented calendar-sync automation. A `state` trigger on a calendar entity fires on attribute-only changes, so an edit to `end_time`, `message` or `location` re-runs the automation while `start_time` — and hence the computed ready time — is unchanged. Adding a periodic trigger for robustness multiplies it further.
+
+  Setting a time that matches the one already set is now a no-op. A genuine change still re-arms the scheduler exactly as before.
+
 - **Prediction bias drifted on restart and could move away from recent accuracy** *(Experimental)* — `prediction_bias` was recomputed from stored session history every time the integration loaded, using a Gaussian kernel that weighted past sessions by how closely their weather matched *current* conditions. Two consequences: the bias changed on restart with no new data (observed moving 1.072 → 1.060 across a restart), and because the weights were re-derived against instantaneous wind, it could rise after a session whose accuracy should have lowered it (observed 1.055 → 1.060 → 1.063 while the two sessions in question came in at ratios of 1.016 and 0.964).
 
   The effect was a systematic over-estimate: on the sessions analysed, the raw rate model was accurate to ±2.6% while the biased estimate was out by 6.9% — the correction was making predictions 2.6× worse, and starting scheduled heat-ups roughly 30 minutes earlier than needed.

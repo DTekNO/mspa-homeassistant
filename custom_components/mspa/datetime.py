@@ -21,6 +21,19 @@ _LOGGER = logging.getLogger(__name__)
 _SET_DEBOUNCE_SECONDS = 5
 
 
+def _same_instant(a: datetime | None, b: datetime | None) -> bool:
+    """True when both values refer to the same moment.
+
+    Tolerates a naive/aware mix rather than raising, since the value can arrive
+    from the HA datetime picker, a service call template, or restored state.
+    """
+    if a is None or b is None:
+        return False
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        return a.replace(tzinfo=None) == b.replace(tzinfo=None)
+    return a == b
+
+
 async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([MSpaScheduledReadyAt(coordinator)])
@@ -44,16 +57,35 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
         self._debounce_cancel = None   # cancel handle from async_call_later
         self._pending_value: datetime | None = None  # value waiting to be committed
 
-    @property
-    def native_value(self) -> datetime | None:
-        # While a debounce is in flight show the user's latest pick, not the
-        # stale coordinator value.  This gives immediate feedback in the UI
-        # even though the coordinator hasn't been updated yet.
+    def _current_target(self) -> datetime | None:
+        """The time this entity is currently presenting.
+
+        While a debounce is in flight that is the user's latest pick, not the
+        stale coordinator value — giving immediate UI feedback even though the
+        coordinator has not been updated yet.
+        """
         if self._debounce_cancel is not None and self._pending_value is not None:
             return self._pending_value
         return self.coordinator.scheduled_ready_at
 
+    @property
+    def native_value(self) -> datetime | None:
+        return self._current_target()
+
     async def async_set_value(self, value: datetime) -> None:
+        # Re-asserting the time that is already set must be a no-op.  Committing
+        # clears _schedule_triggered and ready_latched, so an automation that
+        # re-syncs the schedule on a timer (e.g. from a calendar every 15 min)
+        # would otherwise re-arm the scheduler mid-heat-up: the trigger re-fires,
+        # the setpoint command is resent, and the Heat Schedule sensor drops out
+        # of "Heating" back to a start-time state on every run.
+        if _same_instant(self._current_target(), value):
+            _LOGGER.debug(
+                "Heat schedule: ready time re-asserted unchanged (%s) — ignoring",
+                value.strftime("%Y-%m-%d %H:%M"),
+            )
+            return
+
         # Cancel any previously scheduled commit (restart the debounce window).
         if self._debounce_cancel is not None:
             self._debounce_cancel()

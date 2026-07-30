@@ -89,6 +89,12 @@ _const_mod.UnitOfPower       = _unit_of_power
 _const_mod.UnitOfEnergy      = _unit_of_energy
 _const_mod.EntityCategory    = _entity_cat
 _const_mod.Platform          = MagicMock()
+# homeassistant.core.callback is a marker decorator in real HA — it returns the
+# function unchanged.  A bare MagicMock would replace decorated methods with
+# mocks, silently turning them into no-ops.
+_core_mod            = MagicMock()
+_core_mod.callback   = lambda func: func
+
 _helpers_mod         = MagicMock()
 _helpers_mod.update_coordinator = _coordinator_mod
 _helpers_mod.restore_state      = _restore_mod
@@ -100,7 +106,7 @@ sys.modules.update({
     "voluptuous":                                   MagicMock(),
     "homeassistant":                                MagicMock(),
     "homeassistant.config_entries":                 MagicMock(),
-    "homeassistant.core":                           MagicMock(),
+    "homeassistant.core":                           _core_mod,
     "homeassistant.components":                     MagicMock(),
     "homeassistant.components.sensor":              _sensor_mod,
     "homeassistant.components.switch":              _switch_mod,
