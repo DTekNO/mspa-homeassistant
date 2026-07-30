@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Prediction bias drifted on restart and could move away from recent accuracy** *(Experimental)* — `prediction_bias` was recomputed from stored session history every time the integration loaded, using a Gaussian kernel that weighted past sessions by how closely their weather matched *current* conditions. Two consequences: the bias changed on restart with no new data (observed moving 1.072 → 1.060 across a restart), and because the weights were re-derived against instantaneous wind, it could rise after a session whose accuracy should have lowered it (observed 1.055 → 1.060 → 1.063 while the two sessions in question came in at ratios of 1.016 and 0.964).
+
+  The effect was a systematic over-estimate: on the sessions analysed, the raw rate model was accurate to ±2.6% while the biased estimate was out by 6.9% — the correction was making predictions 2.6× worse, and starting scheduled heat-ups roughly 30 minutes earlier than needed.
+
+  The bias is now an incremental EMA (α = 0.3) folded in **once per completed session** and persisted directly, so it only changes when there is new evidence, and a session below the current bias always pulls it down. Weather no longer participates: adjusting for conditions is `ambient_rate_factor`'s job in the rate model itself. The clamp is tightened from [0.5, 2.0] to [0.9, 1.1], since the segmented rate model now does the real work and the bias should only ever be a small residual.
+
+  On upgrade, stored history is replayed through the new EMA so accumulated learning is preserved rather than reset.
+
+### Internal
+
+- Removed `_weather_weight` (the Gaussian weather-similarity kernel), now unused. A properly learned weather model is planned — see [ROADMAP](ROADMAP.md#learned-weather-factor).
+- 12 new tests covering bias monotonicity, clamping, admissible-sample filtering, and the history-replay upgrade path — including a regression test built from the production sequence that exposed the drift.
+
 ---
 
 ## [2026.7.1] - 2026-07-30

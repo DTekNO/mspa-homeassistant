@@ -93,6 +93,21 @@ CONF_SCHEDULE_LOOKAHEAD_DAYS = "schedule_lookahead_days"
 DEFAULT_SCHEDULE_TARGET_TEMP = 40.0
 DEFAULT_SCHEDULE_LOOKAHEAD_DAYS = 5
 
+# --- Prediction bias -----------------------------------------------------------
+# The bias is a residual correction: the mean ratio of actual to estimated
+# heating time, folded in once per completed session as an EMA.  It must only
+# change when a session finishes — recomputing it from history on every load
+# made it drift with whatever the weather happened to be at startup, and let it
+# move *away* from recent performance.  Weather belongs in the rate model
+# (see ambient_rate_factor), not here.
+BIAS_EMA_ALPHA = 0.3     # newest session weight; last ~3 sessions ≈ 2/3 of total
+BIAS_CLAMP_MIN = 0.9     # the segmented rate model does the real work — cap the
+BIAS_CLAMP_MAX = 1.1     # residual tightly so it cannot double-correct
+BIAS_MIN_DELTA_C = 3.0   # short runs carry too much variance to learn from
+BIAS_RATIO_MIN = 0.3     # reject outlier ratios (e.g. water added mid-session)
+BIAS_RATIO_MAX = 3.0
+
+
 # --- Ambient-condition heating-rate correction ---------------------------------
 # Colder-than-baseline outdoor air slows heating, most strongly near the setpoint
 # (the "hot" bucket) where the water-to-air temperature difference — and thus the

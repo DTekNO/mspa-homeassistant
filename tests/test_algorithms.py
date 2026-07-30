@@ -3,6 +3,7 @@
 Covers:
   ambient_rate_factor  — ambient temperature correction for heating rate buckets
   _anchor_eta_utc      — anchor-based ETA computation
+  prediction bias      — incremental EMA, monotonicity, clamping, history replay
 
 No Home Assistant runtime required; conftest.py stubs the HA package tree.
 Run with: python -m pytest tests/test_algorithms.py -v
@@ -10,7 +11,14 @@ Run with: python -m pytest tests/test_algorithms.py -v
 import pytest
 from datetime import datetime, timezone, timedelta
 
-from custom_components.mspa.const import ambient_rate_factor, AMBIENT_FACTOR_MIN, AMBIENT_FACTOR_MAX
+from custom_components.mspa.const import (
+    ambient_rate_factor,
+    AMBIENT_FACTOR_MIN,
+    AMBIENT_FACTOR_MAX,
+    BIAS_CLAMP_MIN,
+    BIAS_CLAMP_MAX,
+)
+from custom_components.mspa.coordinator import MSpaUpdateCoordinator
 from custom_components.mspa.sensor import _anchor_eta_utc
 
 
@@ -142,3 +150,112 @@ class TestAnchorEtaUtc:
         r1 = _anchor_eta_utc(c, 40.0, now_utc)
         r2 = _anchor_eta_utc(c, 40.0, now_utc)
         assert r1 == r2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Prediction bias — incremental EMA, monotone with respect to evidence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _bias_coord(bias: float = 1.0, history: "list | None" = None) -> MSpaUpdateCoordinator:
+    """Coordinator instance via object.__new__ for bias-only tests."""
+    c = object.__new__(MSpaUpdateCoordinator)
+    c.prediction_bias = bias
+    c._prediction_history = history if history is not None else []
+    return c
+
+
+def _session(start: float, target: float, est: float, actual: float) -> dict:
+    return {"start_temp": start, "target_temp": target,
+            "estimated_minutes": est, "actual_minutes": actual}
+
+
+class TestBiasRatio:
+    """_bias_ratio decides which sessions are admissible evidence."""
+
+    def test_ratio_uses_raw_estimate(self):
+        # The bias must converge on the rate model's error, not on its own output,
+        # so the ratio is taken against estimated_minutes (raw), never the biased one.
+        r = MSpaUpdateCoordinator._bias_ratio(
+            {**_session(34.0, 39.5, 341.6, 329.4), "estimated_minutes_biased": 362.2}
+        )
+        assert r == pytest.approx(329.4 / 341.6)
+
+    def test_rejects_short_run(self):
+        assert MSpaUpdateCoordinator._bias_ratio(_session(38.0, 39.5, 60, 62)) is None
+
+    def test_rejects_outlier_ratio(self):
+        assert MSpaUpdateCoordinator._bias_ratio(_session(30.0, 40.0, 100, 500)) is None
+
+    def test_rejects_missing_values(self):
+        assert MSpaUpdateCoordinator._bias_ratio(_session(30.0, 40.0, 0, 300)) is None
+        assert MSpaUpdateCoordinator._bias_ratio({}) is None
+
+
+class TestBiasMonotonicity:
+    """The regression that motivated the rewrite: the bias moved the wrong way.
+
+    Production data showed bias 1.055 → 1.060 after a session whose ratio was
+    1.0157, then → 1.063 after a ratio of 0.9643.  Both samples were BELOW the
+    bias in force, so both should have pulled it down.
+    """
+
+    def test_below_current_bias_always_lowers_it(self):
+        c = _bias_coord(bias=1.055)
+        c._apply_bias_sample(1.0157)
+        assert c.prediction_bias < 1.055
+
+    def test_above_current_bias_always_raises_it(self):
+        c = _bias_coord(bias=1.0)
+        c._apply_bias_sample(1.08)
+        assert c.prediction_bias > 1.0
+
+    def test_production_sequence_now_converges_downward(self):
+        c = _bias_coord(bias=1.055)
+        c._apply_bias_sample(304.7 / 300.0)    # 29 Jul, ratio 1.0157
+        after_first = c.prediction_bias
+        c._apply_bias_sample(329.4 / 341.6)    # 30 Jul, ratio 0.9643
+        assert after_first < 1.055
+        assert c.prediction_bias < after_first
+        assert c.prediction_bias < 1.03        # heading toward the ~0.99 the data implies
+
+    def test_repeated_neutral_samples_converge_to_one(self):
+        c = _bias_coord(bias=1.10)
+        for _ in range(25):
+            c._apply_bias_sample(1.0)
+        assert c.prediction_bias == pytest.approx(1.0, abs=1e-3)
+
+    def test_clamped_to_configured_range(self):
+        hi = _bias_coord(bias=1.1)
+        for _ in range(50):
+            hi._apply_bias_sample(3.0)
+        assert hi.prediction_bias == pytest.approx(BIAS_CLAMP_MAX)
+
+        lo = _bias_coord(bias=0.9)
+        for _ in range(50):
+            lo._apply_bias_sample(0.3)
+        assert lo.prediction_bias == pytest.approx(BIAS_CLAMP_MIN)
+
+
+class TestBiasSeedFromHistory:
+    """Upgrade path: replay persisted history through the new EMA."""
+
+    def test_empty_history_gives_neutral_bias(self):
+        c = _bias_coord(bias=1.06, history=[])
+        c._seed_prediction_bias_from_history()
+        assert c.prediction_bias == 1.0
+
+    def test_replays_chronologically_and_weights_recent_higher(self):
+        # Old sessions ran slow (ratio 1.10), recent ones ran to plan (1.00).
+        # The result must sit nearer the recent evidence than the old.
+        history = [_session(30.0, 40.0, 100, 110) for _ in range(5)]
+        history += [_session(30.0, 40.0, 100, 100) for _ in range(3)]
+        c = _bias_coord(bias=99.0, history=history)
+        c._seed_prediction_bias_from_history()
+        assert 1.0 <= c.prediction_bias < 1.04
+
+    def test_skips_inadmissible_records(self):
+        history = [_session(38.0, 39.5, 60, 90),      # too short a run
+                   _session(30.0, 40.0, 100, 500)]    # outlier ratio
+        c = _bias_coord(bias=1.06, history=history)
+        c._seed_prediction_bias_from_history()
+        assert c.prediction_bias == 1.0

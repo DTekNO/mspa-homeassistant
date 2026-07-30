@@ -4,6 +4,82 @@ Ideas and planned features that are not yet scheduled for a specific release.
 
 ---
 
+## Learned Weather Factor
+
+### Motivation
+
+The prediction model currently corrects for outdoor conditions in two places, and neither of them actually *learns* the relationship.
+
+**`ambient_rate_factor` uses hardcoded sensitivities.** `AMBIENT_SENSITIVITY = (0.0, 0.02, 0.06)` — a fraction of the bucket's rate lost per °C below the learned baseline — was derived from physical reasoning about the water-to-air temperature gap, not measured. No installation has ever confirmed those numbers. A well-insulated spa with a rigid cover might sit at half those values; an uncovered one in an exposed garden could be double.
+
+**Wind is recorded but never used in the rate model.** `_read_weather_entity` reads wind speed, and it was used by the prediction-bias kernel until 2026.7.2, but `ambient_rate_factor` only takes temperature. Wind drives evaporative loss, which on an uncovered spa is plausibly a *larger* term than conduction. Observed sessions have ranged from 2 m/s to 10.5 m/s — a big uncontrolled variable sitting in the residual.
+
+**Worst of all, the bucket rates absorb weather variation.** There is one EMA per temperature band, fed by every session regardless of conditions. A cold-night observation drags the bucket down; a warm-day observation drags it back up. The bucket therefore converges on an average of whatever weather happened recently, rather than a property of the spa. Time-decay on stored rates exists purely to paper over this — "forget summer before winter arrives" — which discards good data to work around a modelling gap.
+
+The consequence is that seasonal knowledge cannot accumulate. After a full year of operation the integration is no better at predicting a cold January morning than it was in its first week, because every winter observation has been averaged against summer ones and then decayed away.
+
+### Concept
+
+Learn the weather sensitivity from observation, persist it, and evaluate it at current conditions. Split the rate into what the spa does and what the weather does to it:
+
+```
+observed_rate  =  base_rate[bucket]  ×  weather_factor(ambient_temp, wind)
+```
+
+Two consequences follow, and they are the whole point of the change:
+
+- **When an observation arrives**, divide out `weather_factor` *before* updating the bucket EMA. The buckets become "rate at reference conditions" — a genuine property of the spa — and stop absorbing weather at all.
+- **When predicting**, evaluate `weather_factor` at today's conditions. No similarity matching, no history window.
+
+Crucially this means **every session teaches the slope**. A January run and a July run both inform the same coefficients, so winter data improves a summer prediction instead of being discarded as irrelevant. That is the opposite of the old bias kernel, which could only ask "which of my last 10 sessions resembled today" and threw away everything that did not.
+
+### Parameterisation
+
+Data is sparse — roughly one session per day, each yielding a handful of 0.5 °C rate observations. A full model (base rate plus temperature and wind coefficients per bucket = nine free parameters) would overfit badly.
+
+Start with **one learned parameter**: a scalar weather gain `g`, applied to the existing physically-motivated per-bucket shape.
+
+```
+sensitivity[i] = g × SHAPE[i]        where SHAPE = (0.0, 1.0, 3.0)
+```
+
+`SHAPE` preserves the physics — heat loss scales with the water-to-air gap, so the near-setpoint bucket is affected far more than cold water — while `g` calibrates the magnitude to the actual installation. It cannot invert the ordering, converges within a handful of sessions, and reduces to current behaviour at `g = 0.02`.
+
+Add a second parameter for wind the same way once the temperature gain is stable, ideally on a `sqrt(wind)` or capped-linear term rather than raw linear, since evaporative loss does not grow without bound.
+
+Fit online by least squares on the residual: for each observation, compare the observed rate to the rate the model predicted at those conditions, and nudge `g` in the direction that reduces the error. Recursive least squares or a simple gradient step with a small learning rate both work; store the running sample count so the gain can be trusted proportionally to the evidence behind it.
+
+### Bootstrap
+
+No cold start needed. `prediction_history` already persists `ambient_temp`, `ambient_wind`, `estimated_minutes`, `actual_minutes`, `start_temp`, and `target_temp` per session. That is enough to fit an initial `g` offline from existing installations' stored data, and to sanity-check whether 0.02/0.06 was in the right region at all.
+
+### Instrumentation first
+
+The precondition for building this is training data at observation granularity, which is not currently logged. Before the model itself:
+
+- Log every accepted rate observation as `(bucket_index, observed_rate, ambient_temp, wind, cover_state_if_known)`.
+- Persist a rolling window of these — considerably more than the 10 sessions kept now, since the fit needs spread across conditions, and the whole point is multi-season coverage.
+- Add a diagnostic sensor exposing the current gain, its sample count, and the residual spread, so the fit can be inspected on the device page.
+
+Shipping the instrumentation early means data accumulates while the existing model keeps running, so by the time the fitting code is ready there are real coefficients to validate against rather than guesses. It also composes well with the opt-in analytics work below — the same per-observation records are exactly what would let sensitivities be compared across models and climates.
+
+### What this removes
+
+- **The weather kernel in the bias.** Already removed in 2026.7.2 for stability reasons; this change is what makes its absence correct rather than merely safer, because weather moves to where it belongs — the rate.
+- **Most of the time-decay on stored rates.** Once rates are condition-normalised, a summer rate *is* a winter rate. Decay can be relaxed substantially or dropped, keeping hard-won learning instead of bleeding it away.
+- **Much of the residual role of `prediction_bias`.** It should converge close to 1.0 and stay there. Keep it as a genuine catch-all, but it stops carrying weather.
+
+`session_scalar` stays, and becomes more clearly defined: the in-session correction for what the weather model *cannot* see — cover left off, water level, a windbreak, an unusually cold fill.
+
+### Open questions
+
+- Is `sqrt(wind)` the right form, or is a cap at moderate wind speeds sufficient? Needs data.
+- Should the gain be learned per bucket after enough evidence accumulates, or is the fixed `SHAPE` good enough indefinitely?
+- Cover state is the largest unmodelled variable and the integration has no way to know it. Worth an optional `binary_sensor` config option so users who have instrumented their cover can feed it in?
+- How should the gain behave when a user relocates the spa or adds insulation — is a manual reset needed, or does a slow forgetting factor on the fit handle it?
+
+---
+
 ## Opt-in Analytics & Capability Detection
 
 ### Motivation

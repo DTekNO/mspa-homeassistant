@@ -1,6 +1,5 @@
 """DataUpdateCoordinator for MSpa integration."""
 import logging
-import math
 from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
 
@@ -35,6 +34,12 @@ from .const import (
     AMBIENT_BASELINE_ALPHA,
     AMBIENT_BASELINE_DEFAULT,
     ambient_rate_factor,
+    BIAS_EMA_ALPHA,
+    BIAS_CLAMP_MIN,
+    BIAS_CLAMP_MAX,
+    BIAS_MIN_DELTA_C,
+    BIAS_RATIO_MIN,
+    BIAS_RATIO_MAX,
 )
 
 import time
@@ -116,29 +121,6 @@ def _read_weather_entity(hass: HomeAssistant, entity_id: str | None) -> tuple[fl
             wind = None
 
     return temp, wind
-
-
-def _weather_weight(
-    curr_temp: float | None,
-    curr_wind: float | None,
-    hist_temp: float | None,
-    hist_wind: float | None,
-) -> float:
-    """Gaussian kernel similarity for weather conditions.
-
-    Returns a weight in (0, 1] reflecting how similar the historical session's
-    ambient conditions are to the current ones.  Returns 1.0 (neutral) when
-    either side lacks weather data, so bias computation degrades gracefully to
-    a plain average when no weather sensors are configured.
-    """
-    if curr_temp is None or hist_temp is None:
-        return 1.0
-    _SIGMA_TEMP = 8.0   # °C  — sessions within ~8°C ambient count strongly
-    _SIGMA_WIND = 4.0   # m/s — sessions within ~4 m/s wind count strongly
-    sq = ((curr_temp - hist_temp) / _SIGMA_TEMP) ** 2
-    if curr_wind is not None and hist_wind is not None:
-        sq += ((curr_wind - hist_wind) / _SIGMA_WIND) ** 2
-    return math.exp(-0.5 * sq)
 
 
 class MSpaUpdateCoordinator(DataUpdateCoordinator):
@@ -287,61 +269,57 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Extended device detail fetched once on init from /api/device/detail/
         self.device_detail: dict = {}
 
-    def _update_prediction_bias(self) -> None:
-        """Recompute prediction_bias from prediction_history.
+    @staticmethod
+    def _bias_ratio(record: dict) -> float | None:
+        """actual/estimated for one session, or None if unusable for the bias.
 
-        Uses the mean of actual_minutes/estimated_minutes across history entries
-        with a temperature delta >= 3°C. Short runs have too much variance from
-        ambient conditions to be useful for bias correction.
-        Clamped to [0.5, 2.0] to avoid runaway corrections from bad data.
-        Entries where the ratio is outside [0.3, 3.0] are rejected as outliers.
-
-        When a weather entity is configured, historical entries are weighted by a
-        Gaussian kernel over ambient temperature and wind speed similarity to the
-        current conditions.  This makes the bias reflect sessions that happened
-        under similar weather rather than an undifferentiated average.  If no
-        weather entity is configured all weights are 1.0 (plain average).
+        The ratio is taken against the *raw* segmented estimate, not the biased
+        one, so the bias converges on the rate model's true error rather than
+        chasing its own previous output.
         """
-        if not self._prediction_history:
-            self.prediction_bias = 1.0
-            return
+        est    = record.get("estimated_minutes") or 0
+        actual = record.get("actual_minutes") or 0
+        start  = record.get("start_temp") or 0
+        target = record.get("target_temp") or 0
 
-        weighted_sum = 0.0
-        weight_total = 0.0
-        n_used = 0
+        if (target - start) < BIAS_MIN_DELTA_C:
+            return None
+        if est <= 0 or actual <= 0:
+            return None
+        ratio = actual / est
+        if not (BIAS_RATIO_MIN <= ratio <= BIAS_RATIO_MAX):
+            return None
+        return ratio
 
-        for p in self._prediction_history:
-            est = p.get("estimated_minutes", 0)
-            actual = p.get("actual_minutes", 0)
-            start = p.get("start_temp", 0)
-            target = p.get("target_temp", 0)
+    def _apply_bias_sample(self, ratio: float) -> None:
+        """Fold one completed session's accuracy ratio into prediction_bias.
 
-            if (target - start) < 3.0:
-                continue
-            if est <= 0 or actual <= 0:
-                continue
+        An incremental EMA, so the bias is monotone with respect to evidence: a
+        ratio below the current bias always pulls it down and vice versa.  The
+        previous implementation recomputed a weather-weighted mean over the last
+        10 sessions on every call, which could move the bias *up* after a session
+        that should have lowered it — and changed it on restart with no new data.
+        """
+        updated = self.prediction_bias + BIAS_EMA_ALPHA * (ratio - self.prediction_bias)
+        self.prediction_bias = max(BIAS_CLAMP_MIN, min(BIAS_CLAMP_MAX, updated))
 
-            ratio = actual / est
-            if not (0.3 <= ratio <= 3.0):
-                continue
+    def _seed_prediction_bias_from_history(self) -> None:
+        """Rebuild the bias by replaying stored history through the EMA.
 
-            weight = _weather_weight(
-                self.ambient_temp, self.ambient_wind,
-                p.get("ambient_temp"), p.get("ambient_wind"),
-            )
-            weighted_sum += ratio * weight
-            weight_total += weight
-            n_used += 1
-
-        if weight_total > 0:
-            avg = weighted_sum / weight_total
-            self.prediction_bias = max(0.5, min(2.0, avg))
-        else:
-            self.prediction_bias = 1.0
-
+        Used only on the upgrade path, when persisted history exists but no
+        persisted bias does.  Replaying in chronological order preserves the
+        accumulated learning while applying the current algorithm to it.
+        """
+        self.prediction_bias = 1.0
+        n = 0
+        for record in self._prediction_history:
+            ratio = self._bias_ratio(record)
+            if ratio is not None:
+                self._apply_bias_sample(ratio)
+                n += 1
         _LOGGER.debug(
-            "Prediction bias updated: %.3f (from %d samples, weather-weighted=%s)",
-            self.prediction_bias, n_used, self.ambient_temp is not None,
+            "Prediction bias seeded from %d historical sessions → %.3f",
+            n, self.prediction_bias,
         )
 
     async def _async_update_data(self) -> Dict[str, Any]:
@@ -456,7 +434,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self._prediction_history.append(result)
                 self._prediction_history = self._prediction_history[-10:]  # keep last 10
                 self._prediction = None
-                self._update_prediction_bias()
+                ratio = self._bias_ratio(result)
+                if ratio is not None:
+                    self._apply_bias_sample(ratio)
                 _LOGGER.info(
                     "PREDICTION_RESULT: %.1f°C → %.1f°C | estimated %.0f min, actual %.0f min | error %+.0f min (%+.1f%%) | bias=%.3f",
                     result["start_temp"], result["target_temp"],
@@ -514,7 +494,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             pass
                     stored_buckets = stored.get("heat_rate_buckets")
                     self._prediction_history = stored.get("prediction_history", [])
-                    self._update_prediction_bias()
+                    # Restore the bias as a stored value — never recompute it here.
+                    # Recomputing on load made it depend on the weather at startup,
+                    # so a restart alone could change every subsequent prediction.
+                    stored_bias = stored.get("prediction_bias")
+                    if stored_bias is not None:
+                        self.prediction_bias = max(
+                            BIAS_CLAMP_MIN, min(BIAS_CLAMP_MAX, float(stored_bias))
+                        )
+                    else:
+                        self._seed_prediction_bias_from_history()
                     # Restore in-progress prediction so a restart mid-heatup doesn't
                     # drop the session from the learning history.
                     self._prediction = stored.get("active_prediction")
@@ -531,9 +520,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             days_elapsed = (time.time() - save_ts) / 86400
                             # Decay each bucket toward the global flat EMA over time so
                             # stale seasonal rates don't anchor predictions indefinitely.
-                            # When a weather entity is configured, the bias is already
-                            # weather-weighted so seasonal variation is handled there —
-                            # the bucket rates can be trusted for longer.
+                            # With a weather entity, ambient_rate_factor explains some
+                            # of the seasonal variation directly, so the stored rates
+                            # stay useful for longer and can decay more slowly.
                             # Without weather: 0.98/day → ~75% weight at 14 days.
                             # With weather:    0.994/day → ~92% weight at 14 days.
                             has_weather = bool(
@@ -737,6 +726,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "heat_rate_buckets": self.heat_rate_buckets,
                 "bucket_save_ts": time.time(),
                 "prediction_history": self._prediction_history,
+                "prediction_bias": self.prediction_bias,
                 "active_prediction": self._prediction,
                 "ambient_baseline": self.ambient_baseline,
                 "temp_anchor_time": (
