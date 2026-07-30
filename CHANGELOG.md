@@ -7,11 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [2026.7.1] - 2026-07-30
+
+### Summary
+
+This release introduces **predictive scheduling**: tell the spa when you want to use it, and the integration works out when to start heating — learning your spa's actual thermal behaviour as it goes, and adjusting for the weather.
+
+Three new entities (**Ready at**, **Heat Schedule**, **Scheduled for**) replace the two old time-to-target sensors. The prediction model gains an **ambient-aware heating-rate correction**: with an optional weather entity configured, the integration knows that a cold, windy night slows the final approach to set-point far more than it slows warming cold water, and shifts the heating start time earlier accordingly. Both scheduling sensors now derive "Ready" from a single shared code path, so they can no longer disagree with each other.
+
+> **Versioning change**: this project now uses calendar versioning (`YYYY.M.PATCH`), replacing the previous `3.x.y` scheme. `2026.7.1` supersedes `3.0.5`.
+
 ### Added
-- **Ready at sensor** *(Experimental)* — shows when the spa will reach the target temperature (`10:34`, `10:34 +1d`, or `Ready`). Exposes `minutes_remaining`, `ready_at` (ISO 8601 timestamp), and full diagnostic attributes including direction, per-bucket heat rates, session scalar, and prediction bias.
-- **Heat Schedule sensor** *(Experimental)* — predicts when to start conditioning based on a planned session time. Uses the learned temperature-bucketed rates and works for both heating and cooling. Requires the **Scheduled for** datetime control to be set.
-- **Scheduled for** datetime control *(Experimental)* — a datetime entity owned by the device (appears in the device panel under Controls). Set it to when you want the spa ready.
+
+#### Predictive scheduling entities *(Experimental)*
+
+- **Ready at sensor** — one human-readable answer to "is the spa ready, and if not, when?" (`10:34`, `10:34 +1d`, or `Ready`). Exposes `minutes_remaining`, `ready_at` (ISO 8601 timestamp), a `color` attribute for Mushroom-style cards, and full diagnostic attributes including direction, per-bucket heat rates, session scalar, and prediction bias.
+- **Heat Schedule sensor** — predicts when to *start* conditioning to hit a planned session time (`Start at 04:15`, `Start now`, `Heating`, `Ready`, `Not scheduled`). Uses the learned temperature-bucketed rates and works for both heating and cooling. Requires the **Scheduled for** datetime control to be set.
+- **Scheduled for** datetime control — a datetime entity owned by the device (appears in the device panel), so no external `input_datetime` helper is needed. Set it to when you want the spa ready and the schedule recalculates automatically.
+- **Automatic schedule trigger** — when the computed start time arrives the integration sets the target temperature and turns the heater on by itself. The schedule is re-evaluated continuously until it fires, so an overnight cool-down that slows the spa moves the start time earlier rather than silently missing the target.
+- **Schedule lookahead limit** — schedules further out than the configured horizon (default 5 days) report `Not scheduled` instead of projecting an implausibly precise start time.
+
+#### Ambient-aware heating-rate correction *(Experimental)*
+
+- **Weather-driven rate correction** — with an optional weather entity configured, learned bucket rates are scaled by current outdoor temperature relative to a learned seasonal baseline:
+
+  ```
+  factor = clamp(1 + sensitivity × (ambient_now − ambient_baseline), 0.3, 1.5)
+  ```
+
+  Sensitivity is **per temperature bucket** (cold `0.0`, mid `0.02`, hot `0.06` per °C), reflecting the physics: heat loss scales with the water-to-air temperature difference, so cold water is nearly insensitive to outdoor conditions while the near-setpoint "hot" bucket is affected most. This matches observed cold-night behaviour, where the cold and mid buckets track their learned rates but the hot bucket collapses.
+- **Self-learning ambient baseline** — a slow EMA (α = 0.05) of observed session temperatures establishes what "normal" outdoor conditions look like for your location and season, so the correction is relative to your own climate rather than a hard-coded assumption. Seeded at 15 °C until enough samples accumulate.
+- **Correction precedence** — a bucket already observed during the current session is used verbatim (real data beats any model); otherwise the empirical session scalar wins if active; otherwise the weather model applies. This makes the weather model matter exactly where it is needed — the pre-start estimate, before any observation for today exists.
+- **Graceful degradation** — with no weather entity configured, or when the weather entity is unavailable, the correction factor is `1.0` and estimates fall back to the plain learned rates. Nothing is required to opt out.
+- **Weather-weighted bias correction** — historical sessions used for the prediction-bias scalar are weighted by a Gaussian kernel over ambient temperature and wind-speed similarity to current conditions, so the bias reflects sessions that resembled today rather than an undifferentiated average.
+- **Gentler rate decay with weather data** — stored bucket rates decay ≈ 0.6%/day with a weather entity configured versus ≈ 2%/day without, since ambient variation between sessions is already accounted for.
+- New diagnostic fields recorded per session: `ambient_temp`, `ambient_wind`, `ambient_baseline`, and `ambient_factor_hot`.
+
+#### Other additions
+
 - **Device-reported heating rate clamped** — the API `device_heat_perhour` seed value is now clamped to 0.5–2.0 °C/h to prevent implausible cold-start estimates. Models that report zero have no cold-start seed and will not produce estimates until the EMA has real data.
+
+### Changed
+
+- **Ready at is context-first** — the sensor now decides *which* target it is talking about before estimating anything, resolving cases where a pending schedule targeted a different temperature than the current thermostat set-point. Three explicit contexts:
+  - **Schedule pending** (a future schedule that has not fired) → shows the scheduled ready time, or `Ready` if the water is already at the scheduled temperature.
+  - **Scheduled heating** (the trigger has fired) → shows a live ETA to the *scheduled* temperature, ignoring the original plan.
+  - **Free** (no schedule) → shows an ETA to the thermostat set-point, or `Ready`.
+
+  This fixes a reported bug where a stale "at target" latch from an earlier low-temperature session made the sensor read `Ready` while the Heat Schedule sensor still showed `Start at 12:50`.
+- **Anchor-based ETA** — estimates are computed from a fixed (temperature, timestamp) anchor rather than being recalculated from scratch each poll. The displayed time now stays stable while the water temperature is unchanged and moves only when there is new information, instead of drifting by a minute on every poll.
+- **Ready at and Heat Schedule now share one readiness definition** — the Heat Schedule sensor previously applied its own `within 1 °C of target` shortcut, which could declare `Ready` up to an hour before the Ready at sensor agreed. It now delegates to the same function the Ready at sensor uses, so the two entities always converge on `Ready` simultaneously.
+- **Heat Schedule holds `Heating` once triggered** — after the trigger fires the sensor reports a stable `Heating` rather than oscillating between `Start now` and `Start at HH:MM` as the temperature fluctuates during thermostat cycling.
+
+### Fixed
+
+- **Bubbles could not be switched on without first setting a level** — the device reports `bubble_level = 0` while bubbles are off, so the turn-on command was sent as `{bubble_state: 1, bubble_level: 0}` and silently ignored by the spa. The level is now clamped to at least 1 on turn-on, so the switch works on its own. Spas that report a non-zero level while off are unaffected — their last-known level is preserved.
+- **Setting a bubble level started the bubbles without the switch following** — setting a level activates the blower as a device-side effect, but Home Assistant did not know. The level service now sends the state explicitly and registers `bubble = on` for command confirmation, so the switch no longer snaps back to off on the next poll.
+- **Bubble level slider did not update until the next poll** — the new level is written to the local state cache immediately, so the slider reflects the chosen value on the next render instead of waiting for cloud confirmation.
+- **`UnboundLocalError` in Ready at attributes after a schedule trigger** — reading the sensor's attributes immediately after the schedule fired could raise instead of returning values.
 
 ### Removed
 - **⚠️ BREAKING: "Ready At" timestamp sensor removed** *(Experimental)* — the `sensor.mspa_xxx_ready_at` timestamp entity (device class: timestamp) has been removed. It is replaced by the new **Ready at** sensor.
@@ -29,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Conditional cards using `state_not: unavailable` → change to `state_not: Ready`
   - Automations comparing minutes numerically → use `state_attr(..., 'minutes_remaining') | int`
   - Attribute references (`direction`, `prediction_bias`, bucket rates) → same attribute names, now on the Ready at sensor
+
+### Internal
+
+- **Scheduling test suite rebuilt** — the three large per-sensor test files are replaced by scenario-based suites covering the named use patterns (cold start, stale latch with a higher pending schedule, thermostat lowered while at temperature, warm day at scheduled temperature), the readiness latch state machine, trigger firing and guard conditions, the ambient-rate correction, and spa control coupling (filter→heater, bubble level→on). 77 tests, ~0.2 s.
 
 ---
 

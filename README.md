@@ -133,13 +133,17 @@ The integration uses a 3-tier adaptive polling system to balance responsiveness 
 >
 > Feedback on accuracy is very welcome — please open an issue with your model and observations.
 
-This section covers three related sensors and one control entity that work together:
+This section covers two sensors and one control entity that work together:
 
 | Entity | Type | Purpose |
 |--------|------|---------|
 | **Ready at** | Sensor | Estimated ready time — "10:34", "10:34 +1d", or "Ready". `minutes_remaining` available as attribute. |
 | **Heat Schedule** | Sensor | When to start heating for a planned session |
 | **Scheduled for** | Control (datetime) | Set when you want the spa ready |
+
+**How it fits together:** set **Scheduled for** to when you want to use the spa. The **Heat Schedule** sensor works backwards through the learned heating rates — corrected for tonight's weather — to compute when heating must start, and the integration **starts the spa itself** when that moment arrives. The **Ready at** sensor then tracks the live estimate through to `Ready`. The start time is re-evaluated continuously until it fires, so if the spa cools faster than expected overnight the start moves earlier rather than quietly missing your target.
+
+Optionally configure a [weather entity](#optional-weather-entity) to make the pre-start estimate account for outdoor conditions.
 
 ### First-time use — no learning data yet
 
@@ -186,13 +190,59 @@ A spa does not heat at a constant rate across its full temperature range. Heat l
 
 Each bucket is updated only by observations made in that temperature range. When estimating time-to-target, the remaining delta is split at the 30 °C and 37 °C boundaries; each segment is calculated at its own observed rate; the results are summed. This gives substantially more accurate estimates for long heating runs (e.g. 20 °C → 40 °C) compared to a single flat rate.
 
-#### Ambient condition correction (session scalar)
+#### In-session condition correction (session scalar)
 
-Outdoor conditions — temperature, wind, whether the cover is on — can shift the effective heating rate by 20–40% between a cold winter morning and a warm summer afternoon. The model detects this within the first few minutes of a new heating session.
+Outdoor conditions — temperature, wind, whether the cover is on — can shift the effective heating rate by 20–40% between a cold winter morning and a warm summer afternoon. The model detects this within the first few minutes of a new heating session, from the spa's own behaviour and with no weather data required.
 
 At the start of each session (heater engages with delta > 2 °C) the **session scalar** is reset to 1.0. As soon as the first bucket receives a live observation, the ratio of observed rate to stored base rate for that bucket is computed. This ratio is smoothed (weighted 40% new / 60% prior) and applied as a multiplier to any bucket that has not yet received direct observations in the current session.
 
 The effect: today's ambient conditions are reflected across the entire estimate within the first few minutes of heating, before the spa has passed through all three temperature ranges.
+
+#### Outdoor-temperature correction (weather model)
+
+The session scalar can only react *once heating has already started*. For scheduling that is too late — the Heat Schedule sensor has to decide when to start heating before there is any observation of today's conditions. With an optional [weather entity](#optional-weather-entity) configured, the integration closes that gap by predicting the effect of the current outdoor temperature up front.
+
+Each learned bucket rate is scaled by how far the current outdoor temperature sits from a learned seasonal baseline:
+
+```
+factor = clamp(1 + sensitivity × (ambient_now − ambient_baseline), 0.3, 1.5)
+```
+
+The sensitivity is **different for each temperature bucket**, which is the key to the model:
+
+| Bucket | Sensitivity | Why |
+|--------|-------------|-----|
+| Cold (< 30 °C) | 0.00 /°C | Cold water loses little heat to the air — outdoor conditions barely matter |
+| Mid (30–37 °C) | 0.02 /°C | Moderate — losses grow with the water-to-air gap |
+| Hot (≥ 37 °C) | 0.06 /°C | Strongest — near set-point the water-to-air difference, and so the convective and evaporative loss, is greatest |
+
+Heat loss scales with the temperature difference between the water and the air, so a cold night costs you far more in the final approach to set-point than it does while warming cold water. This matches the observed failure mode: on a cold night the cold and mid buckets track their learned rates closely while the hot bucket collapses, and a model using one flat correction either over-corrects the start or under-corrects the finish.
+
+**The baseline is learned, not assumed.** A slow EMA (α = 0.05) of outdoor temperatures observed at session start builds up a picture of what "normal" looks like for your location and season, so the correction is relative to your own climate. Until enough samples accumulate it is seeded at 15 °C.
+
+**Precedence.** Real observations always beat the model. For the bucket the water is actually in:
+
+1. If that bucket has already been observed **this session**, use it verbatim — it reflects today's true conditions.
+2. Otherwise, if the empirical session scalar is active, it wins.
+3. Otherwise, apply the weather-model correction.
+
+So the weather model does its work exactly where it is needed — the pre-start estimate — and steps aside as soon as live data exists.
+
+**Without a weather entity** the factor is `1.0` and estimates fall back to the plain learned rates. Nothing needs to be disabled.
+
+You can watch the correction in the `ambient_temp_deg_c`, `ambient_baseline_deg_c`, and `ambient_factor` attributes on the Ready at sensor.
+
+#### Optional weather entity
+
+Configure one under **Settings → Devices & Services → MSpa → ⚙️ Configure → Weather entity**. Any entity in the `weather` domain works — Met.no (built in, no API key) is a good default; OpenWeatherMap and similar also work. The integration reads the entity's `temperature` and `wind_speed` attributes.
+
+Configuring one enables three things:
+
+- the **outdoor-temperature rate correction** described above, which improves the heating start time before any of today's data exists;
+- **weather-weighted bias correction** — historical sessions are weighted by a Gaussian kernel over ambient temperature and wind-speed similarity to current conditions, so the bias reflects sessions that actually resembled today (see below);
+- **gentler decay on stored rates** — ≈ 0.6 %/day instead of ≈ 2 %/day, because ambient variation between sessions is already accounted for.
+
+It is entirely optional. Everything degrades gracefully to the plain learned rates if no entity is set, or if the one you set becomes unavailable.
 
 #### Historical bias correction
 
@@ -231,8 +281,11 @@ The **Ready at** sensor exposes diagnostic attributes useful while the algorithm
 | `heat_rate_cold_deg_per_hour` | Bucket rate for < 30 °C (`null` until first sample in range) |
 | `heat_rate_mid_deg_per_hour` | Bucket rate for 30–37 °C |
 | `heat_rate_hot_deg_per_hour` | Bucket rate for ≥ 37 °C |
-| `session_condition_scalar` | Current ambient-condition correction factor (1.0 = neutral) |
+| `session_condition_scalar` | Empirical in-session correction factor from observed vs. stored rate (1.0 = neutral) |
 | `prediction_bias` | Historical bias correction (1.0 = no correction, >1.0 = predictions were too optimistic) |
+| `ambient_temp_deg_c` | Current outdoor temperature from the weather entity (`null` if not configured) |
+| `ambient_baseline_deg_c` | Learned seasonal baseline the correction is measured against |
+| `ambient_factor` | Weather-model rate multiplier for the bucket the water is currently in (1.0 = neutral) |
 | `device_rate_deg_per_hour` | Heating rate reported by the device itself (some models only) |
 | `current_temperature` | Current water temperature |
 | `target_temperature` | Current set-point |
@@ -336,9 +389,22 @@ The **Ready at** sensor gives a single, human-readable answer to "is the spa rea
 
 | State | Meaning |
 |-------|---------|
-| `Ready` | Temperature is within 5 minutes of target |
-| `HH:MM` | Estimated time to reach target today |
-| `HH:MM +Nd` | Estimated time with a day offset (e.g. `+1d` = tomorrow) |
+| `Ready` | The spa is at the temperature that currently matters (see below) |
+| `HH:MM` | Estimated ready time today |
+| `HH:MM +Nd` | Estimated ready time with a day offset (e.g. `+1d` = tomorrow) |
+| `unavailable` | No rate data yet, or nothing is heating and the spa is not at target |
+
+### Which target is it talking about?
+
+The sensor identifies its **context** before estimating anything — this matters because a pending schedule may target a different temperature than the thermostat is currently set to.
+
+| Context | When | Shows |
+|---------|------|-------|
+| **Schedule pending** | A future schedule is set but has not fired yet | The scheduled ready time — or `Ready` if the water is already at the scheduled temperature |
+| **Scheduled heating** | The schedule has fired and the spa is heating | A live ETA to the **scheduled** temperature, recalculated from actual progress rather than the original plan |
+| **Free** | No schedule set | An ETA to the current thermostat set-point, or `Ready` when at target |
+
+Estimates are computed from a fixed (temperature, timestamp) anchor rather than being re-derived on every poll, so the displayed time holds steady while the water temperature is unchanged and moves only when there is genuinely new information.
 
 ### Attributes
 
@@ -381,11 +447,16 @@ Replace `datetime.mspa_scheduled_for` with your actual entity ID. Clicking the t
 
 | State | Meaning |
 |-------|---------|
-| `Not scheduled` | No target time set, or the set time has passed |
-| `Ready` | The spa is already within 1 °C of the target temperature |
+| `Not scheduled` | No target time set, the set time has passed, or it is beyond the lookahead horizon |
+| `Ready` | The spa is at the scheduled temperature — same definition the Ready at sensor uses |
+| `Heating` | The schedule has fired and the spa is working toward the target |
 | `Start now` | Conditioning should begin immediately to reach the target in time |
 | `Start at HH:MM` | Conditioning should start at this time today |
 | `Start at HH:MM +Nd` | Conditioning should start in N days at this time |
+
+> **The two sensors agree by construction.** `Ready` here is not a separate rule — the Heat Schedule sensor asks the Ready at sensor's own readiness function. Earlier versions applied an independent "within 1 °C" shortcut here, which could declare the spa ready up to an hour before the Ready at sensor agreed. Both entities now flip to `Ready` at the same moment.
+
+Once the schedule has fired the sensor holds a steady `Heating` rather than flickering between `Start now` and `Start at HH:MM` as the water temperature oscillates during thermostat cycling.
 
 The sensor works in both directions: if the spa needs to heat up it uses the learned bucket heating rates; if it needs to cool down it uses the learned cooling rate.
 
