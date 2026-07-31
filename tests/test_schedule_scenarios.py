@@ -420,3 +420,89 @@ class TestHeatScheduleDisplay:
             near_target=True, ready_latched=True,
         )
         assert _heat_schedule(c) == "Ready"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# READY AT ETA SLEW — corrections land as bounded ramps, not jumps
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _readiness_sensor(coordinator) -> MSpaReadinessSensor:
+    e = object.__new__(MSpaReadinessSensor)
+    e.coordinator = coordinator
+    e._eta_display = None
+    e._eta_wall = None
+    return e
+
+
+class TestEtaSlew:
+    """The raw ETA corrects in lumps at each temperature crossing and creeps
+    +1 min/min while stale.  The displayed ETA must follow at a bounded rate
+    (3 min per wall minute), snapping only for genuine replans (>30 min)."""
+
+    _BASE = datetime(2026, 7, 31, 10, 0, tzinfo=timezone.utc)
+
+    def test_first_eta_is_taken_verbatim(self):
+        e = _readiness_sensor(MockCoordinator())
+        eta = self._BASE + timedelta(hours=3)
+        assert e._slew_eta(eta, now_utc=self._BASE) == eta
+
+    def test_small_lump_is_ramped_at_capped_rate(self):
+        """A +13 min correction (this morning's typical lump) over one poll
+        minute moves the display by at most 3 minutes."""
+        e = _readiness_sensor(MockCoordinator())
+        eta = self._BASE + timedelta(hours=3)
+        e._slew_eta(eta, now_utc=self._BASE)
+        raw = eta + timedelta(minutes=13)
+        shown = e._slew_eta(raw, now_utc=self._BASE + timedelta(minutes=1))
+        assert shown == eta + timedelta(minutes=3)
+
+    def test_lump_fully_repaid_over_successive_polls(self):
+        e = _readiness_sensor(MockCoordinator())
+        eta = self._BASE + timedelta(hours=3)
+        e._slew_eta(eta, now_utc=self._BASE)
+        raw = eta + timedelta(minutes=13)
+        now = self._BASE
+        for _ in range(5):                      # 5 polls, 1 min apart
+            now += timedelta(minutes=1)
+            shown = e._slew_eta(raw, now_utc=now)
+        assert shown == raw                     # 3+3+3+3+1 = 13
+
+    def test_stale_creep_passes_through_unchanged(self):
+        """+1 min of ETA per 1 min of wall clock is under the cap — the
+        honest 'heating slower than predicted' drift is not distorted."""
+        e = _readiness_sensor(MockCoordinator())
+        eta = self._BASE + timedelta(hours=3)
+        e._slew_eta(eta, now_utc=self._BASE)
+        shown = e._slew_eta(eta + timedelta(minutes=1),
+                            now_utc=self._BASE + timedelta(minutes=1))
+        assert shown == eta + timedelta(minutes=1)
+
+    def test_replan_snaps_immediately(self):
+        """A correction beyond 30 min is a schedule/setpoint change."""
+        e = _readiness_sensor(MockCoordinator())
+        eta = self._BASE + timedelta(hours=3)
+        e._slew_eta(eta, now_utc=self._BASE)
+        raw = eta + timedelta(minutes=45)
+        shown = e._slew_eta(raw, now_utc=self._BASE + timedelta(seconds=30))
+        assert shown == raw
+
+    def test_earlier_corrections_also_capped(self):
+        e = _readiness_sensor(MockCoordinator())
+        eta = self._BASE + timedelta(hours=3)
+        e._slew_eta(eta, now_utc=self._BASE)
+        raw = eta - timedelta(minutes=10)
+        shown = e._slew_eta(raw, now_utc=self._BASE + timedelta(minutes=1))
+        assert shown == eta - timedelta(minutes=3)
+
+    def test_non_eta_state_resets_slew(self):
+        """Reaching Ready (or any non-ETA regime) clears the slew state so the
+        next heating session starts fresh instead of ramping from stale data."""
+        c = MockCoordinator(near_target=True, ready_latched=True,
+                            water_temp=40.0, target_temp=40.0)
+        e = _readiness_sensor(c)
+        e._eta_display = self._BASE            # stale leftover
+        e._eta_wall = self._BASE
+        val = MSpaReadinessSensor.native_value.fget(e)
+        assert val == "Ready"
+        assert e._eta_display is None
+        assert e._eta_wall is None

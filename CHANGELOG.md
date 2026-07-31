@@ -19,9 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Restart mid-scheduled-heating forgot the trigger had fired** *(Experimental)* — `_schedule_triggered` was not persisted, so after a restart the scheduler dropped back to *pending* and computed a fresh start time for a heater that was already running (observed: `Start at 10:38` displayed two hours into an active session, with the trigger set to re-fire and resend the setpoint). The flag is now persisted with the other learning state and restored on startup. If the schedule itself is gone or expired when entities restore — HA down past the target time — the stale flag is cleared so the sensors fall back to the free context instead of reporting a phantom scheduled-heating session.
 
+### Changed
+
+- **Ready at ETA corrections now land as bounded ramps** *(Experimental)* — the live estimate corrects in lumps (each temperature crossing repays the accumulated model error at once, e.g. `12:19 → 12:49`) and creeps +1 min/min while the anchor is stale. The displayed ETA now follows the raw estimate at no more than **3 minutes per wall-clock minute**, so a 13-minute correction renders as a ~4-minute ramp instead of a jump, while the honest +1 min/min stale creep passes through undistorted. Corrections beyond 30 minutes are genuine replans (schedule or setpoint changes) and are followed immediately, as are transitions between display regimes (`Ready`, scheduled time, no data). The `minutes_remaining` and `ready_at` attributes derive from the same smoothed value, so dashboards stay consistent with the state.
+
 ### Internal
 
-- Heating and cooling rate tracking extracted from the update loop into `_track_heating_rate` / `_track_cooling_rate` and covered by 11 new tests, including a regression built from the 2026-07-31 log. Trigger-flag restore semantics covered by 5 further tests.
+- Heating and cooling rate tracking extracted from the update loop into `_track_heating_rate` / `_track_cooling_rate` and covered by 11 new tests, including a regression built from the 2026-07-31 log. Trigger-flag restore semantics covered by 5 further tests. ETA slew behaviour covered by 7 more.
+- `_compute_ready_at_value` split into `_compute_ready_at` (returns display kind + raw ETA datetime) and a formatting wrapper, so the Ready at sensor can slew the ETA while the Heat Schedule sensor keeps the shared, unsmoothed readiness definition.
 - Audited all remaining places that anchor on a reported temperature for the same band-phase blindness. The ETA anchor, the schedule trigger's minutes computation, and the prediction accuracy bookkeeping all read mid-band values at session start — their errors are bounded to half a band, lean conservative (later ETAs, earlier starts), and self-correct at the first crossing, so they are documented rather than changed.
 
 ---

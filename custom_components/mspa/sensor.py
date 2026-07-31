@@ -431,6 +431,15 @@ def _spa_direction(coordinator) -> str | None:
 # Sentinel: distinguishes "state never yet reported" from None (no data).
 _UNSET = object()
 
+# Rate-capped ETA display (Ready at sensor).  Corrections to the live estimate
+# — the lump when a temperature crossing re-anchors, the +1 min/min creep when
+# the anchor is stale — are followed at a bounded pace instead of jumping, so
+# quantization effects land as gentle ramps.  A move larger than the snap
+# threshold is a genuine replan (schedule/setpoint change) and is followed
+# immediately.
+_ETA_SLEW_MIN_PER_MIN = 3.0   # max displayed-ETA movement per wall-clock minute
+_ETA_SNAP_MIN = 30.0          # corrections beyond this snap instead of slewing
+
 
 def _fmt_local(dt_utc: "datetime") -> str:
     """Format a UTC datetime as a local-time string, e.g. '14:30' or '14:30 +1d'."""
@@ -447,14 +456,22 @@ def _sra_utc(coordinator) -> "datetime | None":
     return sra.astimezone(timezone.utc) if sra.tzinfo else sra.replace(tzinfo=timezone.utc)
 
 
-def _compute_ready_at_value(coordinator) -> "str | None":
-    """Return the Ready at sensor display value.
+def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
+    """Return the Ready at state as (kind, dt).
+
+    kind is one of:
+      'ready' — the spa is at the temperature that matters (dt is None)
+      'none'  — no meaningful display (dt is None)
+      'sched' — dt is the scheduled ready time; shown verbatim.  It moves only
+                when the user moves the schedule, so it is never slewed.
+      'eta'   — dt is a live anchor-based estimate; the Ready at sensor slews
+                this for display so corrections land as bounded ramps.
 
     Context determines which target drives the display:
 
       SCHEDULE context (sra_future, not triggered):
-        - If spa is within 1°C of sched_temp  → "Ready" (already there)
-        - Otherwise                            → show scheduled time
+        - If spa is within 1°C of sched_temp  → ready (already there)
+        - Otherwise                            → scheduled time
         near_target/latch are thermostat-relative and irrelevant here —
         the schedule may target a higher temperature than the current setpoint.
 
@@ -462,10 +479,10 @@ def _compute_ready_at_value(coordinator) -> "str | None":
         - Anchor-based ETA to sched_temp (real-time, ignores original plan)
 
       FREE context (no schedule, not triggered):
-        - near_target OR latched OR at_target  → "Ready"
-        - direction=cooling                    → None (no ETA for cooling)
+        - near_target OR latched OR at_target  → ready
+        - direction=cooling                    → none (no ETA for cooling)
         - direction=heating AND heater on      → anchor ETA to thermostat
-        - otherwise                            → None
+        - otherwise                            → none
     """
     now_utc    = datetime.now(timezone.utc)
     latched    = coordinator.ready_latched
@@ -502,10 +519,9 @@ def _compute_ready_at_value(coordinator) -> "str | None":
                 "ready_at → Ready (schedule_pending spa at sched_temp=%.1f water=%.1f)",
                 sched_temp, water,
             )
-            return "Ready"
-        result = _fmt_local(sra)
-        _LOGGER.debug("ready_at → %s (schedule_pending sra=%s)", result, sra.isoformat())
-        return result
+            return ("ready", None)
+        _LOGGER.debug("ready_at → %s (schedule_pending)", sra.isoformat())
+        return ("sched", sra)
 
     # ── SCHEDULED HEATING ─────────────────────────────────────────────────────
     # Trigger fired — predict ETA to schedule target from current anchor.
@@ -516,15 +532,14 @@ def _compute_ready_at_value(coordinator) -> "str | None":
             remaining = (eta - now_utc).total_seconds()
             if remaining <= 300:
                 _LOGGER.debug("ready_at → Ready (scheduled_heating ≤5min)")
-                return "Ready"
-            result = _fmt_local(eta)
+                return ("ready", None)
             _LOGGER.debug(
                 "ready_at → %s (scheduled_heating sched_temp=%.1f remaining=%.0fs)",
-                result, sched_temp, remaining,
+                eta.isoformat(), sched_temp, remaining,
             )
-            return result
+            return ("eta", eta)
         _LOGGER.debug("ready_at → None (scheduled_heating no anchor/rate)")
-        return None
+        return ("none", None)
 
     # ── FREE CONTEXT ──────────────────────────────────────────────────────────
     # No schedule pending or triggered.  Use thermostat-relative state.
@@ -533,12 +548,12 @@ def _compute_ready_at_value(coordinator) -> "str | None":
     if latched or near or direction == "at_target":
         reason = "latched" if latched else ("near_target" if near else "at_target")
         _LOGGER.debug("ready_at → Ready (free ctx: %s)", reason)
-        return "Ready"
+        return ("ready", None)
 
     # COOLING: spa above setpoint, no useful ETA
     if direction in ("cooling", None):
         _LOGGER.debug("ready_at → None (free ctx: direction=%s)", direction)
-        return None
+        return ("none", None)
 
     # FREE HEATING: heater on, predict ETA to thermostat setpoint
     if heater_on:
@@ -552,17 +567,31 @@ def _compute_ready_at_value(coordinator) -> "str | None":
                 remaining = (eta - now_utc).total_seconds()
                 if remaining <= 300:
                     _LOGGER.debug("ready_at → Ready (free_heating ≤5min)")
-                    return "Ready"
-                result = _fmt_local(eta)
+                    return ("ready", None)
                 _LOGGER.debug(
                     "ready_at → %s (free_heating thermostat=%.1f remaining=%.0fs)",
-                    result, thermostat, remaining,
+                    eta.isoformat(), thermostat, remaining,
                 )
-                return result
+                return ("eta", eta)
         _LOGGER.debug("ready_at → None (free_heating no anchor/rate/thermostat)")
-        return None
+        return ("none", None)
 
     _LOGGER.debug("ready_at → None (free ctx: heater_off no applicable state)")
+    return ("none", None)
+
+
+def _compute_ready_at_value(coordinator) -> "str | None":
+    """Return the Ready at display value (unsmoothed).
+
+    Formatting wrapper over _compute_ready_at.  Used directly by the Heat
+    Schedule sensor for the shared readiness definition; the Ready at sensor
+    itself goes through _compute_ready_at so it can slew the live ETA.
+    """
+    kind, dt = _compute_ready_at(coordinator)
+    if kind == "ready":
+        return "Ready"
+    if dt is not None:
+        return _fmt_local(dt)
     return None
 
 
@@ -689,6 +718,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         super().__init__(coordinator)
         self._attr_unique_id = f"mspa_readiness_{getattr(coordinator, 'device_id', 'unknown')}"
         self._attr_device_info = self.device_info
+        self._eta_display: "datetime | None" = None   # slewed ETA shown to the user
+        self._eta_wall: "datetime | None" = None      # wall clock of last slew step
 
     @property
     def available(self):
@@ -697,9 +728,43 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         # Available whenever we have enough data to determine a state.
         return _spa_direction(self.coordinator) is not None or self.coordinator.ready_latched
 
+    def _slew_eta(self, raw_eta, now_utc=None):
+        """Move the displayed ETA toward raw_eta at a bounded rate.
+
+        The raw estimate corrects in lumps (each temperature crossing repays
+        the accumulated model error at once) and creeps +1 min/min while the
+        anchor is stale.  The displayed value follows at no more than
+        _ETA_SLEW_MIN_PER_MIN per wall-clock minute, so both effects render
+        as bounded ramps.  A correction beyond _ETA_SNAP_MIN is a genuine
+        replan (schedule or setpoint change) and is followed immediately.
+        """
+        now = now_utc or datetime.now(timezone.utc)
+        if self._eta_display is None or self._eta_wall is None:
+            self._eta_display = raw_eta
+        else:
+            delta_min = (raw_eta - self._eta_display).total_seconds() / 60.0
+            if abs(delta_min) > _ETA_SNAP_MIN:
+                self._eta_display = raw_eta
+            else:
+                dt_min = max((now - self._eta_wall).total_seconds() / 60.0, 0.0)
+                cap = _ETA_SLEW_MIN_PER_MIN * dt_min
+                step = min(max(delta_min, -cap), cap)
+                self._eta_display = self._eta_display + timedelta(minutes=step)
+        self._eta_wall = now
+        return self._eta_display
+
     @property
     def native_value(self):
-        val = _compute_ready_at_value(self.coordinator)
+        kind, dt = _compute_ready_at(self.coordinator)
+        if kind == "eta" and dt is not None:
+            val = _fmt_local(self._slew_eta(dt))
+        else:
+            # Ready / none / scheduled time: exact displays — no slewing, and
+            # the slew state resets so the next ETA regime starts fresh.
+            self._eta_display = None
+            self._eta_wall = None
+            val = ("Ready" if kind == "ready"
+                   else _fmt_local(dt) if dt is not None else None)
         prev = getattr(self, "_logged_state", _UNSET)
         if val != prev:
             _log_readiness_change(self.coordinator, prev, val)
@@ -716,6 +781,14 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         latched = self.coordinator.ready_latched
         cooling = direction == "cooling"
         mins = _minutes_to_target(self.coordinator)
+        # Keep the attributes consistent with the slewed state display: when a
+        # smoothed ETA is being shown, minutes_remaining and ready_at derive
+        # from it rather than from the raw anchor estimate.
+        smoothed = self._eta_display
+        if smoothed is not None and not latched and not cooling:
+            mins = max(0, round(
+                (smoothed - datetime.now(timezone.utc)).total_seconds() / 60
+            ))
         rounded = (round(mins / 5) * 5) if (mins is not None and mins > 5 and not cooling) else (None if cooling else mins)
         if latched:
             color = "green"
@@ -735,6 +808,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         now_utc = datetime.now(timezone.utc)
         if latched or cooling:
             ready_at_utc = None
+        elif smoothed is not None:
+            ready_at_utc = smoothed
         elif target_temp is not None and direction == "heating":
             ready_at_utc = _anchor_eta_utc(self.coordinator, target_temp, now_utc)
         else:
