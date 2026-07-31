@@ -148,3 +148,65 @@ class TestChangedValue:
         assert c._schedule_triggered is False
         assert c.ready_latched is False
         assert c.listeners_pushed == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Restart restore: the persisted trigger flag must survive only with a schedule
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _FakeState:
+    def __init__(self, state: str):
+        self.state = state
+
+
+class TestRestoreTriggerFlag:
+    """A restart mid-scheduled-heating restores _schedule_triggered from the
+    store.  The datetime entity's restore path then has the final word: keep
+    the flag only when a future schedule is also restored; otherwise the flag
+    refers to a session whose schedule is gone (expired while HA was down)
+    and must be cleared."""
+
+    def _restore_entity(self, coord, last_state, now, parsed=None):
+        from unittest.mock import patch
+        e = _entity(coord)
+
+        async def fake_last_state():
+            return last_state
+
+        e.async_get_last_state = fake_last_state
+        with patch("custom_components.mspa.datetime.dt_util") as mock_dt:
+            mock_dt.parse_datetime.side_effect = lambda s: parsed
+            mock_dt.now.return_value = now
+            _run(e.async_added_to_hass())
+        return e
+
+    def test_future_schedule_keeps_trigger_flag(self):
+        """Restart during a scheduled heat-up resumes as Heating."""
+        c = _Coord(triggered=True)
+        future = _T + timedelta(hours=4)
+        self._restore_entity(c, _FakeState(future.isoformat()), now=_T, parsed=future)
+        assert c.scheduled_ready_at == future
+        assert c._schedule_triggered is True
+
+    def test_expired_schedule_clears_stale_trigger_flag(self):
+        """HA down past the target time: no phantom scheduled-heating session."""
+        c = _Coord(triggered=True)
+        past = _T - timedelta(hours=4)
+        self._restore_entity(c, _FakeState(past.isoformat()), now=_T, parsed=past)
+        assert c.scheduled_ready_at is None
+        assert c._schedule_triggered is False
+
+    def test_no_prior_state_clears_stale_trigger_flag(self):
+        c = _Coord(triggered=True)
+        self._restore_entity(c, None, now=_T)
+        assert c._schedule_triggered is False
+
+    def test_unknown_state_clears_stale_trigger_flag(self):
+        c = _Coord(triggered=True)
+        self._restore_entity(c, _FakeState("unknown"), now=_T)
+        assert c._schedule_triggered is False
+
+    def test_untriggered_restore_stays_untriggered(self):
+        c = _Coord(triggered=False)
+        self._restore_entity(c, None, now=_T)
+        assert c._schedule_triggered is False

@@ -17,9 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Cooling rate learning had the same phase defect, amplified** *(Experimental)* — the cooling anchor is re-armed every time the heater stops, i.e. on *every thermostat cycle*, so each off-period injected one phase-biased (fast) sample into the cooling EMA. The same two-crossings rule now applies: the first temperature change after heater-off fixes the position, the second is the first learned cooling rate. A first *upward* change (sun warming the water) also consumes the guard, since any crossing lands the anchor exactly on a band boundary.
 
+- **Restart mid-scheduled-heating forgot the trigger had fired** *(Experimental)* — `_schedule_triggered` was not persisted, so after a restart the scheduler dropped back to *pending* and computed a fresh start time for a heater that was already running (observed: `Start at 10:38` displayed two hours into an active session, with the trigger set to re-fire and resend the setpoint). The flag is now persisted with the other learning state and restored on startup. If the schedule itself is gone or expired when entities restore — HA down past the target time — the stale flag is cleared so the sensors fall back to the free context instead of reporting a phantom scheduled-heating session.
+
 ### Internal
 
-- Heating and cooling rate tracking extracted from the update loop into `_track_heating_rate` / `_track_cooling_rate` and covered by 11 new tests, including a regression built from the 2026-07-31 log.
+- Heating and cooling rate tracking extracted from the update loop into `_track_heating_rate` / `_track_cooling_rate` and covered by 11 new tests, including a regression built from the 2026-07-31 log. Trigger-flag restore semantics covered by 5 further tests.
 - Audited all remaining places that anchor on a reported temperature for the same band-phase blindness. The ETA anchor, the schedule trigger's minutes computation, and the prediction accuracy bookkeeping all read mid-band values at session start — their errors are bounded to half a band, lean conservative (later ETAs, earlier starts), and self-correct at the first crossing, so they are documented rather than changed.
 
 ---

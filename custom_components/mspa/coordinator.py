@@ -522,6 +522,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     # Restore in-progress prediction so a restart mid-heatup doesn't
                     # drop the session from the learning history.
                     self._prediction = stored.get("active_prediction")
+                    # Restore the schedule trigger state so a restart during a
+                    # scheduled heat-up resumes as "Heating" rather than
+                    # re-planning a start for a heater that is already running.
+                    # If the schedule turns out to be gone or expired, the
+                    # datetime entity's restore path clears this again.
+                    self._schedule_triggered = bool(
+                        stored.get("schedule_triggered", False)
+                    )
                     if self._prediction:
                         _LOGGER.info(
                             "Restored in-progress prediction: %.1f°C → %.1f°C (started %s)",
@@ -619,6 +627,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "prediction_history": self._prediction_history,
                 "prediction_bias": self.prediction_bias,
                 "active_prediction": self._prediction,
+                # Persisted so a restart mid-scheduled-heating resumes as
+                # "Heating" instead of dropping back to pending and re-firing.
+                "schedule_triggered": self._schedule_triggered,
                 "ambient_baseline": self.ambient_baseline,
                 "temp_anchor_time": (
                     self.temp_anchor_time.isoformat()

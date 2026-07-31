@@ -131,10 +131,12 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        restored_future = False
         last_state = await self.async_get_last_state()
         if last_state and last_state.state not in ("unknown", "unavailable"):
             restored = dt_util.parse_datetime(last_state.state)
             if restored is not None and restored > dt_util.now():
+                restored_future = True
                 self.coordinator.scheduled_ready_at = restored
                 sched_temp = getattr(self.coordinator, "schedule_target_temp", None)
                 _LOGGER.info(
@@ -142,3 +144,13 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
                     restored.strftime("%Y-%m-%d %H:%M"),
                     sched_temp or 0.0,
                 )
+        if not restored_future and getattr(self.coordinator, "_schedule_triggered", False):
+            # The persisted trigger flag belongs to a schedule that no longer
+            # exists (it expired while HA was down, or the state was lost).
+            # Clear it so the sensors fall back to the free context instead of
+            # reporting a phantom scheduled-heating session.
+            self.coordinator._schedule_triggered = False
+            _LOGGER.info(
+                "Heat schedule: cleared stale trigger flag — no restorable "
+                "future schedule found"
+            )
