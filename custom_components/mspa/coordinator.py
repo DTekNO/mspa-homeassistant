@@ -48,6 +48,14 @@ from homeassistant.const import ATTR_STATE, ATTR_TEMPERATURE
 
 _LOGGER = logging.getLogger(__name__)
 
+# Rate-sampling constants (heating and cooling trackers).
+# Bounds are intentionally generous: even a tiny spa at max power can't exceed
+# ~5 °C/h, and below the minimum the signal is just sensor noise / drift.
+_MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
+_MIN_HEAT_RATE = 0.05             # °C/h — below this is noise / flat
+_MAX_HEAT_RATE = 3.0              # °C/h — above this is an outlier
+_EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
+
 # Maps coordinator _pending_changes keys (transformed names) to their raw API
 # command dict keys.  Used to prune _pending_raw_command incrementally as each
 # pending change is confirmed, so that a retry payload never re-sends fields
@@ -181,6 +189,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.computed_heat_rate: float | None = None  # °C/h, None until enough data
         self._rate_last_temp: float | None = None     # °C at last accepted sample
         self._rate_last_time: float | None = None     # monotonic seconds at last sample
+        # True while the rate anchor is phase-uncertain: the temperature reports
+        # in 0.5 °C bands, so at heater-on the water sits at an unknown position
+        # inside its band.  The FIRST crossing after heater-on measures that
+        # random phase, not the heating rate (it reads ~2x fast on average), so
+        # it re-anchors only; learning starts from the second crossing.
+        self._rate_first_step: bool = False
 
         # Per-temperature-bucket heating EMAs for improved long-range accuracy.
         # Bucket 0: T < 30°C  (cold water, minimal thermal losses — fastest)
@@ -206,6 +220,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Sampled when the heater is off and water temperature is actually dropping.
         self.computed_cool_rate: float | None = None  # °C/h, None until enough data
         self._cool_last_temp: float | None = None     # °C at last accepted sample
+        self._cool_first_step: bool = False           # phase-uncertain anchor guard
         self._cool_last_time: float | None = None     # monotonic seconds at last sample
 
         # Persist learned rates across reloads / HA restarts.
@@ -551,15 +566,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         self.computed_cool_rate or 0,
                     )
 
-            # --- Observed heating rate tracking ---
-            # Only sample when in full-heat mode to avoid preheat / cooling skew.
-            # Bounds are intentionally generous: even a tiny spa at max power can't
-            # exceed ~5 °C/h, and below 0.05 °C/h the signal is just sensor noise.
-            _MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
-            _MIN_HEAT_RATE = 0.05             # °C/h  — below this is noise / flat
-            _MAX_HEAT_RATE = 3.0              # °C/h  — above this is an outlier (no real spa heats faster than ~2.5°C/h)
-            _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
-
+            # --- Observed heating rate tracking (see _track_heating_rate) ---
             curr_temp = transformed_data.get("water_temperature")
             heat_state = transformed_data.get("heat_state")
             now_mono = time.monotonic()
@@ -596,126 +603,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 )
                 self._prediction = None
 
-            if heat_state == 3 and curr_temp is not None:
-                if self._rate_last_temp is None:
-                    # First poll in heat mode — set anchor, no sample yet
-                    self._rate_last_temp = curr_temp
-                    self._rate_last_time = now_mono
-                elif curr_temp != self._rate_last_temp:
-                    # Temperature has changed — elapsed time since anchor is the true
-                    # duration of the previous 0.5 °C step, giving a real rate.
-                    elapsed_hours = (now_mono - self._rate_last_time) / 3600
-                    if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
-                        delta = curr_temp - self._rate_last_temp
-                        rate = delta / elapsed_hours  # guarded: elapsed_hours > 0
-                        if _MIN_HEAT_RATE <= rate <= _MAX_HEAT_RATE:
-                            if self.computed_heat_rate is None:
-                                self.computed_heat_rate = rate
-                            else:
-                                self.computed_heat_rate = (
-                                    _EMA_ALPHA * rate
-                                    + (1 - _EMA_ALPHA) * self.computed_heat_rate
-                                )
-                            # Also update the temperature bucket for this observation.
-                            # _rate_last_temp is the *start* temperature of the step.
-                            _bi = 0 if self._rate_last_temp < 30.0 else 1 if self._rate_last_temp < 37.0 else 2
-                            _bp = self.heat_rate_buckets[_bi]
-                            self.heat_rate_buckets[_bi] = (
-                                _EMA_ALPHA * rate + (1 - _EMA_ALPHA) * _bp
-                            ) if _bp is not None else rate
-                            self._session_fresh_buckets.add(_bi)
-                            # Track the baseline outdoor temperature under which
-                            # rates are being learned, so the ambient correction
-                            # knows what "normal" looks like for this spa.  Slow
-                            # EMA so it reflects the seasonal norm, not one night.
-                            # Seed from a neutral default (not the first, possibly
-                            # cold, reading) so a cold night registers as
-                            # below-normal immediately rather than after the EMA
-                            # slowly drifts up.
-                            if self.ambient_temp is not None:
-                                base = (
-                                    self.ambient_baseline
-                                    if self.ambient_baseline is not None
-                                    else AMBIENT_BASELINE_DEFAULT
-                                )
-                                self.ambient_baseline = (
-                                    AMBIENT_BASELINE_ALPHA * self.ambient_temp
-                                    + (1 - AMBIENT_BASELINE_ALPHA) * base
-                                )
-                            # The first bucket to receive data in this session becomes
-                            # the scalar source.  Its observations are compared against
-                            # the stored base to derive an ambient-condition factor that
-                            # is applied to all *other* buckets that haven't been
-                            # observed yet this session.
-                            if self._session_scalar_bucket is None and _bp is not None:
-                                self._session_scalar_bucket = _bi
-                            if _bi == self._session_scalar_bucket and _bp is not None:
-                                ratio = max(0.5, min(2.0, rate / _bp))
-                                self._session_scalar = 0.4 * ratio + 0.6 * self._session_scalar
-                                _LOGGER.debug(
-                                    "Session scalar → %.3f (bucket[%d] ratio actual/base=%.3f)",
-                                    self._session_scalar, _bi, ratio,
-                                )
-                            _LOGGER.debug(
-                                "Heat rate sample %.3f °C/h (EMA → %.3f °C/h, bucket[%d] → %.3f °C/h)",
-                                rate, self.computed_heat_rate,
-                                _bi, self.heat_rate_buckets[_bi],
-                            )
-                        else:
-                            _LOGGER.debug(
-                                "Heat rate sample %.3f °C/h rejected (out of bounds)", rate
-                            )
-                    # Always advance anchor to new temperature (even if rate rejected).
-                    # This prevents a rejected outlier span from being re-used.
-                    self._rate_last_temp = curr_temp
-                    self._rate_last_time = now_mono
-                # else: temperature unchanged — let elapsed time accumulate, don’t touch anchor
-            else:
-                # Heater off/preheat — reset anchor so next on-cycle starts fresh
-                self._rate_last_temp = None
-                self._rate_last_time = None
+            self._track_heating_rate(curr_temp, heat_state, now_mono)
 
-            # --- Observed cooling rate tracking ---
-            # Sample passively when heater is not active and temperature is dropping.
-            _MIN_COOL_RATE = 0.01  # °C/h — below this is sensor drift
-            _MAX_COOL_RATE = 3.0   # °C/h — above this is unusual for an insulated spa
-
-            if heat_state not in (2, 3) and curr_temp is not None:
-                if self._cool_last_temp is None:
-                    # First poll in cooling mode — set anchor, no sample yet
-                    self._cool_last_temp = curr_temp
-                    self._cool_last_time = now_mono
-                elif curr_temp != self._cool_last_temp:
-                    # Temperature has changed — compute rate only for drops.
-                    elapsed_hours = (now_mono - self._cool_last_time) / 3600
-                    if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
-                        delta = curr_temp - self._cool_last_temp
-                        if delta < 0:  # temperature actually dropped
-                            rate = -delta / elapsed_hours  # positive °C/h
-                            if _MIN_COOL_RATE <= rate <= _MAX_COOL_RATE:
-                                if self.computed_cool_rate is None:
-                                    self.computed_cool_rate = rate
-                                else:
-                                    self.computed_cool_rate = (
-                                        _EMA_ALPHA * rate
-                                        + (1 - _EMA_ALPHA) * self.computed_cool_rate
-                                    )
-                                _LOGGER.debug(
-                                    "Cool rate sample %.3f °C/h (EMA → %.3f °C/h)",
-                                    rate, self.computed_cool_rate,
-                                )
-                            else:
-                                _LOGGER.debug(
-                                    "Cool rate sample %.3f °C/h rejected (out of bounds)", rate
-                                )
-                    # Always advance anchor on any temperature change (rise or drop).
-                    self._cool_last_temp = curr_temp
-                    self._cool_last_time = now_mono
-                # else: temperature unchanged — let elapsed time accumulate
-            else:
-                # Actively heating — reset cooling anchor so next off-cycle starts fresh
-                self._cool_last_temp = None
-                self._cool_last_time = None
+            # --- Observed cooling rate tracking (see _track_cooling_rate) ---
+            self._track_cooling_rate(curr_temp, heat_state, now_mono)
             # --- end rate tracking ---
 
             # Persist updated rates so they survive reloads and HA restarts.
@@ -772,6 +663,178 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Error updating MSpa data: %s", str(err))
             raise UpdateFailed(f"Update failed: {str(err)}")
 
+    def _track_heating_rate(self, curr_temp, heat_state, now_mono: float) -> None:
+        """Sample the observed heating rate from 0.5 °C temperature steps.
+
+        Only samples in full-heat mode (heat_state == 3) to avoid preheat and
+        cooling skew.
+
+        The first crossing after the heater engages is phase-uncertain: the
+        temperature reports in 0.5 °C bands, so the anchor set at heater-on
+        sits at an unknown position inside its band and the time to the first
+        crossing measures that random phase, not the rate (~2x fast on
+        average, arbitrarily fast when the water started near a boundary).
+        That crossing re-anchors only — the anchor is then exactly on a band
+        boundary — and learning starts from the second crossing, where every
+        step runs boundary-to-boundary and is a true rate.
+        """
+        if heat_state == 3 and curr_temp is not None:
+            if self._rate_last_temp is None:
+                # First poll in heat mode — set a phase-uncertain anchor.
+                self._rate_last_temp = curr_temp
+                self._rate_last_time = now_mono
+                self._rate_first_step = True
+            elif curr_temp != self._rate_last_temp:
+                if self._rate_first_step:
+                    # First crossing: position information only.  Keep the
+                    # existing learned rates driving the estimates.
+                    _LOGGER.debug(
+                        "Heat rate: first crossing %.1f→%.1f°C after heater-on "
+                        "is phase-uncertain — anchored, not learned",
+                        self._rate_last_temp, curr_temp,
+                    )
+                    self._rate_first_step = False
+                    self._rate_last_temp = curr_temp
+                    self._rate_last_time = now_mono
+                    return
+                # Temperature has changed — elapsed time since anchor is the true
+                # duration of the previous 0.5 °C step, giving a real rate.
+                elapsed_hours = (now_mono - self._rate_last_time) / 3600
+                if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
+                    delta = curr_temp - self._rate_last_temp
+                    rate = delta / elapsed_hours  # guarded: elapsed_hours > 0
+                    if _MIN_HEAT_RATE <= rate <= _MAX_HEAT_RATE:
+                        if self.computed_heat_rate is None:
+                            self.computed_heat_rate = rate
+                        else:
+                            self.computed_heat_rate = (
+                                _EMA_ALPHA * rate
+                                + (1 - _EMA_ALPHA) * self.computed_heat_rate
+                            )
+                        # Also update the temperature bucket for this observation.
+                        # _rate_last_temp is the *start* temperature of the step.
+                        _bi = 0 if self._rate_last_temp < 30.0 else 1 if self._rate_last_temp < 37.0 else 2
+                        _bp = self.heat_rate_buckets[_bi]
+                        self.heat_rate_buckets[_bi] = (
+                            _EMA_ALPHA * rate + (1 - _EMA_ALPHA) * _bp
+                        ) if _bp is not None else rate
+                        self._session_fresh_buckets.add(_bi)
+                        # Track the baseline outdoor temperature under which
+                        # rates are being learned, so the ambient correction
+                        # knows what "normal" looks like for this spa.  Slow
+                        # EMA so it reflects the seasonal norm, not one night.
+                        # Seed from a neutral default (not the first, possibly
+                        # cold, reading) so a cold night registers as
+                        # below-normal immediately rather than after the EMA
+                        # slowly drifts up.
+                        if self.ambient_temp is not None:
+                            base = (
+                                self.ambient_baseline
+                                if self.ambient_baseline is not None
+                                else AMBIENT_BASELINE_DEFAULT
+                            )
+                            self.ambient_baseline = (
+                                AMBIENT_BASELINE_ALPHA * self.ambient_temp
+                                + (1 - AMBIENT_BASELINE_ALPHA) * base
+                            )
+                        # The first bucket to receive data in this session becomes
+                        # the scalar source.  Its observations are compared against
+                        # the stored base to derive an ambient-condition factor that
+                        # is applied to all *other* buckets that haven't been
+                        # observed yet this session.
+                        if self._session_scalar_bucket is None and _bp is not None:
+                            self._session_scalar_bucket = _bi
+                        if _bi == self._session_scalar_bucket and _bp is not None:
+                            ratio = max(0.5, min(2.0, rate / _bp))
+                            self._session_scalar = 0.4 * ratio + 0.6 * self._session_scalar
+                            _LOGGER.debug(
+                                "Session scalar → %.3f (bucket[%d] ratio actual/base=%.3f)",
+                                self._session_scalar, _bi, ratio,
+                            )
+                        _LOGGER.debug(
+                            "Heat rate sample %.3f °C/h (EMA → %.3f °C/h, bucket[%d] → %.3f °C/h)",
+                            rate, self.computed_heat_rate,
+                            _bi, self.heat_rate_buckets[_bi],
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Heat rate sample %.3f °C/h rejected (out of bounds)", rate
+                        )
+                # Always advance anchor to new temperature (even if rate rejected).
+                # This prevents a rejected outlier span from being re-used.
+                self._rate_last_temp = curr_temp
+                self._rate_last_time = now_mono
+            # else: temperature unchanged — let elapsed time accumulate, don't touch anchor
+        else:
+            # Heater off/preheat — reset anchor so next on-cycle starts fresh
+            # (and the next first crossing is treated as phase-uncertain again).
+            self._rate_last_temp = None
+            self._rate_last_time = None
+            self._rate_first_step = False
+
+    def _track_cooling_rate(self, curr_temp, heat_state, now_mono: float) -> None:
+        """Sample the passive cooling rate from temperature drops.
+
+        Subject to the same phase-uncertainty rule as heating: the anchor set
+        when the heater stops is a 0.5 °C band value at an unknown internal
+        position, so the first crossing re-anchors only and learning starts
+        from the second.  This matters more here than for heating, because
+        thermostat cycling re-arms the anchor on every heater cycle — each
+        cycle previously injected one phase-biased (fast) sample into the
+        cooling EMA.
+        """
+        _MIN_COOL_RATE = 0.01  # °C/h — below this is sensor drift
+        _MAX_COOL_RATE = 3.0   # °C/h — above this is unusual for an insulated spa
+
+        if heat_state not in (2, 3) and curr_temp is not None:
+            if self._cool_last_temp is None:
+                # First poll in cooling mode — set a phase-uncertain anchor.
+                self._cool_last_temp = curr_temp
+                self._cool_last_time = now_mono
+                self._cool_first_step = True
+            elif curr_temp != self._cool_last_temp and self._cool_first_step:
+                # First crossing since the heater stopped: position only.
+                _LOGGER.debug(
+                    "Cool rate: first crossing %.1f→%.1f°C after heater-off "
+                    "is phase-uncertain — anchored, not learned",
+                    self._cool_last_temp, curr_temp,
+                )
+                self._cool_first_step = False
+                self._cool_last_temp = curr_temp
+                self._cool_last_time = now_mono
+            elif curr_temp != self._cool_last_temp:
+                # Temperature has changed — compute rate only for drops.
+                elapsed_hours = (now_mono - self._cool_last_time) / 3600
+                if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
+                    delta = curr_temp - self._cool_last_temp
+                    if delta < 0:  # temperature actually dropped
+                        rate = -delta / elapsed_hours  # positive °C/h
+                        if _MIN_COOL_RATE <= rate <= _MAX_COOL_RATE:
+                            if self.computed_cool_rate is None:
+                                self.computed_cool_rate = rate
+                            else:
+                                self.computed_cool_rate = (
+                                    _EMA_ALPHA * rate
+                                    + (1 - _EMA_ALPHA) * self.computed_cool_rate
+                                )
+                            _LOGGER.debug(
+                                "Cool rate sample %.3f °C/h (EMA → %.3f °C/h)",
+                                rate, self.computed_cool_rate,
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "Cool rate sample %.3f °C/h rejected (out of bounds)", rate
+                            )
+                # Always advance anchor on any temperature change (rise or drop).
+                self._cool_last_temp = curr_temp
+                self._cool_last_time = now_mono
+            # else: temperature unchanged — let elapsed time accumulate
+        else:
+            # Actively heating — reset cooling anchor so next off-cycle starts
+            # fresh (its first crossing will again be phase-uncertain).
+            self._cool_last_temp = None
+            self._cool_last_time = None
+            self._cool_first_step = False
 
     async def _check_schedule_trigger(
         self, current_temp: float | None, current_target: float | None

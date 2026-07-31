@@ -1,0 +1,156 @@
+"""Tests for MSpaUpdateCoordinator._track_heating_rate.
+
+Focus: the first temperature crossing after heater-on is phase-uncertain.
+The water temperature reports in 0.5 °C bands, so the anchor set at heater-on
+sits at an unknown position inside its band — the time to the first crossing
+measures that random phase, not the heating rate (~2x fast on average).  The
+first crossing must therefore anchor only; learning starts from the second.
+
+Regression source: 2026-07-31 morning session.  Heater on at 07:27 with water
+"33.0" (truly ~33.4); first crossing to 33.5 arrived after 11 minutes and was
+learned as 2.7 °C/h, dragging the EMA 0.89 → 1.35 °C/h and collapsing the
+Ready at estimate from 15:34 to 12:16 against a 15:30 schedule.
+
+Run with: python -m pytest tests/test_rate_learning.py -v
+"""
+from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+
+
+def _coord(**overrides) -> MSpaUpdateCoordinator:
+    c = object.__new__(MSpaUpdateCoordinator)
+    c.computed_heat_rate = 0.89
+    c.heat_rate_buckets = [None, 1.30, None]
+    c._rate_last_temp = None
+    c._rate_last_time = None
+    c._rate_first_step = False
+    c._session_scalar = 1.0
+    c._session_scalar_bucket = None
+    c._session_fresh_buckets = set()
+    c.ambient_temp = None
+    c.ambient_baseline = None
+    for k, v in overrides.items():
+        setattr(c, k, v)
+    return c
+
+
+_MIN = 60.0  # seconds
+
+
+class TestFirstStepPhaseUncertainty:
+
+    def test_first_crossing_is_not_learned(self):
+        """The 2026-07-31 regression: 0.5 °C in 11 min (2.7 °C/h) at heater-on."""
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)              # heater-on anchor
+        c._track_heating_rate(33.5, 3, 11 * _MIN)        # first crossing — fast
+        assert c.computed_heat_rate == 0.89, "phantom rate must not be learned"
+        assert c.heat_rate_buckets[1] == 1.30
+        assert c._session_scalar == 1.0
+        assert 1 not in c._session_fresh_buckets
+
+    def test_first_crossing_reanchors_exactly(self):
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 11 * _MIN)
+        assert c._rate_last_temp == 33.5
+        assert c._rate_last_time == 11 * _MIN
+        assert c._rate_first_step is False
+
+    def test_second_crossing_is_learned(self):
+        """33.5 → 34.0 in 25.5 min = 1.18 °C/h — the first true sample."""
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 11 * _MIN)
+        c._track_heating_rate(34.0, 3, (11 + 25.5) * _MIN)
+        expected_rate = 0.5 / (25.5 / 60)                # ≈ 1.176 °C/h
+        expected_ema = 0.25 * expected_rate + 0.75 * 0.89
+        assert abs(c.computed_heat_rate - expected_ema) < 1e-9
+        assert 1 in c._session_fresh_buckets
+
+    def test_heater_interruption_rearms_the_guard(self):
+        """Any off/preheat period loses the phase — the next crossing must
+        again be treated as position-only."""
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 11 * _MIN)        # guard consumed
+        c._track_heating_rate(33.5, 2, 12 * _MIN)        # preheat: anchor reset
+        c._track_heating_rate(33.5, 3, 13 * _MIN)        # heater back on
+        c._track_heating_rate(34.0, 3, 18 * _MIN)        # fast "crossing" again
+        assert c.computed_heat_rate == 0.89, "post-interruption crossing must not be learned"
+
+    def test_third_and_later_crossings_keep_learning(self):
+        c = _coord()
+        t = 0.0
+        c._track_heating_rate(33.0, 3, t)
+        t += 11 * _MIN; c._track_heating_rate(33.5, 3, t)
+        t += 25.5 * _MIN; c._track_heating_rate(34.0, 3, t)
+        after_second = c.computed_heat_rate
+        t += 31.5 * _MIN; c._track_heating_rate(34.5, 3, t)
+        assert c.computed_heat_rate != after_second, "third crossing must be learned"
+
+    def test_outlier_rejection_still_applies_after_guard(self):
+        """A genuinely absurd second step (>3 °C/h) is still rejected."""
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 11 * _MIN)
+        c._track_heating_rate(34.0, 3, (11 + 8) * _MIN)  # 0.5°C in 8 min = 3.75 °C/h
+        assert c.computed_heat_rate == 0.89
+
+    def test_dwell_without_crossing_never_learns(self):
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.0, 3, 30 * _MIN)
+        c._track_heating_rate(33.0, 3, 60 * _MIN)
+        assert c.computed_heat_rate == 0.89
+        assert c._rate_first_step is True
+
+
+class TestCoolingFirstStepPhaseUncertainty:
+    """The cooling tracker has the same phase problem, amplified: its anchor
+    re-arms on every thermostat cycle, so each heater off-period previously
+    injected one phase-biased fast sample into the cooling EMA."""
+
+    def _cool_coord(self, **overrides):
+        c = _coord()
+        c.computed_cool_rate = 0.20
+        c._cool_last_temp = None
+        c._cool_last_time = None
+        c._cool_first_step = False
+        for k, v in overrides.items():
+            setattr(c, k, v)
+        return c
+
+    def test_first_drop_after_heater_off_is_not_learned(self):
+        c = self._cool_coord()
+        c._track_cooling_rate(39.5, 0, 0.0)              # heater stopped: anchor
+        c._track_cooling_rate(39.0, 0, 30 * _MIN)        # first drop — phase-biased
+        assert c.computed_cool_rate == 0.20
+
+    def test_second_drop_is_learned(self):
+        c = self._cool_coord()
+        c._track_cooling_rate(39.5, 0, 0.0)
+        c._track_cooling_rate(39.0, 0, 30 * _MIN)
+        c._track_cooling_rate(38.5, 0, (30 + 90) * _MIN)  # 0.5°C in 90 min
+        expected_rate = 0.5 / 1.5                         # 0.333 °C/h
+        expected_ema = 0.25 * expected_rate + 0.75 * 0.20
+        assert abs(c.computed_cool_rate - expected_ema) < 1e-9
+
+    def test_thermostat_cycle_rearms_the_guard(self):
+        c = self._cool_coord()
+        c._track_cooling_rate(39.5, 0, 0.0)
+        c._track_cooling_rate(39.0, 0, 30 * _MIN)         # guard consumed
+        c._track_cooling_rate(39.0, 3, 31 * _MIN)         # heater cycles on
+        c._track_cooling_rate(39.5, 0, 60 * _MIN)         # heater off again: new anchor
+        c._track_cooling_rate(39.0, 0, 75 * _MIN)         # fast first drop again
+        assert c.computed_cool_rate == 0.20, "per-cycle first drop must not be learned"
+
+    def test_rise_also_consumes_the_guard(self):
+        """Any first crossing fixes the phase — including an upward one
+        (e.g. sun warming the water) — after which a drop is a true rate."""
+        c = self._cool_coord()
+        c._track_cooling_rate(39.0, 0, 0.0)
+        c._track_cooling_rate(39.5, 0, 20 * _MIN)         # rise: guard consumed, no sample
+        assert c.computed_cool_rate == 0.20
+        c._track_cooling_rate(39.0, 0, (20 + 120) * _MIN) # drop in 2 h = 0.25 °C/h
+        expected_ema = 0.25 * 0.25 + 0.75 * 0.20
+        assert abs(c.computed_cool_rate - expected_ema) < 1e-9

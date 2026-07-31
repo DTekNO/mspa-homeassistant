@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **First temperature step after heater-on poisoned the rate model** *(Experimental)* — the water temperature reports in 0.5 °C bands, so at heater-on the true temperature sits at an unknown position inside its band. The time to the *first* band crossing measures that random starting position, not the heating rate — on average it reads twice the true rate, and arbitrarily fast when the water started near a boundary. That phantom sample was fed into the rate EMA, the temperature bucket, and the session scalar at the start of every scheduled session, systematically re-teaching the model optimistic rates each morning.
+
+  Observed 2026-07-31: heater on at 07:27 with water reported 33.0 °C; the crossing to 33.5 °C arrived after 11 minutes and was learned as 2.7 °C/h, dragging the rate EMA from 0.89 to 1.35 °C/h and collapsing the Ready at estimate from 15:34 to 12:16 against a 15:30 schedule — which it then spent the whole morning walking back, thirty minutes at a time.
+
+  The first crossing after heater-on (or after any heating interruption) now re-anchors only — it is exact *position* information, placing the anchor precisely on a band boundary — and rate learning starts from the second crossing, where every step runs boundary-to-boundary and measures a true rate. Until then the previously learned rates keep driving the estimates.
+
+- **Cooling rate learning had the same phase defect, amplified** *(Experimental)* — the cooling anchor is re-armed every time the heater stops, i.e. on *every thermostat cycle*, so each off-period injected one phase-biased (fast) sample into the cooling EMA. The same two-crossings rule now applies: the first temperature change after heater-off fixes the position, the second is the first learned cooling rate. A first *upward* change (sun warming the water) also consumes the guard, since any crossing lands the anchor exactly on a band boundary.
+
+### Internal
+
+- Heating and cooling rate tracking extracted from the update loop into `_track_heating_rate` / `_track_cooling_rate` and covered by 11 new tests, including a regression built from the 2026-07-31 log.
+- Audited all remaining places that anchor on a reported temperature for the same band-phase blindness. The ETA anchor, the schedule trigger's minutes computation, and the prediction accuracy bookkeeping all read mid-band values at session start — their errors are bounded to half a band, lean conservative (later ETAs, earlier starts), and self-correct at the first crossing, so they are documented rather than changed.
+
 ---
 
 ## [2026.7.1] - 2026-07-30
