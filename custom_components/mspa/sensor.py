@@ -413,6 +413,40 @@ def _minutes_to_target(coordinator) -> int | None:
     return max(0, round(remaining))
 
 
+def _relevant_target(coordinator) -> "float | None":
+    """The temperature target currently driving the Ready at display.
+
+    The schedule temperature when a schedule is pending or has triggered,
+    otherwise the thermostat setpoint — mirroring _compute_ready_at's contexts.
+    """
+    now_utc = datetime.now(timezone.utc)
+    sra = _sra_utc(coordinator)
+    if coordinator._schedule_triggered or (sra is not None and sra > now_utc):
+        st = coordinator.schedule_target_temp
+        if st is not None:
+            return float(st)
+    try:
+        target = float(coordinator._last_data.get("target_temperature") or 0)
+    except (TypeError, ValueError):
+        return None
+    return target or None
+
+
+def _segmented_effective_rate(coordinator, from_temp, to_temp) -> "float | None":
+    """Effective heating rate (°C/h) over a span, as the estimator prices it.
+
+    Integrates the per-bucket rates with all corrections (fresh-bucket /
+    session scalar / ambient factor) and the prediction bias — i.e. the rate
+    that is actually in effect for the current estimate, unlike the flat EMA.
+    """
+    if from_temp is None or to_temp is None or to_temp <= from_temp:
+        return None
+    mins = _segmented_heating_minutes(from_temp, to_temp, coordinator)
+    if not mins or mins <= 0:
+        return None
+    return (to_temp - from_temp) / (mins / 60.0)
+
+
 def _spa_direction(coordinator) -> str | None:
     """Return 'heating', 'cooling', 'at_target', or None if data is unavailable."""
     data = coordinator._last_data
@@ -595,12 +629,53 @@ def _compute_ready_at_value(coordinator) -> "str | None":
     return None
 
 
+def _rate_diagnostics(coordinator, water_f, span_target) -> str:
+    """Compact rate diagnostics for log lines.
+
+    eff     — the segmented effective rate actually driving the estimate
+              (buckets + corrections + bias over the span to the display target)
+    ema     — the flat EMA, for contrast (it drives nothing)
+    buckets — cold/mid/hot rates; '*' marks buckets observed this session
+              (used verbatim, superseding scalar and ambient corrections)
+    scalar / amb / bias — the corrections in force
+
+    Designed so a diagnostics log alone answers rate questions without
+    needing the sensor attributes.
+    """
+    eff = _segmented_effective_rate(coordinator, water_f, span_target)
+    ema = _effective_heat_rate(coordinator)
+    buckets = getattr(coordinator, "heat_rate_buckets", [None, None, None])
+    fresh = getattr(coordinator, "_session_fresh_buckets", set()) or set()
+    b_str = "/".join(
+        (f"{b:.2f}" + ("*" if i in fresh else "")) if b is not None else "-"
+        for i, b in enumerate(buckets)
+    )
+    scalar = getattr(coordinator, "_session_scalar", 1.0)
+    bias = getattr(coordinator, "prediction_bias", 1.0)
+    if water_f is not None:
+        idx = 0 if water_f < _HEAT_BUCKET_T1 else 1 if water_f < _HEAT_BUCKET_T2 else 2
+        amb = ambient_rate_factor(
+            idx,
+            getattr(coordinator, "ambient_temp", None),
+            getattr(coordinator, "ambient_baseline", None),
+        )
+        amb_str = f"{amb:.2f}"
+    else:
+        amb_str = "n/a"
+    eff_str = f"{eff:.2f}°C/h" if eff is not None else "n/a"
+    ema_str = f"{ema:.2f}" if ema is not None else "n/a"
+    return (f"eff={eff_str} ema={ema_str} buckets={b_str} "
+            f"scalar={scalar:.2f} amb={amb_str} bias={bias:.2f}")
+
+
 def _log_readiness_change(coordinator, old_state: object, new_state: "str | None") -> None:
     """Emit one INFO line when the Ready at sensor value transitions."""
     data = coordinator._last_data
     try:
-        water = f"{float(data.get('water_temperature')):.1f}"
+        water_f = float(data.get("water_temperature"))
+        water = f"{water_f:.1f}"
     except (TypeError, ValueError):
+        water_f = None
         water = "?"
     try:
         setpoint = f"{float(data.get('target_temperature')):.1f}"
@@ -616,8 +691,6 @@ def _log_readiness_change(coordinator, old_state: object, new_state: "str | None
     else:
         sched_ctx = "no-sched"
 
-    rate = _effective_heat_rate(coordinator)
-    rate_str = f"{rate:.2f}°C/h" if rate is not None else "no-rate"
     heater = data.get("heater", "?")
     latched = getattr(coordinator, "ready_latched", False)
     near = getattr(coordinator, "near_target", False)
@@ -625,10 +698,12 @@ def _log_readiness_change(coordinator, old_state: object, new_state: "str | None
     old_label = "BOOT" if old_state is _UNSET else repr(old_state)
 
     _LOGGER.info(
-        "Ready at: %s → %s  [water=%s  sp=%s  %s  heater=%s  rate=%s  "
+        "Ready at: %s → %s  [water=%s  sp=%s  %s  heater=%s  %s  "
         "latched=%s  near=%s  triggered=%s]",
         old_label, repr(new_state),
-        water, setpoint, sched_ctx, heater, rate_str, latched, near, triggered,
+        water, setpoint, sched_ctx, heater,
+        _rate_diagnostics(coordinator, water_f, _relevant_target(coordinator)),
+        latched, near, triggered,
     )
 
 
@@ -665,8 +740,10 @@ def _log_schedule_change(
     """Emit one INFO line when the Heat Schedule sensor value transitions."""
     data = coordinator._last_data
     try:
-        water = f"{float(data.get('water_temperature')):.1f}"
+        water_f = float(data.get("water_temperature"))
+        water = f"{water_f:.1f}"
     except (TypeError, ValueError):
+        water_f = None
         water = "?"
 
     sched_at = getattr(coordinator, "scheduled_ready_at", None)
@@ -678,8 +755,7 @@ def _log_schedule_change(
     else:
         sched_ctx = "no-sched"
 
-    rate = _effective_heat_rate(coordinator)
-    rate_str = f"{rate:.2f}°C/h" if rate is not None else "no-rate"
+    rate_str = _rate_diagnostics(coordinator, water_f, sched_temp)
     triggered = getattr(coordinator, "_schedule_triggered", False)
 
     if isinstance(schedule_data, tuple) and len(schedule_data) == 3:
@@ -696,7 +772,7 @@ def _log_schedule_change(
 
     old_label = "BOOT" if old_state is _UNSET else repr(old_state)
     _LOGGER.info(
-        "Heat Schedule: %s → %s  [water=%s  %s  %s  rate=%s  triggered=%s]",
+        "Heat Schedule: %s → %s  [water=%s  %s  %s  %s  triggered=%s]",
         old_label, repr(new_state),
         water, sched_ctx, extra, rate_str, triggered,
     )
@@ -816,7 +892,17 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             ready_at_utc = None
         ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
 
-        effective = _effective_rate(self.coordinator, water_temp, target_temp) if water_temp is not None and target_temp is not None else None
+        # The rate actually in effect for the current estimate: segmented over
+        # the span to the display-driving target, with all corrections and the
+        # bias — NOT the flat EMA (which is exposed separately below).
+        rel_target = _relevant_target(self.coordinator)
+        if (water_temp is not None and rel_target is not None
+                and rel_target > water_temp):
+            effective = _segmented_effective_rate(self.coordinator, water_temp, rel_target)
+        elif water_temp is not None and target_temp is not None:
+            effective = _effective_rate(self.coordinator, water_temp, target_temp)
+        else:
+            effective = None
         computed_heat = getattr(self.coordinator, "computed_heat_rate", None)
         computed_cool = getattr(self.coordinator, "computed_cool_rate", None)
         raw = data.get("device_heat_perhour", 0)

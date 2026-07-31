@@ -19,9 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Restart mid-scheduled-heating forgot the trigger had fired** *(Experimental)* — `_schedule_triggered` was not persisted, so after a restart the scheduler dropped back to *pending* and computed a fresh start time for a heater that was already running (observed: `Start at 10:38` displayed two hours into an active session, with the trigger set to re-fire and resend the setpoint). The flag is now persisted with the other learning state and restored on startup. If the schedule itself is gone or expired when entities restore — HA down past the target time — the stale flag is cleared so the sensors fall back to the free context instead of reporting a phantom scheduled-heating session.
 
+- **`effective_rate_deg_per_hour` attribute showed the flat EMA, not the effective rate** *(Experimental)* — the attribute (and the `rate=` field in the Ready at / Heat Schedule log lines) displayed the global flat EMA, which drives nothing: estimation always integrates the per-bucket rates with corrections and bias. The attribute and logs now show the true segmented effective rate over the span to the display-driving target (e.g. `0.86 °C/h` for a 37→39.5 °C span priced by the hot bucket, while the flat EMA read `1.02`).
+
 ### Changed
 
 - **Ready at ETA corrections now land as bounded ramps** *(Experimental)* — the live estimate corrects in lumps (each temperature crossing repays the accumulated model error at once, e.g. `12:19 → 12:49`) and creeps +1 min/min while the anchor is stale. The displayed ETA now follows the raw estimate at no more than **3 minutes per wall-clock minute**, so a 13-minute correction renders as a ~4-minute ramp instead of a jump, while the honest +1 min/min stale creep passes through undistorted. Corrections beyond 30 minutes are genuine replans (schedule or setpoint changes) and are followed immediately, as are transitions between display regimes (`Ready`, scheduled time, no data). The `minutes_remaining` and `ready_at` attributes derive from the same smoothed value, so dashboards stay consistent with the state.
+
+- **Self-sufficient diagnostics logging** *(Experimental)* — log lines now carry everything needed to diagnose rate behaviour without inspecting entity attributes:
+  - Ready at / Heat Schedule transition lines include `eff=` (segmented effective rate), `ema=` (flat average, labelled apart), `buckets=cold/mid/hot` with `*` marking buckets observed this session (used verbatim, superseding corrections), `scalar=`, `amb=`, and `bias=`.
+  - `PREDICTION_START` includes the bucket rates in force at session start.
+  - `start time moved` includes the effective rate behind the recomputed heating minutes.
+  - Rate learning events promoted from DEBUG to INFO: accepted and rejected heat/cool samples, and the phase-uncertain first-crossing skips — the primary evidence in rate diagnosis, at a few lines per hour.
 
 ### Internal
 

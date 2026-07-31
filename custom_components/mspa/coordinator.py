@@ -420,11 +420,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             ambient_rate_factor(2, self.ambient_temp, self.ambient_baseline), 3
                         ),
                     }
+                    buckets_str = "/".join(
+                        f"{b:.2f}" if b is not None else "-"
+                        for b in self.heat_rate_buckets
+                    )
                     _LOGGER.info(
                         "PREDICTION_START: %.1f°C → %.1f°C, raw=%.0f min, biased=%.0f min"
-                        " (bias=%.3f, scalar=%.3f, ambient=%.1f°C %.1f m/s)",
+                        " (bias=%.3f, scalar=%.3f, buckets=%s, ambient=%.1f°C %.1f m/s)",
                         new_temp, new_target, raw_minutes, est_minutes,
-                        self.prediction_bias, self._session_scalar,
+                        self.prediction_bias, self._session_scalar, buckets_str,
                         self.ambient_temp or 0.0, self.ambient_wind or 0.0,
                     )
 
@@ -699,7 +703,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if self._rate_first_step:
                     # First crossing: position information only.  Keep the
                     # existing learned rates driving the estimates.
-                    _LOGGER.debug(
+                    _LOGGER.info(
                         "Heat rate: first crossing %.1f→%.1f°C after heater-on "
                         "is phase-uncertain — anchored, not learned",
                         self._rate_last_temp, curr_temp,
@@ -762,13 +766,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                 "Session scalar → %.3f (bucket[%d] ratio actual/base=%.3f)",
                                 self._session_scalar, _bi, ratio,
                             )
-                        _LOGGER.debug(
+                        _LOGGER.info(
                             "Heat rate sample %.3f °C/h (EMA → %.3f °C/h, bucket[%d] → %.3f °C/h)",
                             rate, self.computed_heat_rate,
                             _bi, self.heat_rate_buckets[_bi],
                         )
                     else:
-                        _LOGGER.debug(
+                        _LOGGER.info(
                             "Heat rate sample %.3f °C/h rejected (out of bounds)", rate
                         )
                 # Always advance anchor to new temperature (even if rate rejected).
@@ -805,7 +809,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self._cool_first_step = True
             elif curr_temp != self._cool_last_temp and self._cool_first_step:
                 # First crossing since the heater stopped: position only.
-                _LOGGER.debug(
+                _LOGGER.info(
                     "Cool rate: first crossing %.1f→%.1f°C after heater-off "
                     "is phase-uncertain — anchored, not learned",
                     self._cool_last_temp, curr_temp,
@@ -828,7 +832,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                     _EMA_ALPHA * rate
                                     + (1 - _EMA_ALPHA) * self.computed_cool_rate
                                 )
-                            _LOGGER.debug(
+                            _LOGGER.info(
                                 "Cool rate sample %.3f °C/h (EMA → %.3f °C/h)",
                                 rate, self.computed_cool_rate,
                             )
@@ -887,12 +891,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         prev_start = self._last_computed_start_at
         if prev_start is None or abs((start_at - prev_start).total_seconds()) > 900:
             if prev_start is not None:
+                eff = (
+                    (self.schedule_target_temp - current_temp) / (minutes_needed / 60.0)
+                    if minutes_needed and current_temp is not None
+                    and self.schedule_target_temp is not None else None
+                )
                 _LOGGER.info(
-                    "Heat schedule: start time moved %s → %s (%.0f min heat, "
+                    "Heat schedule: start time moved %s → %s (%.0f min heat @%s, "
                     "outdoor=%s°C, baseline=%s°C)",
                     prev_start.isoformat(timespec="minutes"),
                     start_at.isoformat(timespec="minutes"),
                     minutes_needed,
+                    f"{eff:.2f}°C/h" if eff is not None else "n/a",
                     f"{self.ambient_temp:.1f}" if self.ambient_temp is not None else "n/a",
                     f"{self.ambient_baseline:.1f}" if self.ambient_baseline is not None else "n/a",
                 )
