@@ -650,18 +650,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # pre-empt by clearing scheduled_ready_at first).
             await self._check_schedule_trigger(new_temp, new_target)
 
-            # Auto-clear scheduled_ready_at once its time has passed.
-            if (self.scheduled_ready_at is not None
-                    and dt_util.utcnow() >= dt_util.as_utc(self.scheduled_ready_at)):
-                _LOGGER.info(
-                    "Heat schedule: session complete — clearing  "
-                    "[water=%.1f°C  sched=%.1f°C  triggered=%s]",
-                    new_temp or 0.0, self.schedule_target_temp or 0.0,
-                    self._schedule_triggered,
-                )
-                self.scheduled_ready_at = None
-                self._schedule_triggered = False
-                self._last_computed_start_at = None
+            # Auto-clear the schedule once its time has passed.
+            self._clear_schedule_if_expired(new_temp)
 
             # Check for power cycle and restore state if enabled
             await self._check_power_cycle(transformed_data)
@@ -677,6 +667,31 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error("Error updating MSpa data: %s", str(err))
             raise UpdateFailed(f"Update failed: {str(err)}")
+
+    def _clear_schedule_if_expired(self, current_temp) -> None:
+        """Retire the schedule once its ready time has passed.
+
+        Clears the trigger state AND the readiness latch: the latch exists so
+        "Ready" holds steady through the scheduled session, but once the
+        session is over the Ready at sensor must be released to follow the
+        thermostat again — otherwise it stays pinned on "Ready" while the
+        water cools or the setpoint is lowered, until the next schedule or a
+        reload happens to reset it.  If the spa genuinely is at the thermostat
+        target after clearing, near_target keeps the sensor on "Ready" on its
+        own merit.
+        """
+        if (self.scheduled_ready_at is not None
+                and dt_util.utcnow() >= dt_util.as_utc(self.scheduled_ready_at)):
+            _LOGGER.info(
+                "Heat schedule: session complete — clearing  "
+                "[water=%.1f°C  sched=%.1f°C  triggered=%s  latched=%s]",
+                current_temp or 0.0, self.schedule_target_temp or 0.0,
+                self._schedule_triggered, self.ready_latched,
+            )
+            self.scheduled_ready_at = None
+            self._schedule_triggered = False
+            self._last_computed_start_at = None
+            self.ready_latched = False
 
     def _track_heating_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the observed heating rate from 0.5 °C temperature steps.

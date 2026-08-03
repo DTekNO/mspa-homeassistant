@@ -225,3 +225,52 @@ class TestTriggerErrors:
         call_count = c.api.set_temperature_setting.call_count
         _run(c._check_schedule_trigger(38.0, None))
         assert c.api.set_temperature_setting.call_count == call_count
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Schedule expiry — the latch must release with the schedule
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestScheduleExpiry:
+    """Once the scheduled ready time passes, the whole schedule state retires —
+    including ready_latched.  The latch holds 'Ready' steady through the
+    session, but leaving it set afterwards pinned the Ready at sensor on
+    'Ready' indefinitely (until the next schedule or an integration reload)
+    while the water cooled or the thermostat was lowered."""
+
+    def test_expiry_clears_schedule_trigger_and_latch(self):
+        c = _coord(
+            scheduled_ready_at=_NOW_UTC - timedelta(minutes=5),
+            _schedule_triggered=True,
+            ready_latched=True,
+            _last_computed_start_at=_NOW_UTC - timedelta(hours=3),
+        )
+        c._clear_schedule_if_expired(39.5)
+        assert c.scheduled_ready_at is None
+        assert c._schedule_triggered is False
+        assert c._last_computed_start_at is None
+        assert c.ready_latched is False
+
+    def test_future_schedule_is_left_alone(self):
+        c = _coord(
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=2),
+            _schedule_triggered=True,
+            ready_latched=True,
+        )
+        c._clear_schedule_if_expired(39.5)
+        assert c.scheduled_ready_at is not None
+        assert c._schedule_triggered is True
+        assert c.ready_latched is True
+
+    def test_no_schedule_is_a_noop(self):
+        c = _coord(scheduled_ready_at=None, ready_latched=True)
+        c._clear_schedule_if_expired(39.5)
+        assert c.ready_latched is True, "free-session latch is not the expiry's business"
+
+    def test_expiry_with_none_temp_does_not_raise(self):
+        c = _coord(
+            scheduled_ready_at=_NOW_UTC - timedelta(minutes=1),
+            ready_latched=True,
+        )
+        c._clear_schedule_if_expired(None)
+        assert c.ready_latched is False
