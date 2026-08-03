@@ -51,6 +51,7 @@ class MockCoordinator:
     ):
         self.near_target = near_target
         self.ready_latched = ready_latched
+        self.ready_latched_temp = water_temp if ready_latched else None
         self._schedule_triggered = schedule_triggered
         self.computed_heat_rate = heat_rate
         self.computed_cool_rate = cool_rate
@@ -512,6 +513,9 @@ class TestEtaSlew:
 # LATCH RELEASE ON SETPOINT RAISE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_LATCH_COOL_OFF = 3.0
+
+
 def _apply_latch_rules(c, new_temp, new_target):
     """Replicate the coordinator's near_target / ready_latched block."""
     c.temp_anchor_temp = new_temp
@@ -523,11 +527,21 @@ def _apply_latch_rules(c, new_temp, new_target):
     if delta < _NEAR_TARGET_DEACTIVATE:
         if not c.near_target:
             c.ready_latched = True
+            c.ready_latched_temp = new_temp
         c.near_target = True
     elif delta >= _NEAR_TARGET_ACTIVATE:
         c.near_target = False
         if c.ready_latched and (new_target - new_temp) > 2.0:
             c.ready_latched = False
+            c.ready_latched_temp = None
+    # peak tracking runs regardless of the hysteresis branches
+    if c.ready_latched and (c.ready_latched_temp is None
+                            or new_temp > c.ready_latched_temp):
+        c.ready_latched_temp = new_temp
+    if (c.ready_latched and c.ready_latched_temp is not None
+            and (c.ready_latched_temp - new_temp) >= _LATCH_COOL_OFF):
+        c.ready_latched = False
+        c.ready_latched_temp = None
 
 
 class TestLatchReleaseOnSetpointRaise:
@@ -600,3 +614,79 @@ class TestLatchReleaseOnSetpointRaise:
         _apply_latch_rules(c, 40.0, 40.0)
         _apply_latch_rules(c, 40.0, 43.0)          # +3 °C, a real session
         assert c.ready_latched is False
+
+
+class TestLatchCoolOffRelease:
+    """The latch advertises "still warm enough to use without waiting".  Without
+    a cool-off release it outlives that claim: drop the thermostat to 20 °C with
+    the water at 40 °C and two days later the water is 24 °C — still above
+    setpoint, so the heating-gap release never fires — and the sensor would
+    happily report Ready for a tub nobody wants to get into."""
+
+    def test_ready_withdrawn_once_the_water_has_cooled(self):
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        assert c.ready_latched is True
+        _apply_latch_rules(c, 40.0, 20.0)          # after the soak: thermostat down
+        assert c.ready_latched is True, "still hot — still ready"
+        for water in (39.0, 38.0):                 # cooling, under the threshold
+            _apply_latch_rules(c, water, 20.0)
+            assert c.ready_latched is True, f"released too early at {water}"
+        _apply_latch_rules(c, 37.0, 20.0)          # 3 °C down from the latch temp
+        assert c.ready_latched is False, "cooled 3 °C — Ready must be withdrawn"
+        assert _ready_at(c) != "Ready"
+
+    def test_the_two_day_scenario_no_longer_claims_ready(self):
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        _apply_latch_rules(c, 40.0, 20.0)
+        for water in (38.0, 34.0, 30.0, 26.0, 24.0):   # two days of cooling
+            _apply_latch_rules(c, water, 20.0)
+        assert c.ready_latched is False
+        assert _ready_at(c) != "Ready"
+
+    def test_cool_off_measured_from_the_warmest_point(self):
+        """Thermostat cycling nudges the water above the setpoint; the cool-off
+        must be measured from the peak reached, not from whatever the reading
+        happened to be when it latched.
+
+        The thermostat is dropped before cooling so the heating-gap release
+        cannot fire — this isolates the cool-off rule.
+        """
+        c = MockCoordinator(water_temp=39.8, target_temp=40.0)
+        _apply_latch_rules(c, 39.8, 40.0)          # latches at 39.8
+        _apply_latch_rules(c, 40.4, 40.0)          # cycling peak (hysteresis dead band)
+        assert c.ready_latched_temp == 40.4, "peak must be tracked in the dead band"
+        _apply_latch_rules(c, 40.4, 20.0)          # after the soak: thermostat down
+        _apply_latch_rules(c, 37.6, 20.0)          # 2.8 °C below the peak
+        assert c.ready_latched is True, "not yet 3 °C from the peak"
+        _apply_latch_rules(c, 37.3, 20.0)          # 3.1 °C below the peak
+        assert c.ready_latched is False
+
+    def test_heating_gap_release_still_takes_precedence(self):
+        """A real heating gap releases via the setpoint rule before the cool-off
+        threshold is reached — the two rules cover different situations."""
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        _apply_latch_rules(c, 37.6, 40.0)          # only 2.4 °C cooled, but a
+        assert c.ready_latched is False             # 2.4 °C heating gap exists
+
+    def test_normal_cycling_does_not_withdraw_ready(self):
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        for water in (39.5, 39.0, 39.4, 39.8, 40.0, 39.2):
+            _apply_latch_rules(c, water, 40.0)
+            assert c.ready_latched is True, f"cycling withdrew Ready at {water}"
+
+    def test_relatching_resets_the_reference_temperature(self):
+        """After a release and a fresh arrival, the cool-off measures from the
+        new arrival temperature — not the stale one."""
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        _apply_latch_rules(c, 36.0, 40.0)          # cooled 4 °C → released
+        assert c.ready_latched is False
+        _apply_latch_rules(c, 30.0, 30.0)          # arrives at a new, lower target
+        assert c.ready_latched is True
+        assert c.ready_latched_temp == 30.0
+        _apply_latch_rules(c, 28.0, 30.0)          # only 2 °C down from 30
+        assert c.ready_latched is True

@@ -62,6 +62,14 @@ _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
 # release the readiness latch when the user raises the setpoint.
 _NEW_SESSION_DELTA = 2.0          # °C
 
+# How far the water may cool below the temperature at which it latched before
+# "Ready" is withdrawn.  The latch advertises "still warm enough to use
+# without waiting"; once the water has given up this much heat that claim is
+# no longer credible, however the thermostat happens to be set.  Larger than
+# _NEW_SESSION_DELTA so a lowered thermostat followed by ordinary cycling
+# doesn't withdraw Ready prematurely.
+_LATCH_COOL_OFF = 3.0             # °C
+
 # Full-heat mode: the device reports heat_state 3 while actually heating
 # (0 = off, 2 = preheat).  Rate sampling and prediction tracking both key off
 # this so they start and stop on the same signal.
@@ -255,6 +263,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Never cleared automatically by temperature changes — the spa staying warm
         # between sessions must not re-arm predictions.
         self.ready_latched: bool = False
+        # Water temperature when the latch was set (peak while at target).  The
+        # cool-off release measures against this, so "Ready" is withdrawn once
+        # the spa is no longer as warm as it was when it arrived.
+        self.ready_latched_temp: float | None = None
         self.scheduled_ready_at: datetime | None = None  # set by MSpaScheduledReadyAt entity
         # Target temperature the scheduler should heat to.  Exposed as a number entity
         # so the user can adjust it from the device panel without entering options.
@@ -508,10 +520,44 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if delta < _NEAR_TARGET_DEACTIVATE:
                     if not self.near_target:   # latch only on the False→True transition
                         self.ready_latched = True
+                        # Remember how warm the water was when it latched, so the
+                        # cool-off release below can tell how much heat has since
+                        # been given up.
+                        self.ready_latched_temp = new_temp
                         _LOGGER.debug("ready_latched set (near_target True, delta=%.2f°C)", delta)
                     self.near_target = True
                 elif delta >= _NEAR_TARGET_ACTIVATE:
                     self.near_target = False
+
+                # Track the warmest water seen while latched.  Thermostat cycling
+                # nudges the temperature either side of the setpoint — including
+                # into the hysteresis dead band, where neither branch above runs —
+                # so the cool-off must measure from the peak reached, not from
+                # whatever the reading happened to be at the moment it latched.
+                if (self.ready_latched
+                        and (self.ready_latched_temp is None
+                             or new_temp > self.ready_latched_temp)):
+                    self.ready_latched_temp = new_temp
+
+                # Cool-off release: withdraw "Ready" once the water has given up
+                # _LATCH_COOL_OFF degrees from where it latched.  Without this the
+                # latch outlives the warmth it advertises — drop the thermostat to
+                # 20 °C with the water at 40 °C and, two days later, the water is
+                # 24 °C, still "above target", and the sensor would happily claim
+                # the tub is ready for a dip.  Checked regardless of direction,
+                # because with a lowered thermostat the spa is technically cooling
+                # yet still above setpoint.
+                if (self.ready_latched
+                        and self.ready_latched_temp is not None
+                        and (self.ready_latched_temp - new_temp) >= _LATCH_COOL_OFF):
+                    self.ready_latched = False
+                    _LOGGER.info(
+                        "ready_latched released (water cooled %.1f°C from %.1f°C "
+                        "to %.1f°C — no longer warm enough to call ready)",
+                        self.ready_latched_temp - new_temp,
+                        self.ready_latched_temp, new_temp,
+                    )
+                    self.ready_latched_temp = None
                     # Release the readiness latch once a genuine heating gap
                     # opens.  The latch exists to hold "Ready" steady once the
                     # spa has arrived, but raising the setpoint means there is
@@ -527,6 +573,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     if (self.ready_latched
                             and (new_target - new_temp) > _NEW_SESSION_DELTA):
                         self.ready_latched = False
+                        self.ready_latched_temp = None
                         _LOGGER.debug(
                             "ready_latched released (setpoint %.1f°C is %.1f°C "
                             "above water %.1f°C — new heating session)",
@@ -743,6 +790,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._schedule_triggered = False
             self._last_computed_start_at = None
             self.ready_latched = False
+            self.ready_latched_temp = None
 
     def _track_heating_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the observed heating rate from 0.5 °C temperature steps.
@@ -992,6 +1040,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # sensor counts down to the new target rather than showing "Ready"
         # immediately from a previous session.
         self.ready_latched = False
+        self.ready_latched_temp = None
         self.near_target   = False
         try:
             # Always confirm the setpoint at the scheduled time regardless of current

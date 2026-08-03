@@ -406,8 +406,9 @@ Once the spa reaches temperature, `Ready` **stays** showing even if you then low
 
 `Ready` is released when there is genuinely something to wait for:
 
+- **the water cools more than 3 °C** below the warmest point it reached — the tub is no longer dip-warm, whatever the thermostat is set to. This is what stops `Ready` outliving the heat: drop the setpoint to 20 °C with the water at 40 °C and the sensor keeps saying `Ready` for the first couple of hours, then withdraws it, rather than still claiming the tub is usable two days later at 24 °C.
 - the setpoint moves more than 2 °C **above** the water (a real heating session — the sensor switches to a live ETA),
-- a scheduled session's ready time passes,
+- a scheduled session's ready time passes, a schedule triggers,
 - or you set a new schedule.
 
 One side effect worth knowing if you sit and experiment with the thermostat: with the water above the setpoint, the sensor reads `Ready` if the spa recently reached its setpoint, and `unknown` if it has not — the same water temperature can show either, depending on that history. It looks inconsistent in isolation, but the `Ready` behaviour is the useful one and it is kept on purpose.

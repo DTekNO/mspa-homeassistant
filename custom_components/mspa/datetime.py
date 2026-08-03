@@ -125,6 +125,7 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
         )
         self.coordinator.scheduled_ready_at = value
         self.coordinator.ready_latched = False
+        self.coordinator.ready_latched_temp = None
         self.coordinator._schedule_triggered = False
         self.async_write_ha_state()
         self.coordinator.async_update_listeners()  # push new state to sensors immediately
