@@ -56,6 +56,17 @@ _MIN_HEAT_RATE = 0.05             # °C/h — below this is noise / flat
 _MAX_HEAT_RATE = 3.0              # °C/h — above this is an outlier
 _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
 
+# A gap this large between water and setpoint defines a genuine heating
+# session, as opposed to thermostat cycling near the setpoint (±0.5–1 °C).
+# Used to start prediction tracking, to reset the session scalar, and to
+# release the readiness latch when the user raises the setpoint.
+_NEW_SESSION_DELTA = 2.0          # °C
+
+# Full-heat mode: the device reports heat_state 3 while actually heating
+# (0 = off, 2 = preheat).  Rate sampling and prediction tracking both key off
+# this so they start and stop on the same signal.
+_HEAT_STATE_FULL = 3
+
 # Maps coordinator _pending_changes keys (transformed names) to their raw API
 # command dict keys.  Used to prune _pending_raw_command incrementally as each
 # pending change is confirmed, so that a retry payload never re-sends fields
@@ -389,10 +400,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Start tracking when a big heating session begins (delta > 2°C).
             # Only start after rates have been loaded from storage to avoid using
             # the unreliable device_heat_perhour fallback on the first poll.
+            # Gated on full-heat mode, the same signal the cancellation below
+            # uses.  Without it, a setpoint change during rapid polling created
+            # and immediately cancelled a prediction on every 1 s poll, because
+            # the device drops out of heat_state 3 while it recalculates.
             if (self._rates_loaded
                     and new_temp is not None and new_target is not None
                     and new_target > new_temp
-                    and (new_target - new_temp) > 2.0
+                    and (new_target - new_temp) > _NEW_SESSION_DELTA
+                    and transformed_data.get("heat_state") == _HEAT_STATE_FULL
                     and self._prediction is None):
                 # Lazy import to reuse the sensor's segmented calculation.
                 from .sensor import _segmented_heating_minutes
@@ -481,6 +497,26 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self.near_target = True
                 elif delta >= _NEAR_TARGET_ACTIVATE:
                     self.near_target = False
+                    # Release the readiness latch once a genuine heating gap
+                    # opens.  The latch exists to hold "Ready" steady once the
+                    # spa has arrived, but raising the setpoint means there is
+                    # real heating to do and the sensor must follow the
+                    # thermostat again — otherwise it stays pinned on "Ready"
+                    # with degrees to go.
+                    #
+                    # Heating direction only: water ABOVE the setpoint (the
+                    # thermostat was lowered while the spa is warm) is still
+                    # legitimately "Ready".  Using the new-session threshold
+                    # rather than the hysteresis one means thermostat cycling
+                    # cannot flicker the latch off and on.
+                    if (self.ready_latched
+                            and (new_target - new_temp) > _NEW_SESSION_DELTA):
+                        self.ready_latched = False
+                        _LOGGER.debug(
+                            "ready_latched released (setpoint %.1f°C is %.1f°C "
+                            "above water %.1f°C — new heating session)",
+                            new_target, new_target - new_temp, new_temp,
+                        )
             # else: no temp data — leave flags unchanged
 
             # Load persisted rates on the very first poll after startup/reload.
@@ -586,10 +622,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Detect new heating session.  Only reset the session scalar when
             # the heater newly engages AND delta-to-target is large (> 2°C).
             # This avoids false resets from thermostat cycling near setpoint.
-            heater_now_active = (heat_state == 3)
+            heater_now_active = (heat_state == _HEAT_STATE_FULL)
             if heater_now_active and not self._heat_was_active:
                 delta_to_target = abs((new_target or 0) - (curr_temp or 0))
-                if delta_to_target > 2.0:
+                if delta_to_target > _NEW_SESSION_DELTA:
                     self._session_scalar = 1.0
                     self._session_scalar_bucket = None
                     self._session_fresh_buckets = set()
@@ -708,7 +744,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         boundary — and learning starts from the second crossing, where every
         step runs boundary-to-boundary and is a true rate.
         """
-        if heat_state == 3 and curr_temp is not None:
+        if heat_state == _HEAT_STATE_FULL and curr_temp is not None:
             if self._rate_last_temp is None:
                 # First poll in heat mode — set a phase-uncertain anchor.
                 self._rate_last_temp = curr_temp
@@ -816,7 +852,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         _MIN_COOL_RATE = 0.01  # °C/h — below this is sensor drift
         _MAX_COOL_RATE = 3.0   # °C/h — above this is unusual for an insulated spa
 
-        if heat_state not in (2, 3) and curr_temp is not None:
+        if heat_state not in (2, _HEAT_STATE_FULL) and curr_temp is not None:
             if self._cool_last_temp is None:
                 # First poll in cooling mode — set a phase-uncertain anchor.
                 self._cool_last_temp = curr_temp

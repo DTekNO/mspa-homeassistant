@@ -154,3 +154,57 @@ class TestCoolingFirstStepPhaseUncertainty:
         c._track_cooling_rate(39.0, 0, (20 + 120) * _MIN) # drop in 2 h = 0.25 °C/h
         expected_ema = 0.25 * 0.25 + 0.75 * 0.20
         assert abs(c.computed_cool_rate - expected_ema) < 1e-9
+
+
+class TestPredictionCreationGating:
+    """Reported 2026-08-03: changing the setpoint on the climate card produced
+    a PREDICTION_START / PREDICTION_CANCELLED pair on every 1 s rapid poll —
+    seven in seven seconds.  Creation did not check heat_state, so it fired
+    while the device was briefly out of full-heat mode recalculating, and the
+    cancellation (which does check) killed it in the same cycle.
+
+    Both now key off heat_state == 3, so create and cancel use one signal."""
+
+    def test_full_heat_is_required_to_start_a_prediction(self):
+        from custom_components.mspa.coordinator import (
+            _HEAT_STATE_FULL, _NEW_SESSION_DELTA,
+        )
+        assert _HEAT_STATE_FULL == 3
+        assert _NEW_SESSION_DELTA == 2.0
+
+        def would_create(heat_state, water, target, prediction=None):
+            """The creation guard as the coordinator applies it."""
+            return (
+                water is not None and target is not None
+                and target > water
+                and (target - water) > _NEW_SESSION_DELTA
+                and heat_state == _HEAT_STATE_FULL
+                and prediction is None
+            )
+
+        # The reported case: setpoint raised 31 → 40 while the device is
+        # transitioning (preheat / idle), during rapid polling.
+        assert not would_create(0, 31.0, 40.0), "idle must not start a prediction"
+        assert not would_create(2, 31.0, 40.0), "preheat must not start a prediction"
+        # Once genuinely heating, it starts — as it did at 09:57 in the log.
+        assert would_create(3, 31.5, 40.0)
+        # Unchanged guards still apply.
+        assert not would_create(3, 39.0, 40.0), "gap under threshold: no session"
+        assert not would_create(3, 31.0, 40.0, prediction={}), "already tracking"
+
+    def test_cancellation_uses_the_same_signal(self):
+        """heater_now_active is heat_state == 3, matching the creation gate, so
+        a prediction cannot be created and cancelled within one poll."""
+        from custom_components.mspa.coordinator import _HEAT_STATE_FULL
+
+        def would_cancel(heat_state, near_target, prediction):
+            heater_now_active = (heat_state == _HEAT_STATE_FULL)
+            return (not heater_now_active
+                    and prediction is not None
+                    and not near_target)
+
+        # Same states that must not create must also be the ones that cancel —
+        # so no state both creates and cancels.
+        for hs in (0, 2):
+            assert would_cancel(hs, False, {})
+        assert not would_cancel(_HEAT_STATE_FULL, False, {})

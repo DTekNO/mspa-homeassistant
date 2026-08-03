@@ -506,3 +506,75 @@ class TestEtaSlew:
         assert val == "Ready"
         assert e._eta_display is None
         assert e._eta_wall is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LATCH RELEASE ON SETPOINT RAISE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _apply_latch_rules(c, new_temp, new_target):
+    """Replicate the coordinator's near_target / ready_latched block."""
+    c.temp_anchor_temp = new_temp
+    c.temp_anchor_target = new_target
+    c._last_data["water_temperature"] = str(new_temp)
+    c._last_data["target_temperature"] = str(new_target)
+    c._last_data["heater"] = "on" if new_target > new_temp else "off"
+    delta = abs(new_target - new_temp)
+    if delta < _NEAR_TARGET_DEACTIVATE:
+        if not c.near_target:
+            c.ready_latched = True
+        c.near_target = True
+    elif delta >= _NEAR_TARGET_ACTIVATE:
+        c.near_target = False
+        if c.ready_latched and (new_target - new_temp) > 2.0:
+            c.ready_latched = False
+
+
+class TestLatchReleaseOnSetpointRaise:
+    """Reported 2026-08-03: setpoint moved 40 → 31 → 40 on the climate card.
+    At 31/31 the spa latched Ready; raising the setpoint back to 40 left the
+    latch set, so Ready at reported 'Ready' with 9 °C still to heat instead of
+    recalculating."""
+
+    def test_raising_setpoint_releases_latch_and_shows_eta(self):
+        c = MockCoordinator(water_temp=31.0, target_temp=31.0, heat_rate=1.0)
+        _apply_latch_rules(c, 31.0, 31.0)          # arrives at setpoint
+        assert c.ready_latched is True
+        assert _ready_at(c) == "Ready"
+
+        _apply_latch_rules(c, 31.0, 40.0)          # user raises setpoint to 40
+        assert c.ready_latched is False, "latch must release for a real heating gap"
+        assert c.near_target is False
+        val = _ready_at(c)
+        assert val != "Ready", "Ready at must recalculate, not stay pinned"
+        assert re.match(r"^\d{2}:\d{2}", val), f"expected an ETA, got {val!r}"
+
+    def test_lowering_setpoint_while_warm_keeps_ready(self):
+        """Design pattern D: the spa IS warm; a lowered setpoint keeps Ready."""
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        assert c.ready_latched is True
+        _apply_latch_rules(c, 40.0, 36.0)          # thermostat lowered 4 °C
+        assert c.ready_latched is True, "water above setpoint is still ready"
+        assert _ready_at(c) == "Ready"
+
+    def test_thermostat_cycling_does_not_flicker_the_latch(self):
+        """±0.5–1 °C swings must not release the latch, or Ready would blink
+        off and on during normal maintenance cycling."""
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        for water in (39.5, 39.0, 39.4, 39.8, 40.0):
+            _apply_latch_rules(c, water, 40.0)
+            assert c.ready_latched is True, f"latch lost at water={water}"
+
+    def test_small_setpoint_raise_within_session_threshold_keeps_latch(self):
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        _apply_latch_rules(c, 40.0, 41.5)          # +1.5 °C, under the threshold
+        assert c.ready_latched is True
+
+    def test_large_setpoint_raise_releases_even_from_at_target(self):
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0)
+        _apply_latch_rules(c, 40.0, 40.0)
+        _apply_latch_rules(c, 40.0, 43.0)          # +3 °C, a real session
+        assert c.ready_latched is False
