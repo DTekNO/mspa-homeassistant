@@ -550,13 +550,35 @@ class TestLatchReleaseOnSetpointRaise:
         assert re.match(r"^\d{2}:\d{2}", val), f"expected an ETA, got {val!r}"
 
     def test_lowering_setpoint_while_warm_keeps_ready(self):
-        """Design pattern D: the spa IS warm; a lowered setpoint keeps Ready."""
+        """The after-a-soak case — deliberate, do not "fix" it.
+
+        You have used the tub, turned the thermostat down to save energy, and
+        the water is still hot.  Ready at must keep saying "Ready" so you can
+        see that a late-night second dip needs no waiting.  This is why the
+        latch is released only for HEATING gaps, never for a lowered setpoint,
+        and it is why the display legitimately depends on latch history.
+
+        Reviewed and kept 2026-08-03 after being re-reported as a bug.  See the
+        long comment above the FREE CONTEXT block in sensor.py.
+        """
         c = MockCoordinator(water_temp=40.0, target_temp=40.0)
         _apply_latch_rules(c, 40.0, 40.0)
         assert c.ready_latched is True
         _apply_latch_rules(c, 40.0, 36.0)          # thermostat lowered 4 °C
         assert c.ready_latched is True, "water above setpoint is still ready"
         assert _ready_at(c) == "Ready"
+
+    def test_lowering_setpoint_a_long_way_still_keeps_ready(self):
+        """Even a large drop keeps Ready — the water is what matters, not the
+        size of the setpoint change.  (Reported 2026-08-03: "it doesn't make a
+        difference if I lower the temperature by a bigger margin than 2
+        degrees" — correct, by design.)"""
+        c = MockCoordinator(water_temp=31.5, target_temp=31.5)
+        _apply_latch_rules(c, 31.5, 31.5)
+        for setpoint in (29.5, 25.0, 20.0):
+            _apply_latch_rules(c, 31.5, setpoint)
+            assert c.ready_latched is True, f"latch lost at setpoint={setpoint}"
+            assert _ready_at(c) == "Ready"
 
     def test_thermostat_cycling_does_not_flicker_the_latch(self):
         """±0.5–1 °C swings must not release the latch, or Ready would blink

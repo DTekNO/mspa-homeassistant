@@ -578,6 +578,27 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
     # ── FREE CONTEXT ──────────────────────────────────────────────────────────
     # No schedule pending or triggered.  Use thermostat-relative state.
 
+    # DELIBERATE, and reported as a bug more than once — please read before
+    # "fixing" it:
+    #
+    # The latch keeps "Ready" showing after you turn the thermostat DOWN while
+    # the water is still hot.  That is the after-a-soak case: you have used the
+    # tub, dropped the setpoint to save energy, and the water is still warm
+    # enough that a late-night second dip needs no waiting.  Ready at should
+    # keep saying "Ready", because the tub genuinely is.
+    #
+    # The consequence is that the display depends on latch history: water above
+    # setpoint reads "Ready" when the spa recently reached its setpoint, and
+    # unknown when it did not (that path falls through to the cooling branch
+    # below).  That asymmetry looks like a bug when you sit and play with the
+    # thermostat, but the latched behaviour is the one users actually want.
+    # Reviewed and kept 2026-08-03; see tests/test_schedule_scenarios.py
+    # TestLatchReleaseOnSetpointRaise for the boundaries.
+    #
+    # The latch IS released when the setpoint moves more than
+    # _NEW_SESSION_DELTA above the water (a real heating session is needed) and
+    # when a schedule expires — see coordinator.py.
+
     # READY: coordinator confirms near target or spa is exactly at target
     if latched or near or direction == "at_target":
         reason = "latched" if latched else ("near_target" if near else "at_target")

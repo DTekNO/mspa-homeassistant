@@ -400,6 +400,18 @@ The **Ready at** sensor gives a single, human-readable answer to "is the spa rea
 | `HH:MM +Nd` | Estimated ready time with a day offset (e.g. `+1d` = tomorrow) |
 | `unavailable` | No rate data yet, or nothing is heating and the spa is not at target |
 
+### Why it still says `Ready` after you turn the thermostat down
+
+Once the spa reaches temperature, `Ready` **stays** showing even if you then lower the thermostat well below the current water temperature. This is deliberate: after a soak you typically drop the setpoint to save energy, and the water stays hot for hours — so if you fancy a late-night second dip, the sensor should tell you the tub is ready *now*, not that it is busy cooling.
+
+`Ready` is released when there is genuinely something to wait for:
+
+- the setpoint moves more than 2 °C **above** the water (a real heating session — the sensor switches to a live ETA),
+- a scheduled session's ready time passes,
+- or you set a new schedule.
+
+One side effect worth knowing if you sit and experiment with the thermostat: with the water above the setpoint, the sensor reads `Ready` if the spa recently reached its setpoint, and `unknown` if it has not — the same water temperature can show either, depending on that history. It looks inconsistent in isolation, but the `Ready` behaviour is the useful one and it is kept on purpose.
+
 ### Which target is it talking about?
 
 The sensor identifies its **context** before estimating anything — this matters because a pending schedule may target a different temperature than the thermostat is currently set to.
