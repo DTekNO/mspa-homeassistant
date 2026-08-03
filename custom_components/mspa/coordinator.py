@@ -449,13 +449,28 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     )
 
             # Finish tracking when near_target is newly reached.
-            if (self.near_target and self._prediction is not None):
+            #
+            # near_target is updated later in this same poll, so the value read
+            # here is the PREVIOUS poll's.  That matters when the setpoint has
+            # just been raised: a prediction created moments ago would be
+            # "completed" against a stale near_target from before the change,
+            # recording a zero-duration session (observed: 31.5 → 35.0 °C
+            # started and finished in the same millisecond, actual 0 min,
+            # error -5910280273.8%).  A real session cannot complete inside the
+            # minimum sample window, so require at least that much elapsed
+            # before a completion is believed.
+            if (self.near_target and self._prediction is not None
+                    and (datetime.now(timezone.utc)
+                         - datetime.fromisoformat(self._prediction["start_time"])
+                         ).total_seconds() / 3600 >= _MIN_RATE_SAMPLE_HOURS):
                 start_iso = self._prediction["start_time"]
                 start_dt = datetime.fromisoformat(start_iso)
                 actual_minutes = (datetime.now(timezone.utc) - start_dt).total_seconds() / 60
                 est = self._prediction["estimated_minutes"]
                 error_minutes = actual_minutes - est
-                error_pct = (error_minutes / actual_minutes * 100) if actual_minutes > 0 else 0
+                # Guard the ratio too: a sub-minute duration would produce a
+                # meaningless percentage even if it got this far.
+                error_pct = (error_minutes / actual_minutes * 100) if actual_minutes >= 1 else 0
                 est_biased = self._prediction.get("estimated_minutes_biased", est)
                 error_minutes_biased = actual_minutes - est_biased
                 result = {
