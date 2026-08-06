@@ -8,21 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2026.8.1]
 
 A consolidation release for the **⚠️ Experimental [Predictive Scheduling](README.md#experimental-predictive-scheduling)**
-feature introduced in 2026.7.1. Nothing about the core spa controls changes.
-
-Predictive scheduling learns your spa's heating and cooling rates, then works
-backwards from a target time to decide when to start — the **Heat Schedule**
-sensor tells you when conditioning must begin, and **Ready at** tracks the live
-estimate through to `Ready`. Both are described in the README, with worked
-examples in [docs/heat_scheduler.md](docs/heat_scheduler.md).
-
-This release makes those two sensors substantially more trustworthy. The headline
-fix removes a systematic bias that had been re-teaching the model optimistic
-heating rates at the start of every session. Three further fixes stop `Ready`
-sticking — after the water has cooled, after you move the setpoint, and after a
-schedule finishes — and a restart part-way through a scheduled session no longer
-loses track of it. If you tried predictive scheduling in 2026.7.1 and found the
-estimates drifted or `Ready` got stuck, this is the release to retry with.
+feature from 2026.7.1 — the **Heat Schedule** and **Ready at** sensors are now
+substantially more trustworthy. A systematic bias that had been re-teaching the
+model optimistic heating rates is gone, three bugs that left `Ready` stuck are
+fixed, and the estimate no longer jumps around as it corrects. **If you tried
+predictive scheduling in 2026.7.1 and found the estimates drifted or `Ready` got
+stuck, this is the release to retry with.** Nothing about the core spa controls
+changes.
 
 ### Fixed — heating estimates
 
@@ -52,44 +44,32 @@ estimates drifted or `Ready` got stuck, this is the release to retry with.
 
 ### Added
 
-- **A real timestamp for automations.** The Ready at state is a short display
-  string (`10:34`, `10:34 +1d`, `Ready`) so it reads well on a dashboard. The
-  `ready_at` attribute now carries a full ISO 8601 timestamp whenever the state
-  shows a time — including while a schedule is pending and the spa is still
-  cooling toward a lower standby setpoint, which previously reported nothing at
-  all. A new `ready_at_kind` attribute distinguishes the schedule you set
-  (`sched`) from the integration's live prediction (`eta`).
-
-  The **Heat Schedule** sensor's `target_time` and `start_at` were already ISO
-  8601, so the computed start of a session can be used directly as an automation
-  trigger — useful if your spa needs a preparatory step before heating. See
+- **A real timestamp for automations.** `ready_at` now carries a full ISO 8601
+  timestamp whenever the state shows a time — including while a schedule is
+  pending and the spa is cooling toward a standby setpoint, which previously
+  reported nothing at all. `ready_at_kind` says whether that is the schedule you
+  set or a live prediction. The Heat Schedule sensor's `start_at` can be used the
+  same way, which helps if your spa needs a preparatory step before heating. See
   [Getting a timestamp instead of the display string](README.md#getting-a-timestamp-instead-of-the-display-string).
 
 ### Changed
 
-- **The Ready at estimate no longer jumps.** Corrections used to arrive in lumps —
-  each temperature crossing repaid the accumulated model error at once, e.g.
-  `12:19 → 12:49`. The display now follows at no more than 3 minutes per
-  wall-clock minute, so a 13-minute correction renders as a gentle ramp. Genuine
-  replans (you move the schedule or the setpoint) are still followed immediately,
-  and `minutes_remaining` and `ready_at` stay consistent with what is shown.
+- **The Ready at estimate no longer jumps.** Corrections used to arrive in lumps
+  (`12:19 → 12:49`); the display now ramps at up to 3 minutes per minute, while
+  genuine replans are still followed immediately.
 
-- **`effective_rate_deg_per_hour` now shows the rate actually in use.** It
-  previously reported the flat global average, which drives nothing — estimates
-  always integrate the per-temperature-band rates with their corrections. All
+- **`effective_rate_deg_per_hour` now shows the rate actually in use**, not the
+  flat global average, which drives nothing. All
   [sensor attributes](README.md#sensor-attributes) are documented in the README.
 
-- **Diagnostics are self-sufficient.** Log lines now carry the effective rate,
-  the flat average, the per-band rates with the ones observed this session marked,
-  and the correction factors — enough to diagnose rate behaviour without
-  inspecting entity attributes. Rate learning decisions (accepted, rejected, and
-  skipped-as-phase-uncertain samples) are logged at INFO, a few lines per hour.
+- **Diagnostics are self-sufficient** — log lines carry the effective rate, the
+  per-band rates and the correction factors, and rate learning decisions are
+  logged at INFO.
 
 ### Internal
 
-- Prediction-accuracy bookkeeping no longer records nonsense sessions: a setpoint
-  raise could write a zero-duration record, and a setpoint change during rapid
-  polling could create and cancel a prediction on every one-second poll.
+- Prediction-accuracy bookkeeping no longer records nonsense sessions from a
+  setpoint change.
 - Rate tracking extracted from the update loop and covered by tests, including a
   regression built from the log that exposed the phase-uncertainty defect.
   152 tests in total.
