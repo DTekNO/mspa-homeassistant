@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ready_at` reported nothing while a schedule was pending** — the Ready at state and its `ready_at` attribute were derived by two separate pieces of logic, and they disagreed. `extra_state_attributes` bailed out whenever the spa was `cooling`, so the common overnight case — a schedule set for tomorrow, the thermostat sitting at a lower maintenance setpoint, the water drifting down toward it — displayed `13:00 +1d` in the state while the attribute reported nothing at all.
+
+  Observed 2026-08-06: water 23 °C, thermostat 20 °C, schedule 39.5 °C for 13:00 the next day. State `13:00 +1d`, `ready_at` `Unknown`.
+
+  Both now come from the same decision (`_compute_ready_at`), so the attribute is populated whenever the state shows a time. This matters because the state is deliberately a short display string for dashboards — `ready_at` is how you get a real timestamp back, which is what anyone building an automation on this sensor needs. A new `ready_at_kind` attribute says which kind of time it is: `sched` (the time you asked for) or `eta` (the live prediction), since the two behave differently — a scheduled time is shown verbatim while an ETA is rate-slewed.
+
+  Four tests added, including the invariant that the state showing a clock time and `ready_at` being populated are the same condition.
+
+  For reference, the **Heat Schedule** sensor already exposed `target_time` and `start_at` as ISO 8601 UTC — those needed no change and are directly usable as automation triggers.
+
 - **First temperature step after heater-on poisoned the rate model** *(Experimental)* — the water temperature reports in 0.5 °C bands, so at heater-on the true temperature sits at an unknown position inside its band. The time to the *first* band crossing measures that random starting position, not the heating rate — on average it reads twice the true rate, and arbitrarily fast when the water started near a boundary. That phantom sample was fed into the rate EMA, the temperature bucket, and the session scalar at the start of every scheduled session, systematically re-teaching the model optimistic rates each morning.
 
   Observed 2026-07-31: heater on at 07:27 with water reported 33.0 °C; the crossing to 33.5 °C arrived after 11 minutes and was learned as 2.7 °C/h, dragging the rate EMA from 0.89 to 1.35 °C/h and collapsing the Ready at estimate from 15:34 to 12:16 against a 15:30 schedule — which it then spent the whole morning walking back, thirty minutes at a time.

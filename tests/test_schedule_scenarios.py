@@ -690,3 +690,75 @@ class TestLatchCoolOffRelease:
         assert c.ready_latched_temp == 30.0
         _apply_latch_rules(c, 28.0, 30.0)          # only 2 °C down from 30
         assert c.ready_latched is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# READY AT — the ready_at attribute must never disagree with the state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReadyAtAttributeMatchesState:
+    """`ready_at` is the machine-readable form of the state, so the two must be
+    derived from the same decision.
+
+    They used not to be: extra_state_attributes re-derived the time and bailed out
+    whenever the spa was cooling, so a pending schedule displayed "13:00 +1d" while
+    ready_at reported nothing — the spa was cooling toward a maintenance setpoint
+    below the schedule target.  That is the common overnight case, and it is the
+    attribute anyone restoring a timestamp after the state became a display string
+    will reach for.
+    """
+
+    def _attrs(self, c):
+        e = _readiness_sensor(c)
+        return MSpaReadinessSensor.extra_state_attributes.fget(e)
+
+    def test_schedule_pending_while_cooling_exposes_the_scheduled_time(self):
+        """The real 6 Aug case: water 23, thermostat 20 (cooling), schedule 39.5."""
+        sched = datetime.now(timezone.utc) + timedelta(hours=14, minutes=31)
+        c = MockCoordinator(
+            water_temp=23.0, target_temp=20.0,          # cooling toward maintenance
+            scheduled_ready_at=sched, schedule_target_temp=39.5,
+            heat_rate=1.05, cool_rate=0.15,
+        )
+        attrs = self._attrs(c)
+        assert attrs["direction"] == "cooling"
+        assert attrs["ready_at_kind"] == "sched"
+        assert attrs["ready_at"] == sched.isoformat(), "cooling must not blank the scheduled time"
+        # and it agrees with what the state shows
+        assert _ready_at(c) is not None
+
+    def test_ready_state_reports_no_timestamp(self):
+        c = MockCoordinator(water_temp=40.0, target_temp=40.0, near_target=True)
+        attrs = self._attrs(c)
+        assert _ready_at(c) == "Ready"
+        assert attrs["ready_at"] is None
+        assert attrs["ready_at_kind"] == "ready"
+
+    def test_free_heating_exposes_the_live_eta(self):
+        c = MockCoordinator(water_temp=30.0, target_temp=40.0, heat_rate=2.0, heater="on")
+        attrs = self._attrs(c)
+        assert attrs["ready_at_kind"] == "eta"
+        assert attrs["ready_at"] is not None
+        # ~5 h at 2 °C/h; generous bounds so the anchor logic isn't over-constrained
+        eta = datetime.fromisoformat(attrs["ready_at"])
+        hours = (eta - datetime.now(timezone.utc)).total_seconds() / 3600
+        assert 3.0 < hours < 7.0, f"implausible ETA: {hours:.1f} h"
+
+    def test_a_timestamp_is_present_whenever_the_state_shows_a_time(self):
+        """The invariant: state shows a clock time  <=>  ready_at is populated."""
+        sched = datetime.now(timezone.utc) + timedelta(hours=10)
+        cases = [
+            MockCoordinator(water_temp=23.0, target_temp=20.0,
+                            scheduled_ready_at=sched, schedule_target_temp=39.5,
+                            heat_rate=1.05, cool_rate=0.15),
+            MockCoordinator(water_temp=30.0, target_temp=40.0, heat_rate=2.0, heater="on"),
+            MockCoordinator(water_temp=40.0, target_temp=40.0, near_target=True),
+            MockCoordinator(water_temp=25.0, target_temp=20.0, cool_rate=0.15),
+        ]
+        for c in cases:
+            state = _ready_at(c)
+            attrs = self._attrs(c)
+            shows_time = bool(state and re.match(r"^\d{1,2}:\d{2}", state))
+            assert shows_time == (attrs["ready_at"] is not None), (
+                f"state={state!r} but ready_at={attrs['ready_at']!r}"
+            )

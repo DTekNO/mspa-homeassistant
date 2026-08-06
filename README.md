@@ -137,7 +137,7 @@ This section covers two sensors and one control entity that work together:
 
 | Entity | Type | Purpose |
 |--------|------|---------|
-| **Ready at** | Sensor | Estimated ready time — "10:34", "10:34 +1d", or "Ready". `minutes_remaining` available as attribute. |
+| **Ready at** | Sensor | Estimated ready time — "10:34", "10:34 +1d", or "Ready". `ready_at` (ISO 8601 timestamp) and `minutes_remaining` available as attributes. |
 | **Heat Schedule** | Sensor | Predicts when to start heating for a planned session |
 | **Scheduled for** | Control (datetime) | Set when you want the spa ready |
 
@@ -280,7 +280,8 @@ The **Ready at** sensor exposes diagnostic attributes useful while the algorithm
 | `direction` | `heating`, `cooling`, or `at_target` |
 | `minutes_remaining` | Integer minutes until target (null when ready or unavailable) |
 | `color` | `green` (ready), `red` (heating), `light-blue` (cooling) — for Mushroom card |
-| `ready_at` | ISO 8601 timestamp of estimated ready time (null when ready or unavailable) |
+| `ready_at` | **ISO 8601 UTC timestamp of the time shown in the state** — the scheduled ready time while a schedule is pending, the live estimate once heating. `null` only when the state is `Ready` or unknown. Use this if you need a machine-readable timestamp rather than the state's display string. |
+| `ready_at_kind` | What `ready_at` means: `sched` (the time you asked for), `eta` (live prediction), `ready`, or `none` |
 | `effective_rate_deg_per_hour` | Rate being used for the current estimate |
 | `computed_heat_rate_deg_per_hour` | Learned EMA heating rate (`null` until first sample) |
 | `computed_cool_rate_deg_per_hour` | Learned EMA cooling rate (`null` until first sample) |
@@ -297,6 +298,25 @@ The **Ready at** sensor exposes diagnostic attributes useful while the algorithm
 | `target_temperature` | Current set-point |
 
 You can inspect these in **Developer Tools → States** to see how the algorithm is performing.
+
+### Getting a timestamp instead of the display string
+
+The state is a short display string (`10:34`, `10:34 +1d`, `Ready`) so it reads
+well on a dashboard. For automations and templates use the `ready_at` attribute,
+which is a full ISO 8601 UTC timestamp:
+
+```jinja
+{{ state_attr('sensor.mspa_ready_at', 'ready_at') | as_datetime | as_local }}
+```
+
+It is populated whenever the state shows a time — including while a schedule is
+pending and the spa is still cooling toward a lower maintenance setpoint, which
+is the usual overnight case. `ready_at_kind` tells you whether that timestamp is
+the schedule you set (`sched`) or the integration's live prediction (`eta`).
+
+The **Heat Schedule** sensor exposes the same shape: `target_time` and `start_at`
+are both ISO 8601 UTC, so the computed start of a session is directly usable as a
+trigger.
 
 ### Availability
 

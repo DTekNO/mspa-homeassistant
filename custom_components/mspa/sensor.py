@@ -905,15 +905,22 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         except (TypeError, ValueError):
             water_temp = target_temp = None
 
-        now_utc = datetime.now(timezone.utc)
-        if latched or cooling:
-            ready_at_utc = None
-        elif smoothed is not None:
-            ready_at_utc = smoothed
-        elif target_temp is not None and direction == "heating":
-            ready_at_utc = _anchor_eta_utc(self.coordinator, target_temp, now_utc)
+        # Single source of truth: the attribute has to agree with the state.
+        # This used to re-derive the time independently, which disagreed with the
+        # display whenever a schedule was driving it — with a schedule pending and
+        # the spa cooling toward its maintenance setpoint the state showed
+        # "13:00 +1d" while ready_at reported nothing, because the old branch bailed
+        # out on `cooling`.  Deriving both from _compute_ready_at() removes the
+        # second opinion.
+        kind, kind_dt = _compute_ready_at(self.coordinator)
+        if kind == "sched":
+            # Scheduled times are shown verbatim and never slewed.
+            ready_at_utc = kind_dt
+        elif kind == "eta":
+            # Match the slewed display rather than the raw anchor estimate.
+            ready_at_utc = smoothed if smoothed is not None else kind_dt
         else:
-            ready_at_utc = None
+            ready_at_utc = None     # 'ready' / 'none' — there is no time to report
         ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
 
         # The rate actually in effect for the current estimate: segmented over
@@ -953,7 +960,13 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             "direction": direction,
             "minutes_remaining": rounded,
             "color": color,
+            # ISO 8601 UTC, or None when the state is "Ready"/unknown.  Templates:
+            #   {{ state_attr('sensor..._ready_at','ready_at') | as_datetime | as_local }}
             "ready_at": ready_at_ts,
+            # What that timestamp means, since it has two sources: 'sched' is the
+            # time you asked for, 'eta' is the live prediction.  'ready'/'none'
+            # accompany a null ready_at.
+            "ready_at_kind": kind,
             "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
             "computed_heat_rate_deg_per_hour": round(computed_heat, 3) if computed_heat is not None else None,
             "computed_cool_rate_deg_per_hour": round(computed_cool, 3) if computed_cool is not None else None,
