@@ -18,10 +18,11 @@ examples in [docs/heat_scheduler.md](docs/heat_scheduler.md).
 
 This release makes those two sensors substantially more trustworthy. The headline
 fix removes a systematic bias that had been re-teaching the model optimistic
-heating rates at the start of every session, and four separate bugs that left
-`Ready` showing when the spa was not are resolved. If you tried predictive
-scheduling in 2026.7.1 and found the estimates drifted or `Ready` got stuck, this
-is the release to retry with.
+heating rates at the start of every session. Three further fixes stop `Ready`
+sticking — after the water has cooled, after you move the setpoint, and after a
+schedule finishes — and a restart part-way through a scheduled session no longer
+loses track of it. If you tried predictive scheduling in 2026.7.1 and found the
+estimates drifted or `Ready` got stuck, this is the release to retry with.
 
 ### Fixed — heating estimates
 
