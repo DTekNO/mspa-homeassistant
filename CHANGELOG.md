@@ -5,63 +5,115 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2026.8.1]
 
-### Fixed
+A consolidation release for the **⚠️ Experimental [Predictive Scheduling](README.md#experimental-predictive-scheduling)**
+feature introduced in 2026.7.1. Nothing about the core spa controls changes.
 
-- **`ready_at` reported nothing while a schedule was pending** — the Ready at state and its `ready_at` attribute were derived by two separate pieces of logic, and they disagreed. `extra_state_attributes` bailed out whenever the spa was `cooling`, so the common overnight case — a schedule set for tomorrow, the thermostat sitting at a lower maintenance setpoint, the water drifting down toward it — displayed `13:00 +1d` in the state while the attribute reported nothing at all.
+Predictive scheduling learns your spa's heating and cooling rates, then works
+backwards from a target time to decide when to start — the **Heat Schedule**
+sensor tells you when conditioning must begin, and **Ready at** tracks the live
+estimate through to `Ready`. Both are described in the README, with worked
+examples in [docs/heat_scheduler.md](docs/heat_scheduler.md).
 
-  Observed 2026-08-06: water 23 °C, thermostat 20 °C, schedule 39.5 °C for 13:00 the next day. State `13:00 +1d`, `ready_at` `Unknown`.
+This release makes those two sensors substantially more trustworthy. The headline
+fix removes a systematic bias that had been re-teaching the model optimistic
+heating rates at the start of every session, and four separate bugs that left
+`Ready` showing when the spa was not are resolved. If you tried predictive
+scheduling in 2026.7.1 and found the estimates drifted or `Ready` got stuck, this
+is the release to retry with.
 
-  Both now come from the same decision (`_compute_ready_at`), so the attribute is populated whenever the state shows a time. This matters because the state is deliberately a short display string for dashboards — `ready_at` is how you get a real timestamp back, which is what anyone building an automation on this sensor needs. A new `ready_at_kind` attribute says which kind of time it is: `sched` (the time you asked for) or `eta` (the live prediction), since the two behave differently — a scheduled time is shown verbatim while an ETA is rate-slewed.
+### Fixed — heating estimates
 
-  Four tests added, including the invariant that the state showing a clock time and `ready_at` being populated are the same condition.
+- **Heating and cooling rates were learned systematically too fast.** The spa
+  reports water temperature in 0.5 °C bands, so at the moment heating starts the
+  true temperature sits somewhere unknown inside its band. The time to the *first*
+  band crossing measures that starting position rather than the rate — on average
+  reading about twice the truth, and arbitrarily fast if the water happened to
+  start near a boundary. That phantom sample was fed into the model at the start
+  of every session.
 
-  For reference, the **Heat Schedule** sensor already exposed `target_time` and `start_at` as ISO 8601 UTC — those needed no change and are directly usable as automation triggers.
+  Observed: a first crossing learned as 2.7 °C/h against a real 0.89 °C/h,
+  collapsing a Ready at estimate from 15:34 to 12:16 against a 15:30 schedule,
+  which the model then spent the whole morning walking back. The first crossing
+  after any heater state change is now used only to fix position; rate learning
+  begins at the second crossing, where the step runs boundary to boundary and
+  measures a true rate. Cooling was affected more often — its anchor re-arms on
+  *every* thermostat cycle — and gets the same treatment.
 
-- **First temperature step after heater-on poisoned the rate model** *(Experimental)* — the water temperature reports in 0.5 °C bands, so at heater-on the true temperature sits at an unknown position inside its band. The time to the *first* band crossing measures that random starting position, not the heating rate — on average it reads twice the true rate, and arbitrarily fast when the water started near a boundary. That phantom sample was fed into the rate EMA, the temperature bucket, and the session scalar at the start of every scheduled session, systematically re-teaching the model optimistic rates each morning.
+### Fixed — the `Ready` state and restarts
 
-  Observed 2026-07-31: heater on at 07:27 with water reported 33.0 °C; the crossing to 33.5 °C arrived after 11 minutes and was learned as 2.7 °C/h, dragging the rate EMA from 0.89 to 1.35 °C/h and collapsing the Ready at estimate from 15:34 to 12:16 against a 15:30 schedule — which it then spent the whole morning walking back, thirty minutes at a time.
+- **`Ready` could outlive the heat it advertised.** Lower the thermostat after a
+  soak and the sensor deliberately keeps showing `Ready`, because the water
+  genuinely is still usable for a late dip. But nothing ever withdrew it: two days
+  later, water at 24 °C with a 20 °C setpoint was still "above target" and still
+  reported `Ready`. It now withdraws once the water has cooled more than 3 °C
+  below the warmest point reached — so `Ready` survives the thermostat drop and
+  the first hours of cooling, then stands down. Normal cycling at temperature
+  cannot trigger it. The rationale is written up under
+  [Why it still says `Ready`](README.md#why-it-still-says-ready-after-you-turn-the-thermostat-down).
 
-  The first crossing after heater-on (or after any heating interruption) now re-anchors only — it is exact *position* information, placing the anchor precisely on a band boundary — and rate learning starts from the second crossing, where every step runs boundary-to-boundary and measures a true rate. Until then the previously learned rates keep driving the estimates.
+- **`Ready` stayed stuck after raising the thermostat.** Once the spa had reached
+  its setpoint, raising the setpoint left `Ready` displayed with degrees still to
+  heat instead of recalculating. Observed moving the climate control 40 → 31 → 40:
+  the return to 40 showed `Ready` with 9 °C to go. It now recalculates as soon as
+  a real heating gap opens.
 
-- **Cooling rate learning had the same phase defect, amplified** *(Experimental)* — the cooling anchor is re-armed every time the heater stops, i.e. on *every thermostat cycle*, so each off-period injected one phase-biased (fast) sample into the cooling EMA. The same two-crossings rule now applies: the first temperature change after heater-off fixes the position, the second is the first learned cooling rate. A first *upward* change (sun warming the water) also consumes the guard, since any crossing lands the anchor exactly on a band boundary.
+- **`Ready` stayed stuck after a schedule finished.** The schedule's automatic
+  expiry cleared its own state but not the readiness latch, so the sensor showed
+  `Ready` indefinitely — through cool-down and thermostat changes — until a new
+  schedule was set or the integration reloaded. Expiry now releases it, and the
+  sensor goes back to following the thermostat.
 
-- **Restart mid-scheduled-heating forgot the trigger had fired** *(Experimental)* — `_schedule_triggered` was not persisted, so after a restart the scheduler dropped back to *pending* and computed a fresh start time for a heater that was already running (observed: `Start at 10:38` displayed two hours into an active session, with the trigger set to re-fire and resend the setpoint). The flag is now persisted with the other learning state and restored on startup. If the schedule itself is gone or expired when entities restore — HA down past the target time — the stale flag is cleared so the sensors fall back to the free context instead of reporting a phantom scheduled-heating session.
+- **A restart during scheduled heating forgot the session had started.** The
+  scheduler dropped back to *pending* and computed a fresh start time for a heater
+  that was already running (observed: `Start at 10:38` displayed two hours into an
+  active session). That state is now saved and restored, and a schedule that
+  expired while Home Assistant was down no longer leaves a phantom session behind.
 
-- **Ready at stayed pinned on `Ready` after the scheduled time passed** *(Experimental)* — the readiness latch exists to hold `Ready` steady through the scheduled session, but the schedule's expiry auto-clear reset the trigger state without releasing the latch. The sensor then showed `Ready` indefinitely — through cool-down, thermostat changes, everything — until the next schedule was set or the integration was reloaded (reload initialises the latch to false, which is why reloading appeared to fix it). The expiry now retires the latch together with the rest of the schedule state, so the sensor returns to following the thermostat: it still reads `Ready` immediately after the session if the water genuinely is at the setpoint (`near_target` earns that on its own), goes to unknown as the spa cools with a lowered setpoint, and shows a live ETA if the thermostat keeps maintaining temperature.
+### Added
 
-- **`Ready` could outlive the heat it advertised** *(Experimental)* — the readiness latch deliberately keeps showing `Ready` when you lower the thermostat after a soak, so a late-night second dip shows as available rather than as a wait. But the latch had no way to know whether that was still true: drop the setpoint to 20 °C with the water at 40 °C, and two days later the water at 24 °C is still "above target", so nothing released the latch and the sensor would happily report a tub nobody wants to get into as `Ready`.
+- **A real timestamp for automations.** The Ready at state is a short display
+  string (`10:34`, `10:34 +1d`, `Ready`) so it reads well on a dashboard. The
+  `ready_at` attribute now carries a full ISO 8601 timestamp whenever the state
+  shows a time — including while a schedule is pending and the spa is still
+  cooling toward a lower standby setpoint, which previously reported nothing at
+  all. A new `ready_at_kind` attribute distinguishes the schedule you set
+  (`sched`) from the integration's live prediction (`eta`).
 
-  The latch now also releases once the water has cooled more than 3 °C below the warmest point it reached while latched — measured from the peak, since thermostat cycling nudges the temperature either side of the setpoint. In practice `Ready` survives the thermostat drop and the first couple of hours of cooling, then withdraws. Normal cycling at temperature cannot trigger it.
-
-- **Ready at stayed pinned on `Ready` after raising the thermostat** *(Experimental)* — the readiness latch was released when a schedule expired but not when the setpoint moved. Once the spa had reached its setpoint and latched, raising the setpoint left the latch set, so Ready at reported `Ready` with degrees still to heat instead of recalculating. Observed by moving the climate control 40 → 31 → 40 °C: at 31/31 the spa latched, and the return to 40 left `Ready` displayed with 9 °C to go.
-
-  The latch now releases when a genuine heating gap opens — more than 2 °C below setpoint, the same threshold that defines a new heating session. Lowering the thermostat while the spa is warm still shows `Ready` (the water genuinely is), and normal thermostat cycling of ±0.5–1 °C cannot flicker the latch off and on.
-
-- **Raising the setpoint could record a zero-duration prediction** *(Experimental)* — the session-completion check reads `near_target`, which is refreshed *later* in the same poll, so it saw the previous poll's value. Immediately after a setpoint raise that meant a just-created prediction was completed against a stale "we're at target" flag from before the change, writing a nonsense record: observed as `31.5 °C → 35.0 °C | estimated 211 min, actual 0 min | error -211 min (-5910280273.8%)` logged in the same millisecond as its own `PREDICTION_START`. The bias was protected (the ratio guard rejects it), but the record consumed a slot in the ten-session history. A completion is now believed only after at least the minimum sample window has genuinely elapsed, and the error percentage is guarded against sub-minute durations.
-
-- **Changing the setpoint churned prediction records during rapid polling** *(Experimental)* — prediction tracking started whenever the water was more than 2 °C below setpoint, without checking that the spa was actually in full-heat mode, while the cancellation *did* check. A setpoint change therefore created and immediately cancelled a prediction on every 1-second rapid poll — seven `PREDICTION_START` / `PREDICTION_CANCELLED` pairs in seven seconds — because the device briefly drops out of full-heat mode while it recalculates. Creation is now gated on the same signal the cancellation uses, so no poll can both start and end a session.
-
-- **`effective_rate_deg_per_hour` attribute showed the flat EMA, not the effective rate** *(Experimental)* — the attribute (and the `rate=` field in the Ready at / Heat Schedule log lines) displayed the global flat EMA, which drives nothing: estimation always integrates the per-bucket rates with corrections and bias. The attribute and logs now show the true segmented effective rate over the span to the display-driving target (e.g. `0.86 °C/h` for a 37→39.5 °C span priced by the hot bucket, while the flat EMA read `1.02`).
+  The **Heat Schedule** sensor's `target_time` and `start_at` were already ISO
+  8601, so the computed start of a session can be used directly as an automation
+  trigger — useful if your spa needs a preparatory step before heating. See
+  [Getting a timestamp instead of the display string](README.md#getting-a-timestamp-instead-of-the-display-string).
 
 ### Changed
 
-- **Ready at ETA corrections now land as bounded ramps** *(Experimental)* — the live estimate corrects in lumps (each temperature crossing repays the accumulated model error at once, e.g. `12:19 → 12:49`) and creeps +1 min/min while the anchor is stale. The displayed ETA now follows the raw estimate at no more than **3 minutes per wall-clock minute**, so a 13-minute correction renders as a ~4-minute ramp instead of a jump, while the honest +1 min/min stale creep passes through undistorted. Corrections beyond 30 minutes are genuine replans (schedule or setpoint changes) and are followed immediately, as are transitions between display regimes (`Ready`, scheduled time, no data). The `minutes_remaining` and `ready_at` attributes derive from the same smoothed value, so dashboards stay consistent with the state.
+- **The Ready at estimate no longer jumps.** Corrections used to arrive in lumps —
+  each temperature crossing repaid the accumulated model error at once, e.g.
+  `12:19 → 12:49`. The display now follows at no more than 3 minutes per
+  wall-clock minute, so a 13-minute correction renders as a gentle ramp. Genuine
+  replans (you move the schedule or the setpoint) are still followed immediately,
+  and `minutes_remaining` and `ready_at` stay consistent with what is shown.
 
-- **Self-sufficient diagnostics logging** *(Experimental)* — log lines now carry everything needed to diagnose rate behaviour without inspecting entity attributes:
-  - Ready at / Heat Schedule transition lines include `eff=` (segmented effective rate), `ema=` (flat average, labelled apart), `buckets=cold/mid/hot` with `*` marking buckets observed this session (used verbatim, superseding corrections), `scalar=`, `amb=`, and `bias=`.
-  - `PREDICTION_START` includes the bucket rates in force at session start.
-  - `start time moved` includes the effective rate behind the recomputed heating minutes.
-  - Rate learning events promoted from DEBUG to INFO: accepted and rejected heat/cool samples, and the phase-uncertain first-crossing skips — the primary evidence in rate diagnosis, at a few lines per hour.
+- **`effective_rate_deg_per_hour` now shows the rate actually in use.** It
+  previously reported the flat global average, which drives nothing — estimates
+  always integrate the per-temperature-band rates with their corrections. All
+  [sensor attributes](README.md#sensor-attributes) are documented in the README.
+
+- **Diagnostics are self-sufficient.** Log lines now carry the effective rate,
+  the flat average, the per-band rates with the ones observed this session marked,
+  and the correction factors — enough to diagnose rate behaviour without
+  inspecting entity attributes. Rate learning decisions (accepted, rejected, and
+  skipped-as-phase-uncertain samples) are logged at INFO, a few lines per hour.
 
 ### Internal
 
-- Heating and cooling rate tracking extracted from the update loop into `_track_heating_rate` / `_track_cooling_rate` and covered by 11 new tests, including a regression built from the 2026-07-31 log. Trigger-flag restore semantics covered by 5 further tests. ETA slew behaviour covered by 7 more.
-- `_compute_ready_at_value` split into `_compute_ready_at` (returns display kind + raw ETA datetime) and a formatting wrapper, so the Ready at sensor can slew the ETA while the Heat Schedule sensor keeps the shared, unsmoothed readiness definition.
-- Audited all remaining places that anchor on a reported temperature for the same band-phase blindness. The ETA anchor, the schedule trigger's minutes computation, and the prediction accuracy bookkeeping all read mid-band values at session start — their errors are bounded to half a band, lean conservative (later ETAs, earlier starts), and self-correct at the first crossing, so they are documented rather than changed.
-
----
+- Prediction-accuracy bookkeeping no longer records nonsense sessions: a setpoint
+  raise could write a zero-duration record, and a setpoint change during rapid
+  polling could create and cancel a prediction on every one-second poll.
+- Rate tracking extracted from the update loop and covered by tests, including a
+  regression built from the log that exposed the phase-uncertainty defect.
+  152 tests in total.
 
 ## [2026.7.1] - 2026-07-30
 
