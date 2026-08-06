@@ -4,6 +4,84 @@ Ideas and planned features that are not yet scheduled for a specific release.
 
 ---
 
+## Pre-roll Hook for the Scheduled Start
+
+### Problem
+
+The scheduler's startup is deliberately minimal: at `start_at` it sets the target
+temperature and turns the heater on. Nothing else. That is right for most spas,
+but some hardware needs a preparatory step first.
+
+Reported by a user whose flow sensor throws F1 unless water is already moving —
+they run the jets briefly before the heater to get flow going. They can do that
+today with a template trigger on the Heat Schedule sensor's `start_at` attribute,
+but it is inference rather than notification, and it has a real gap: `start_at`
+is recomputed every poll, so if it moves earlier by more than the automation's
+lead time — a faster-than-expected cool-down, or a replan after a setpoint change
+— the pre-hook can be skipped entirely and the heater starts with no preparation.
+The one-sided form below latches instead of missing, but it can still fire *late*:
+
+```jinja
+{% set s = state_attr('sensor.mspa_heat_schedule', 'start_at') %}
+{{ s is not none and now() >= (s | as_datetime) - timedelta(minutes=5) }}
+```
+
+There is also no ordering guarantee. The integration cannot promise the event
+reaches the automation before it commands the heater, because it never emits one.
+
+### Design
+
+A configurable **pre-roll**, default unset. When unset nothing changes and no
+event fires — existing installations are unaffected.
+
+When set, `_check_schedule_trigger` fires an event at `start_at − pre_roll`,
+waits out the pre-roll via `async_call_later`, then performs the existing
+setpoint and heater commands. Automations subscribe with `trigger: event`.
+
+**The plan must freeze for the duration.** This is the part that turns the event
+from a hint into a guarantee: once the integration has announced "starting in N
+minutes" it must not re-plan, or the heater could fire before the pre-roll
+elapses (start moves earlier) or long after the automation's preparation has
+finished (start moves later). Continuous re-evaluation is the predictor's main
+virtue, so giving it up is a real cost — which is why the pre-roll wants a hard
+cap. **10 minutes** is a reasonable bound: at typical rates around 1 °C/h the
+water moves ~0.17 °C over that window, so the abandoned re-planning is worth far
+less than the ordering guarantee.
+
+Event payload should carry the frozen `start_at`, `target_time` and
+`target_temperature`, so an automation can time itself against the real
+actuation moment rather than hardcoding a delay that duplicates the config.
+
+### Must-haves
+
+- **Persist the commitment.** A restart inside the pre-roll window must not lose
+  it, or the event re-fires and the heater may start early. This is the same
+  class of bug as the `_schedule_triggered` persistence fix — freeze state and
+  frozen start time belong with the other stored scheduler state.
+- **Cancel on a new schedule.** If the user moves or clears the schedule during
+  the pre-roll, the commitment must be abandoned rather than honouring a plan
+  that has been replaced — mirroring how a new schedule resets
+  `_schedule_triggered`.
+- **Fire at most once per schedule**, guarded like `_schedule_triggered`.
+- **Fire even when no heating is needed.** With the spa already at target,
+  `minutes_needed == 0` and `start_at == target_time`; the preparation step is
+  still wanted, so the event should fire `pre_roll` before the target time.
+
+### Notes
+
+Granularity is bounded by `DEFAULT_SCAN_INTERVAL` (60 s), so the pre-roll is
+minutes, not seconds — a few seconds of lead would sit inside the scheduler's own
+jitter and could land after the heater command. That suits the motivating case
+anyway, where a couple of minutes of jet flow is what actually clears the sensor.
+
+Not built yet, deliberately. One user with a sticky flow sensor is enough to know
+the *shape* is right but not enough to fix the payload. If a second request
+arrives, that will say whether the hook should stay generic (an event, integration
+knows nothing about jets) or become a concrete "run jets for N seconds before
+heating" option.
+
+---
+
 ## Cancelling a Heat Schedule
 
 ### Problem
