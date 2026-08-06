@@ -26,51 +26,29 @@ estimates drifted or `Ready` got stuck, this is the release to retry with.
 
 ### Fixed — heating estimates
 
-- **Heating and cooling rates were learned systematically too fast.** The spa
-  reports water temperature in 0.5 °C bands, so at the moment heating starts the
-  true temperature sits somewhere unknown inside its band. The time to the *first*
-  band crossing measures that starting position rather than the rate — on average
-  reading about twice the truth, and arbitrarily fast if the water happened to
-  start near a boundary. That phantom sample was fed into the model at the start
-  of every session.
-
-  Observed: a first crossing learned as 2.7 °C/h against a real 0.89 °C/h,
-  collapsing a Ready at estimate from 15:34 to 12:16 against a 15:30 schedule,
-  which the model then spent the whole morning walking back. The first crossing
-  after any heater state change is now used only to fix position; rate learning
-  begins at the second crossing, where the step runs boundary to boundary and
-  measures a true rate. Cooling was affected more often — its anchor re-arms on
-  *every* thermostat cycle — and gets the same treatment.
+- **Heating and cooling rates were learned systematically too fast.** Water
+  temperature reports in 0.5 °C bands, so the first band crossing after heating
+  starts measures where inside the band the water happened to be, not how fast it
+  is warming — reading roughly double the truth. It is now used only to fix
+  position, with rate learning starting from the second crossing. Cooling was
+  affected on every thermostat cycle and gets the same treatment.
 
 ### Fixed — the `Ready` state and restarts
 
-- **`Ready` could outlive the heat it advertised.** Lower the thermostat after a
-  soak and the sensor deliberately keeps showing `Ready`, because the water
-  genuinely is still usable for a late dip. But nothing ever withdrew it: two days
-  later, water at 24 °C with a 20 °C setpoint was still "above target" and still
-  reported `Ready`. It now withdraws once the water has cooled more than 3 °C
-  below the warmest point reached — so `Ready` survives the thermostat drop and
-  the first hours of cooling, then stands down. Normal cycling at temperature
-  cannot trigger it. The rationale is written up under
+- **`Ready` could outlive the heat it advertised.** Lowering the thermostat after
+  a soak deliberately keeps `Ready` showing, but nothing ever withdrew it — water
+  at 24 °C two days later still reported ready. It now stands down once the water
+  has cooled 3 °C below its peak; see
   [Why it still says `Ready`](README.md#why-it-still-says-ready-after-you-turn-the-thermostat-down).
 
-- **`Ready` stayed stuck after raising the thermostat.** Once the spa had reached
-  its setpoint, raising the setpoint left `Ready` displayed with degrees still to
-  heat instead of recalculating. Observed moving the climate control 40 → 31 → 40:
-  the return to 40 showed `Ready` with 9 °C to go. It now recalculates as soon as
-  a real heating gap opens.
+- **`Ready` stayed stuck after raising the thermostat**, showing ready with
+  degrees still to heat instead of recalculating.
 
-- **`Ready` stayed stuck after a schedule finished.** The schedule's automatic
-  expiry cleared its own state but not the readiness latch, so the sensor showed
-  `Ready` indefinitely — through cool-down and thermostat changes — until a new
-  schedule was set or the integration reloaded. Expiry now releases it, and the
-  sensor goes back to following the thermostat.
+- **`Ready` stayed stuck after a schedule finished**, persisting through cool-down
+  until a new schedule was set or the integration reloaded.
 
-- **A restart during scheduled heating forgot the session had started.** The
-  scheduler dropped back to *pending* and computed a fresh start time for a heater
-  that was already running (observed: `Start at 10:38` displayed two hours into an
-  active session). That state is now saved and restored, and a schedule that
-  expired while Home Assistant was down no longer leaves a phantom session behind.
+- **A restart during scheduled heating forgot the session had started**, and
+  computed a fresh start time for a heater that was already running.
 
 ### Added
 
