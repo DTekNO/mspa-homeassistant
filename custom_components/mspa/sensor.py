@@ -471,8 +471,28 @@ _UNSET = object()
 # quantization effects land as gentle ramps.  A move larger than the snap
 # threshold is a genuine replan (schedule/setpoint change) and is followed
 # immediately.
-_ETA_SLEW_MIN_PER_MIN = 3.0   # max displayed-ETA movement per wall-clock minute
-_ETA_SNAP_MIN = 30.0          # corrections beyond this snap instead of slewing
+_ETA_SLEW_MIN_PER_MIN = 1.0   # max displayed-ETA movement per wall-clock minute
+_ETA_DEADBAND_MIN = 5.0       # ignore raw movement smaller than this
+_ETA_ROUND_MIN = 5            # display granularity, minutes
+
+# Why these values.  The first attempt capped movement at 3 min per wall minute
+# and snapped anything beyond 30 min, on the theory that a large correction meant
+# the user had replanned.  Measured over an 11 h session (2026-08-06/07) that gave
+# 166 display changes, 39 in the worst hour, 14 direction reversals, and the cap
+# saturated on 30% of steps — it was acting as a speed limiter pegged at its
+# limit, not as a smoother.  Three things were wrong:
+#
+#   * 3 min/min is 1.5 min per 30 s poll, so the cap almost never bound on the
+#     ±1-2 min jitter that produced most of the churn.
+#   * There was no deadband, so every wiggle — including reversals — rendered.
+#   * Snapping on magnitude caught the wrong events.  Both large jumps that
+#     session (-68 min, +38 min) came from rate-learning samples, not from the
+#     user: a single sample early in a 16 h heat-up moves the ETA by more than
+#     30 min, so precisely the corrections most in need of smoothing bypassed it.
+#
+# Snapping is now driven by cause rather than size (see _replan_key), and the
+# display is rounded because minute precision on an estimate hours out is
+# spurious: it guarantees visible churn however the slew is tuned.
 
 
 def _fmt_local(dt_utc: "datetime") -> str:
@@ -820,6 +840,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         self._attr_device_info = self.device_info
         self._eta_display: "datetime | None" = None   # slewed ETA shown to the user
         self._eta_wall: "datetime | None" = None      # wall clock of last slew step
+        self._eta_plan_key = None                     # plan identity; a change snaps
+        self._eta_closing = False                     # mid-correction hysteresis latch
 
     @property
     def available(self):
@@ -828,30 +850,71 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         # Available whenever we have enough data to determine a state.
         return _spa_direction(self.coordinator) is not None or self.coordinator.ready_latched
 
-    def _slew_eta(self, raw_eta, now_utc=None):
-        """Move the displayed ETA toward raw_eta at a bounded rate.
+    def _replan_key(self):
+        """Identity of the plan being estimated.
 
-        The raw estimate corrects in lumps (each temperature crossing repays
-        the accumulated model error at once) and creeps +1 min/min while the
-        anchor is stale.  The displayed value follows at no more than
-        _ETA_SLEW_MIN_PER_MIN per wall-clock minute, so both effects render
-        as bounded ramps.  A correction beyond _ETA_SNAP_MIN is a genuine
-        replan (schedule or setpoint change) and is followed immediately.
+        A change here means the user moved something — the schedule time, the
+        schedule target, or the thermostat — and the ETA should jump to the new
+        answer rather than crawl to it.  Everything else, however large, is the
+        model revising its own estimate and gets slewed.
+        """
+        c = self.coordinator
+        try:
+            setpoint = float(c._last_data.get("target_temperature"))
+        except (TypeError, ValueError):
+            setpoint = None
+        return (c.scheduled_ready_at, c.schedule_target_temp, setpoint)
+
+    def _slew_eta(self, raw_eta, now_utc=None):
+        """Move the displayed ETA toward raw_eta, smoothly and coarsely.
+
+        Three mechanisms, in order:
+          * replan snap — if the plan itself changed (_replan_key), adopt the new
+            estimate immediately; the old one is answering a different question.
+          * deadband with hysteresis — a gap under _ETA_DEADBAND_MIN never *starts*
+            movement, so jitter and small reversals are ignored; but once moving,
+            the gap is closed completely rather than stalling at the deadband
+            edge, which would otherwise leave a permanent lag of up to
+            _ETA_DEADBAND_MIN behind the real estimate.
+          * rate cap — otherwise close the gap at no more than
+            _ETA_SLEW_MIN_PER_MIN per wall-clock minute.
+
+        The returned value is rounded to _ETA_ROUND_MIN for display.  The
+        unrounded position is kept internally so repeated small steps still
+        accumulate instead of being rounded away each time.
         """
         now = now_utc or datetime.now(timezone.utc)
-        if self._eta_display is None or self._eta_wall is None:
+        key = self._replan_key()
+        replanned = (self._eta_plan_key is not None and key != self._eta_plan_key)
+
+        if self._eta_display is None or self._eta_wall is None or replanned:
+            if replanned:
+                _LOGGER.debug("ETA slew: plan changed, snapping to %s", raw_eta.isoformat())
             self._eta_display = raw_eta
+            self._eta_closing = False
         else:
             delta_min = (raw_eta - self._eta_display).total_seconds() / 60.0
-            if abs(delta_min) > _ETA_SNAP_MIN:
-                self._eta_display = raw_eta
-            else:
+            if abs(delta_min) >= _ETA_DEADBAND_MIN:
+                self._eta_closing = True
+            elif abs(delta_min) < 0.5:
+                self._eta_closing = False
+            if self._eta_closing:
                 dt_min = max((now - self._eta_wall).total_seconds() / 60.0, 0.0)
                 cap = _ETA_SLEW_MIN_PER_MIN * dt_min
                 step = min(max(delta_min, -cap), cap)
                 self._eta_display = self._eta_display + timedelta(minutes=step)
+
         self._eta_wall = now
-        return self._eta_display
+        self._eta_plan_key = key
+        return self._round_eta(self._eta_display)
+
+    @staticmethod
+    def _round_eta(dt):
+        """Round to the nearest _ETA_ROUND_MIN for display."""
+        q = _ETA_ROUND_MIN * 60
+        secs = dt.hour * 3600 + dt.minute * 60 + dt.second
+        shift = round(secs / q) * q - secs
+        return (dt + timedelta(seconds=shift)).replace(second=0, microsecond=0)
 
     @property
     def native_value(self):
@@ -863,6 +926,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             # the slew state resets so the next ETA regime starts fresh.
             self._eta_display = None
             self._eta_wall = None
+            self._eta_plan_key = None
+            self._eta_closing = False
             val = ("Ready" if kind == "ready"
                    else _fmt_local(dt) if dt is not None else None)
         prev = getattr(self, "_logged_state", _UNSET)
@@ -884,7 +949,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         # Keep the attributes consistent with the slewed state display: when a
         # smoothed ETA is being shown, minutes_remaining and ready_at derive
         # from it rather than from the raw anchor estimate.
-        smoothed = self._eta_display
+        smoothed = (self._round_eta(self._eta_display)
+                    if self._eta_display is not None else None)
         if smoothed is not None and not latched and not cooling:
             mins = max(0, round(
                 (smoothed - datetime.now(timezone.utc)).total_seconds() / 60
