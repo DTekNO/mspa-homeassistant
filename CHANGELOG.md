@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Heating rates are now measured over a growing window rather than a single
+  temperature step.** Each 0.5 °C step took about half an hour, and rate is
+  distance over time, so a few minutes of report-timing jitter swamped the
+  measurement — 18% scatter between consecutive samples. That noise was the
+  remaining source of Ready at moving around, and worse, it was dragging the
+  learned cold-water rate *below* the truth: 0.98 °C/h stored against 1.14 °C/h
+  actually achieved.
+
+  Each sample now measures from the first temperature boundary reached in the
+  current range through to the latest one, so the span widens as heating
+  progresses and the estimate keeps sharpening. This is sound because every
+  reported step lands on the same 0.5 °C grid, so a wide span is no less exact
+  than a narrow one — just far less noisy. Scatter falls from 18% to 7% in the
+  cold range and from 3% to 1% in the middle one, reaching 0.4% once the span
+  passes 2 °C, and the learned rates land within a few hundredths of what the
+  spa actually did.
+
+  Side benefit: a pair of glitched readings — one report late, the next early —
+  used to be learned as a spuriously slow rate, because the impossible one was
+  rejected and the slow one kept. A wide span absorbs both.
+
 ### Fixed
 
 - **The Ready at time no longer wobbles.** During a long heating session the

@@ -208,3 +208,77 @@ class TestPredictionCreationGating:
         for hs in (0, 2):
             assert would_cancel(hs, False, {})
         assert not would_cancel(_HEAT_STATE_FULL, False, {})
+
+
+class TestGrowingWindow:
+    """The rate is measured from the first band boundary reached in the current
+    bucket, not from the previous crossing.
+
+    Every crossing lands exactly on a 0.5 °C boundary, so any
+    boundary-to-boundary span is equally phase-exact — a wider span is no more
+    biased and much less noisy, since rate is delta/elapsed and report-timing
+    jitter matters far less over hours than over one 30-minute step.
+
+    Regression source: 2026-08-06 session.  Per-step sampling measured 18% noise
+    in the cold bucket and dragged its stored rate to 0.98 °C/h against a
+    realised 1.14; the growing window gives 7% and 1.08.
+    """
+
+    def test_anchor_is_held_within_a_bucket(self):
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)                    # phase-uncertain anchor
+        c._track_heating_rate(33.5, 3, 10 * _MIN)             # re-anchors here
+        assert c._rate_last_temp == 33.5
+        c._track_heating_rate(34.0, 3, 40 * _MIN)             # learned; anchor must hold
+        assert c._rate_last_temp == 33.5, "anchor advanced — window did not grow"
+        c._track_heating_rate(34.5, 3, 70 * _MIN)
+        assert c._rate_last_temp == 33.5, "anchor advanced on the third crossing"
+
+    def test_rate_is_measured_over_the_whole_span(self):
+        """Asymmetric timings separate the two schemes: a 15-minute final step
+        reads 2.0 °C/h alone but 1.2 °C/h across the window."""
+        c = _coord(heat_rate_buckets=[None, 1.20, None], computed_heat_rate=1.20)
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 10 * _MIN)             # anchor at 33.5 @ 10 min
+        c._track_heating_rate(34.0, 3, 40 * _MIN)             # 0.5 °C / 0.5 h = 1.0
+        after_first = c.heat_rate_buckets[1]
+        c._track_heating_rate(34.5, 3, 55 * _MIN)             # window: 1.0 °C / 0.75 h = 1.333
+        # per-step would have been 0.5 °C / 0.25 h = 2.0 °C/h, pulling the bucket
+        # far higher; the window keeps it near the true ~1.2
+        expected = after_first + 0.25 * (1.0 / 0.75 - after_first)
+        assert abs(c.heat_rate_buckets[1] - expected) < 1e-6
+        per_step = after_first + 0.25 * (2.0 - after_first)
+        assert c.heat_rate_buckets[1] < per_step - 0.05, "looks like per-step sampling"
+
+    def test_window_closes_at_a_bucket_boundary(self):
+        """Each bucket models a different loss regime and must be measured alone."""
+        c = _coord(heat_rate_buckets=[1.10, 1.00, None])
+        c._track_heating_rate(29.0, 3, 0.0)
+        c._track_heating_rate(29.5, 3, 20 * _MIN)             # anchor at 29.5, bucket 0
+        c._track_heating_rate(30.0, 3, 50 * _MIN)             # crosses into bucket 1
+        assert c._rate_last_temp == 30.0, "window must close at the bucket boundary"
+        assert 1 not in c._session_fresh_buckets, "span belongs to the anchor's bucket"
+        assert 0 in c._session_fresh_buckets
+
+    def test_window_closes_on_a_rejected_sample(self):
+        """A bad span must never be re-used as an anchor for later samples."""
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 10 * _MIN)
+        before = c.computed_heat_rate
+        c._track_heating_rate(34.0, 3, 13 * _MIN)             # 0.5 °C in 3 min = 10 °C/h
+        assert c.computed_heat_rate == before, "outlier should have been rejected"
+        assert c._rate_last_temp == 34.0, "anchor must advance past a rejected span"
+
+    def test_interruption_still_rearms_the_phase_guard(self):
+        """Heater-off must discard the window, not merely pause it."""
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 10 * _MIN)
+        c._track_heating_rate(34.0, 3, 40 * _MIN)
+        c._track_heating_rate(34.0, 1, 45 * _MIN)             # heater drops out
+        assert c._rate_last_temp is None
+        before = c.computed_heat_rate
+        c._track_heating_rate(34.0, 3, 50 * _MIN)             # fresh anchor
+        c._track_heating_rate(34.5, 3, 53 * _MIN)             # phase-uncertain again
+        assert c.computed_heat_rate == before, "first crossing after resume was learned"

@@ -52,6 +52,17 @@ _LOGGER = logging.getLogger(__name__)
 # Bounds are intentionally generous: even a tiny spa at max power can't exceed
 # ~5 °C/h, and below the minimum the signal is just sensor noise / drift.
 _MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
+
+
+# Temperature-bucket boundaries, mirroring sensor._HEAT_BUCKET_T1/_T2.  Defined
+# here too so the coordinator does not import from the sensor platform.
+_HEAT_BUCKET_T1 = 30.0
+_HEAT_BUCKET_T2 = 37.0
+
+
+def _heat_bucket_index(temp: float) -> int:
+    """Bucket index for a water temperature: 0 cold, 1 mid, 2 near-setpoint."""
+    return 0 if temp < _HEAT_BUCKET_T1 else 1 if temp < _HEAT_BUCKET_T2 else 2
 _MIN_HEAT_RATE = 0.05             # °C/h — below this is noise / flat
 _MAX_HEAT_RATE = 3.0              # °C/h — above this is an outlier
 _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
@@ -793,7 +804,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self.ready_latched_temp = None
 
     def _track_heating_rate(self, curr_temp, heat_state, now_mono: float) -> None:
-        """Sample the observed heating rate from 0.5 °C temperature steps.
+        """Sample the observed heating rate over a growing per-bucket window.
 
         Only samples in full-heat mode (heat_state == 3) to avoid preheat and
         cooling skew.
@@ -804,8 +815,38 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         crossing measures that random phase, not the rate (~2x fast on
         average, arbitrarily fast when the water started near a boundary).
         That crossing re-anchors only — the anchor is then exactly on a band
-        boundary — and learning starts from the second crossing, where every
-        step runs boundary-to-boundary and is a true rate.
+        boundary — and learning starts from the second crossing.
+
+        From there the anchor is *held*, so each sample measures from the first
+        boundary reached in this bucket to the current one rather than from the
+        previous crossing.  Every crossing lands exactly on a band boundary, so
+        any boundary-to-boundary span is equally phase-exact — a wider span is
+        no more biased, and much less noisy, because rate is delta/elapsed and a
+        few minutes of report-timing jitter matters far less over hours than
+        over one 30-minute step.
+
+        Measured on the 2026-08-06 session (22 samples): per-step sampling gave
+        18% noise in the cold bucket and dragged its stored rate to 0.98 °C/h
+        against a realised 1.14; the growing window gives 7% and 1.08.  In the
+        mid bucket, 3% becomes 1% (0.4% once the span reaches 2 °C), converging
+        on 0.958 °C/h — exactly that bucket's realised rate.  It also absorbs
+        paired reporting glitches that per-step sampling cannot: that session
+        contained 27.5→28.0 at 0.51 °C/h immediately followed by 28.0→28.5 at
+        29.5 °C/h — one late report then one early — where the out-of-bounds
+        second is rejected and the spuriously slow first is learned.
+
+        The window closes when the water leaves the anchor's bucket (each bucket
+        must be measured on its own, since they model different loss regimes) or
+        when a sample is rejected (a bad span is never re-used).  Heater-off
+        resets it entirely via the branch below, so a window never spans an
+        interruption.
+
+        Successive estimates from a growing window share most of their data, so
+        the per-crossing EMA double-counts the early samples and its effective
+        time constant is shorter than nominal.  That is harmless here — the
+        sequence it averages is smooth and converging rather than noisy — but it
+        is why the EMA must not be re-tuned on the assumption that samples are
+        independent.
         """
         if heat_state == _HEAT_STATE_FULL and curr_temp is not None:
             if self._rate_last_temp is None:
@@ -826,13 +867,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono
                     return
-                # Temperature has changed — elapsed time since anchor is the true
-                # duration of the previous 0.5 °C step, giving a real rate.
+                # Temperature has changed — elapsed time since the window anchor
+                # is the true duration of the whole boundary-to-boundary span.
                 elapsed_hours = (now_mono - self._rate_last_time) / 3600
+                anchor_bucket = _heat_bucket_index(self._rate_last_temp)
+                accepted = False
                 if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
                     delta = curr_temp - self._rate_last_temp
                     rate = delta / elapsed_hours  # guarded: elapsed_hours > 0
                     if _MIN_HEAT_RATE <= rate <= _MAX_HEAT_RATE:
+                        accepted = True
                         if self.computed_heat_rate is None:
                             self.computed_heat_rate = rate
                         else:
@@ -841,8 +885,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                 + (1 - _EMA_ALPHA) * self.computed_heat_rate
                             )
                         # Also update the temperature bucket for this observation.
-                        # _rate_last_temp is the *start* temperature of the step.
-                        _bi = 0 if self._rate_last_temp < 30.0 else 1 if self._rate_last_temp < 37.0 else 2
+                        # The window anchor is the *start* temperature of the span.
+                        _bi = anchor_bucket
                         _bp = self.heat_rate_buckets[_bi]
                         self.heat_rate_buckets[_bi] = (
                             _EMA_ALPHA * rate + (1 - _EMA_ALPHA) * _bp
@@ -881,18 +925,23 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                 self._session_scalar, _bi, ratio,
                             )
                         _LOGGER.info(
-                            "Heat rate sample %.3f °C/h (EMA → %.3f °C/h, bucket[%d] → %.3f °C/h)",
-                            rate, self.computed_heat_rate,
+                            "Heat rate sample %.3f °C/h over %.1f °C / %.1f h "
+                            "(EMA → %.3f °C/h, bucket[%d] → %.3f °C/h)",
+                            rate, delta, elapsed_hours, self.computed_heat_rate,
                             _bi, self.heat_rate_buckets[_bi],
                         )
                     else:
                         _LOGGER.info(
                             "Heat rate sample %.3f °C/h rejected (out of bounds)", rate
                         )
-                # Always advance anchor to new temperature (even if rate rejected).
-                # This prevents a rejected outlier span from being re-used.
-                self._rate_last_temp = curr_temp
-                self._rate_last_time = now_mono
+                # Close the window only when it must be: the water has left the
+                # anchor's bucket (the next bucket models a different loss regime
+                # and is measured on its own), or the sample was rejected (a bad
+                # span must never be re-used).  Otherwise hold the anchor so the
+                # span keeps widening and the estimate keeps improving.
+                if not accepted or _heat_bucket_index(curr_temp) != anchor_bucket:
+                    self._rate_last_temp = curr_temp
+                    self._rate_last_time = now_mono
             # else: temperature unchanged — let elapsed time accumulate, don't touch anchor
         else:
             # Heater off/preheat — reset anchor so next on-cycle starts fresh
