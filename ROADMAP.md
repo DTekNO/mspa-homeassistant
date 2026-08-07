@@ -473,6 +473,73 @@ Shipping the instrumentation early means data accumulates while the existing mod
 
 ---
 
+### Measured evidence (long-term statistics, 2026-08-07)
+
+Hourly long-term statistics make this measurable retrospectively. Differencing
+consecutive hourly mean water temperatures gives a rate over an exactly-one-hour
+window, and requiring the `heat_state` hourly mean to be *exactly* 3.0 keeps only
+hours that were full-heat throughout. That yielded **831 clean heating hours** across
+14 months and an outdoor range of −8.6 to +21.4 °C.
+
+Two spas are present in the history and must not be pooled for absolute rates — the
+previous unit had a different pump and heater. Like-for-like in the mid bucket at
+5–15 °C outdoor: 0.716 °C/h against 1.063 °C/h, 48% apart. Sensitivity is a
+*relative* quantity, so the older data still informs the shape, and it is the only
+source of sub-zero observations.
+
+**Measured sensitivity, current spa** (n=192, outdoor 2.7–21.4 °C, 95% CI):
+
+| bucket | measured | 95% CI | `AMBIENT_SENSITIVITY` | verdict |
+|---|---|---|---|---|
+| cold <30 | +0.0005 | −0.018 .. +0.019 | 0.00 | consistent, but uninformative |
+| mid 30–37 | +0.0238 | +0.011 .. +0.037 | 0.02 | **confirmed** |
+| hot ≥37 | +0.0269 | +0.009 .. +0.045 | 0.06 | **too steep — 0.06 is outside the CI** |
+
+**Measured ratio to the 10–15 °C rate, previous spa** (the only winter data):
+
+| bucket | −15..−5 | −5..0 | 0..5 | 5..10 | 10..15 |
+|---|---|---|---|---|---|
+| cold | 0.58 (7) | 0.55 (43) | 0.60 (50) | 0.69 (77) | 1.00 (20) |
+| mid | 0.41 (5) | 0.66 (35) | 0.68 (42) | 0.73 (61) | 1.00 (41) |
+| hot | 0.59 (6) | 0.70 (40) | 0.87 (60) | 0.83 (49) | 1.00 (29) |
+
+### Two conclusions that change the plan
+
+**1. The hot-bucket sensitivity is roughly twice too steep, and it clamps absurdly
+early.** At 0.06, the factor reaches the `AMBIENT_FACTOR_MIN` floor of 0.30 at about
++3 °C outdoor — so the model predicts the spa almost stops heating at freezing. The
+well-powered −5..0 °C bin (35–43 samples per bucket) measures 0.55–0.70. The owner's
+account of a January session at −10 °C being unproblematic matches the data and not
+the code. Sub-zero bins have only 5–7 samples each, so treat the very coldest column
+as indicative; the −5..0 column is solid.
+
+**2. The self-cancelling baseline has been masking the bad calibration — so fixing
+the baseline alone would make winter predictions materially worse.** Because
+`ambient_baseline` follows the weather (see the session evidence below), the factor
+returns ~1.0 whatever the season and the mis-calibrated sensitivity never fires. Pin
+the reference conditions without re-deriving the gains and every winter prediction
+would suddenly be corrected by a factor that is twice too severe. **The two must
+change together**, and the sensitivities should be *measured* from this dataset
+rather than kept as constants.
+
+Both are reasons to prefer the plan in *Concept* above — learn the gain from
+observations rather than hardcode a sensitivity — over merely repairing the baseline.
+
+### Remaining gaps
+
+- **No sub-zero data for the current spa.** It was commissioned at Easter 2026, so
+  its record starts in April and reaches only 2.7 °C. Winter sensitivity for *this*
+  machine is extrapolated. One cold season fixes it, and the statistics are already
+  accumulating.
+- **Outdoor temperature explains only 11–16% of the variance** (r² 0.114 mid, 0.155
+  hot). Weather is real but secondary — consistent with the session evidence below,
+  where the rate model was accurate to 1% and `prediction_bias` caused the whole
+  46-minute error. Expect the weather work to sharpen predictions, not transform them.
+- **Cover state is unmeasured** and is the obvious candidate for much of that
+  unexplained variance.
+- **Wind is absent from this dataset.** The local station measures temperature only;
+  met.no would be the source for a `sqrt(wind)` term.
+
 ### Measured evidence (session of 2026-08-06/07)
 
 A 17.5 °C cold start, 22.0 → 39.5 °C, the first long predictive run without test
