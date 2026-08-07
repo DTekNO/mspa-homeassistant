@@ -12,3 +12,4 @@ MSpa_Hot_Tub_HA_integration.iml
 .idea/vcs.xml
 custom_components/mspa.zip
 *.log
+history.csv
