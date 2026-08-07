@@ -13,3 +13,6 @@ MSpa_Hot_Tub_HA_integration.iml
 custom_components/mspa.zip
 *.log
 history.csv
+# Private data: HA history and statistics exports. Never commit these —
+# they carry device aliases and the owner's usage patterns.
+*.csv
