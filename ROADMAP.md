@@ -255,11 +255,22 @@ and survives restarts. It does not work in practice:
 
 ### What it buys
 
-- **Restart immunity.** `_rate_last_temp`, `_rate_last_time`, `_rate_first_step`,
-  `_session_scalar` and `_session_fresh_buckets` are all lost on restart today.
-  A hot deploy mid-session costs a crossing of learning and resets the session
-  scalar; from a stored series nothing is lost, because the rate is recomputed
-  from the samples rather than accumulated.
+- **Phase uncertainty becomes a once-per-session cost, not once-per-restart.**
+  This is the strongest argument. The uncertainty is a property of a single
+  moment — heater-on, when the water sits at an unknown position inside its
+  0.5 °C band. The first crossing resolves it: from then on the water is known to
+  have been *exactly* on a boundary at a *known* time, and that fact does not
+  expire. But it currently lives in volatile state, so every restart discards it
+  and re-pays a penalty physics charges only once. The 2026-08-06/07 session paid
+  it three times across two restarts and a hot deploy. Worse, now that the window
+  grows, a restart truncates an accumulated 2 °C span back to 0.5 °C — so the
+  streaming design makes restarts *more* damaging than they were, which is itself
+  a reason to move off it.
+
+- **Restart immunity generally.** `_rate_last_temp`, `_rate_last_time`,
+  `_rate_first_step`, `_session_scalar` and `_session_fresh_buckets` are all lost
+  on restart today. From a stored series nothing is lost, because the rate is
+  recomputed from the samples rather than accumulated.
 - **Retrospective recomputation — the big one for development.** Every algorithm
   change currently needs a fresh 16-hour session to evaluate. With the samples
   stored, a new rule can be replayed against past sessions immediately. This is
@@ -292,6 +303,13 @@ and survives restarts. It does not work in practice:
 - Interaction with `heat_state` gaps. Thermostat cycling near setpoint fragments a
   session into many short heating spans; the series makes it possible to stitch
   those by accumulating heating time only, which the streaming version cannot do.
+- Could the *initial* phase uncertainty be reduced too, rather than merely paid
+  once? The series also covers the cool-down before heating, and a cooling
+  trajectory reveals when the water *entered* its current band. Knowing that entry
+  time and the cooling rate bounds where inside the band it sat at heater-on, which
+  would make even the first span usable instead of discarded. Speculative, and it
+  depends on the cooling rate being known better than the band is wide — but the
+  data to test it would be sitting there.
 
 ---
 
