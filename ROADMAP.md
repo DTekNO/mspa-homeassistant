@@ -278,13 +278,56 @@ must run through `recorder.get_instance(hass).async_add_executor_job` with
 `after_dependencies: ["recorder"]`; and it ties the estimator to Home Assistant in
 the module *Extracting the Prediction Engine* wants dependency-free.
 
-**Likely answer: both, for different jobs.** Our own short series as the
-authoritative input for learning — self-contained, portable, immune to purge and to
-user recorder config. The recorder as a *bootstrap and analysis* path: seed the
-model from existing history on first run, and replay past sessions when evaluating
-an algorithm change. The second is optional and can degrade to "not available"
-without affecting normal operation, which keeps the coupling at the edge rather
-than in the core.
+**Long-term statistics are a third source, and the best one for bootstrapping.**
+Unlike states, LTS are *never purged*. Both signals qualify: `water_temperature`
+declares `SensorStateClass.MEASUREMENT`, and `heat_state` is in `MEASUREMENT_KEYS`
+so it gets one too — so wherever those sensors have been enabled, hourly mean/min/max
+exist back to the day they were switched on.
+
+Two properties make this better than reconstructing from crossings:
+
+- **A fixed one-hour window has no timing jitter.** Differencing consecutive hourly
+  means gives the rate directly, over a window that is exactly an hour every time.
+  That removes the entire noise source this section exists to fight: the 15% scatter
+  measured on 0.5 °C crossings came from a few minutes of report-timing variation on
+  a ~30 minute span. Errors also partially cancel across the difference, so hourly
+  statistics may well beat the growing window as well as predating it.
+- **`heat_state` mean == 3.0 exactly means the whole hour was full heat.** Any
+  interruption — preheat, idle, cycling — drags the mean below 3, so the qualifier is
+  a single equality test rather than an interval reconstruction. Hours that fail it
+  are simply dropped.
+
+Combined with hourly outdoor temperature from a local weather sensor, that yields
+`(rate, water_temp, ambient)` for every clean heating hour since the spa was
+commissioned — evenly spaced, conditions attached, which is precisely the dataset
+*Learned Weather Factor* needs and the form it wants it in.
+
+**Caveats specific to this route:**
+
+- **Entity renames break continuity.** Statistics are keyed by `statistic_id`, which
+  follows the entity id. Renaming through the UI migrates them, but removing and
+  re-adding the device does not — the old series is orphaned, still queryable if the
+  old id is known. Developer Tools → Statistics lists orphaned ids, flagged as no
+  longer provided, so the history is recoverable but the ids must be collected first.
+- **Only hourly is durable.** Five-minute statistics are short-lived; hourly is the
+  resolution to design against, which happens to be the resolution wanted.
+- **Hourly buckets straddle temperature buckets.** An hour spanning 29.5 → 30.5 °C
+  belongs to neither cleanly. Either attribute by the hour's mean temperature and
+  accept slight smearing, or keep only hours wholly inside one bucket.
+- **Local sensor versus met.no.** A local outdoor sensor better represents the
+  microclimate the spa actually loses heat to, and is the right choice for the
+  temperature term. met.no is the fallback where local history is short, and the
+  source for *wind*, which a basic weather station does not measure and the
+  `sqrt(wind)` term needs. Watch for placement bias — a sun-exposed module reads
+  high in the afternoon, which could alias with time of day.
+
+**Answer: three sources, three jobs.** Our own short series as the authoritative
+learning input — portable, immune to purge and user config, keeps the estimator
+dependency-free. Long-term statistics to *bootstrap and backfit*, giving months of
+conditioned observations immediately instead of after a season. Recorder states only
+if sub-hourly detail is ever needed for a specific investigation. The latter two are
+optional and may degrade to unavailable without affecting normal operation, keeping
+the coupling at the edge rather than in the core.
 
 ### What it buys
 
