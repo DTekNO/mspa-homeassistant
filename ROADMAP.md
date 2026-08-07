@@ -80,10 +80,26 @@ from there.
 - **A no-op safety net.** This is the one risk the hook did not have: if the user's
   automation is broken, disabled, or never written, nothing happens and the spa
   silently is not ready — while Ready at keeps counting down to a heat-up that never
-  began. If the heater is still off some minutes after the event, log a warning
-  naming the option, so the failure is visible rather than silent. Whether it should
-  also *fall back* to acting is a judgement call: falling back is safer for the
-  spa but defeats the point for a user who deliberately wants no heating.
+  began.
+
+  Watch for heating actually starting, and if the heater is still off ~5 minutes
+  after the event, treat the handover as failed:
+
+  - **Get the user's attention.** A `persistent_notification` is the right weight —
+    HA-native, needs no configuration, and survives until dismissed. A log warning
+    alone is invisible to exactly the user this protects.
+  - **Stop predicting a fiction.** Abort the schedule rather than leaving it
+    `triggered`, so Ready at and Heat Schedule stop counting down to a session that
+    is not happening. Reporting nothing is more honest than reporting a confident
+    time for a heater that is off, and it is the difference between a visible
+    failure and a silent one.
+
+  Whether it should *also* fall back to starting the spa itself is left open. Falling
+  back is safer for the spa and matches what most users would want; it also defeats
+  the point for someone who deliberately wants no heating this session — say a cover
+  check that decided against it. A per-option choice ("notify only" versus "notify
+  and take over") may be the honest resolution, but that is a second decision and
+  should wait for a second user.
 - **Fire at most once per schedule**, reusing the existing `_schedule_triggered` guard.
 - **Fire even when no heating is needed.** With the spa already at target,
   `minutes_needed == 0` and `start_at == target_time`; the preparation step is still
@@ -103,6 +119,78 @@ case, where a couple of minutes of jet flow is what clears the sensor.
 Not built yet, deliberately. One user with a sticky flow sensor is enough to know the
 shape is right but not enough to fix the payload or settle the fallback question. If
 a second request arrives, that will say which.
+
+---
+
+## Extracting the Prediction Engine
+
+An idea, not a plan: the scheduler and prediction model are not really about MSpa.
+Any spa — any heated body of water — could use them. Extracting them would let other
+integrations benefit, while mspa keeps them built in so its users install one thing.
+
+### Where the seam is
+
+The engine is nearly pure computation over a time series. It consumes water
+temperature, setpoint, a heating-active signal, and optionally outdoor conditions;
+it produces learned rates, an ETA, and a start time. What is genuinely MSpa-specific
+is everything else: the API client and auth, quota and polling behaviour, the device
+features, the climate entity, and the actuation calls.
+
+Candidates to move: rate learning (`_track_heating_rate` / `_track_cooling_rate`,
+the phase-uncertainty guard, buckets, session scalar, prediction bias, ambient
+factor), the ETA and start-time maths (`_anchor_eta_utc`,
+`_segmented_heating_minutes`), and the learned-state persistence. The Ready at and
+Heat Schedule sensors are presentation and would probably stay, consuming the
+engine.
+
+### Distribution, without PyPI
+
+- **Vendored via git subtree or submodule.** One source repo; mspa carries the module
+  inside `custom_components/mspa/`. Subtree keeps the files really present, so the
+  release zip works with no CI changes, at the cost of manual sync. Submodule keeps
+  history clean but the release workflow must `git submodule update --init` before
+  zipping, or the zip ships an empty directory.
+- **CI-synced copy.** A workflow copies the module into mspa on release — the same
+  pattern already used to keep ha-alert-card's `dist/` from drifting, so the
+  machinery and the habit both exist.
+- **A separate HACS integration that mspa depends on.** Rejected: HACS does not
+  auto-install dependencies for custom integrations, so users would have to install
+  two things, which breaks "built in to mspa".
+
+The likely answer is a module in its own repo, vendored into mspa, plus a thin
+standalone integration wrapping the same module for other spas. Two copies can
+coexist in one HA instance without collision, since `custom_components` namespaces
+them — an mspa user simply would not install the standalone one.
+
+### Why not yet
+
+The extraction is **cheaper later and riskier now**, which is the opposite of the
+usual advice, for one reason: the interface is not settled.
+
+The algorithm changed three times in the week of 2026-08-03 alone (phase
+uncertainty, the latch lifecycle, ETA smoothing), and the weather work in *Learned
+Weather Factor* will change what the engine consumes — it needs each observation
+tagged with its conditions, which is a new input, and it will probably retire
+`prediction_bias` as a weather carrier. Freezing a public interface across that
+would slow the work that matters.
+
+There is also real coupling that only looks incidental. The phase-uncertainty guard
+depends on knowing the reporting quantum (0.5 °C bands) — a device property, not a
+physical one. Other spas may report differently, so that has to become a parameter.
+The prediction-record gating depends on `heat_state == 3`, which is MSpa's notion of
+full-heat mode. Both are fine as parameters, but they show the boundary needs
+designing rather than merely drawing.
+
+### The cheap step that de-risks it
+
+Keep tightening the seam *inside* mspa, which is worth doing on its own merits.
+Move the prediction functions into a `predictor.py` that imports nothing from Home
+Assistant and never reaches into `coordinator` — taking explicit arguments and
+returning values instead. `_track_heating_rate` / `_track_cooling_rate` were already
+pulled out of the update loop for testability; this is the same move continued.
+
+That gives a testable, dependency-free core now, makes the eventual extraction
+mechanical rather than exploratory, and costs nothing if the split never happens.
 
 ---
 
