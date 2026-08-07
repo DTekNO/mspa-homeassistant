@@ -236,22 +236,55 @@ A 16-hour heat-up produces roughly 35 temperature changes, so this is a couple o
 kilobytes per session. Keeping the last handful of sessions is ~10 kB, alongside
 the learning state already stored in `_rates_store`.
 
-### Why not the recorder
+### Source: the recorder, or our own series
 
-The obvious source is Home Assistant's own history, which is already timestamped
-and survives restarts. It does not work in practice:
+Both are viable — an earlier draft of this entry wrongly ruled the recorder out on
+the grounds that the entities are disabled by default. That is true of the dedicated
+`water_temperature` and `heat_state` diagnostic sensors, but **the climate entity
+carries the same two signals and is enabled for everyone**:
 
-- **The entities are disabled by default.** `water_temperature` sets
-  `_attr_entity_registry_enabled_default = False`, and every `MSpaDiagnosticSensor`
-  — including `heat_state` — does the same. Most users therefore have no history
-  for either. Temperature is partly recoverable from the climate entity's
-  `current_temperature` attribute, but `heat_state` is not, and that is precisely
-  the qualifier that makes a span usable.
-- **The recorder is optional and purges.** Default retention is days, users exclude
-  entities, and some run without it.
-- **It deepens HA coupling** in the module that *Extracting the Prediction Engine*
-  wants to keep dependency-free. A self-kept series keeps the engine pure; a
-  recorder query does not.
+```python
+def current_temperature(self):
+    return self.coordinator.last_data.get("water_temperature")   # identical value
+
+def hvac_action(self):
+    if heat_state == 3: return HVACAction.HEATING                # the qualifier
+```
+
+It declares no `_unrecorded_attributes`, so both are in history, and `hvac_action`
+distinguishes preheating, heating, idle and off — exactly the heat-mode qualifier
+that makes a span usable.
+
+Both arrive in the *same* attribute set, so one recorder row carries the
+temperature and the heat mode together — no correlating two entity histories, and
+no risk of pairing a temperature with a heat mode from a different instant:
+
+```
+current_temperature: 37
+temperature: 39.5
+hvac_action: heating
+```
+
+**Recorder — pros:** no new storage; no new state to persist or migrate; and
+decisively, **it works retroactively on data already collected.** Weeks of climate
+history exist right now, so the weather fit in *Learned Weather Factor* could be
+bootstrapped from real sessions across varied conditions instead of waiting a
+season to accumulate them. That is a large shortcut for the item this entry is a
+prerequisite to.
+
+**Recorder — cons:** retention is finite (default ten days), so it cannot be the
+long-term memory; the recorder is optional and users can exclude entities; queries
+must run through `recorder.get_instance(hass).async_add_executor_job` with
+`after_dependencies: ["recorder"]`; and it ties the estimator to Home Assistant in
+the module *Extracting the Prediction Engine* wants dependency-free.
+
+**Likely answer: both, for different jobs.** Our own short series as the
+authoritative input for learning — self-contained, portable, immune to purge and to
+user recorder config. The recorder as a *bootstrap and analysis* path: seed the
+model from existing history on first run, and replay past sessions when evaluating
+an algorithm change. The second is optional and can degrade to "not available"
+without affecting normal operation, which keeps the coupling at the edge rather
+than in the core.
 
 ### What it buys
 
