@@ -197,16 +197,56 @@ making changes to the API client or coordinator.
 
 ## Development workflow
 
-There is no local test runner or CI lint step — the owner has no local IDE.
-Validation is done by loading the integration in a real Home Assistant instance.
+There is a pytest suite under `tests/` (156 tests, runs in under a second). It is
+dependency-light on purpose — `conftest.py` stubs Home Assistant — so it runs on a
+development workstation with nothing but pytest installed.
+
+> **Never run the test suite on the Home Assistant host.** It was tried once on the
+> RPi 5 and caused significant disruption. Agents running *on* the HA box (e.g. the
+> opencode add-on) must not invoke pytest, install test dependencies, or import the
+> test modules there. Run the suite on the development machine; validate on the HA
+> instance by loading the integration and reading the logs.
+>
+> The cause was never established — the HA container's own `homeassistant` package
+> most likely interferes with the stubs in `conftest.py` — and deliberately was not
+> investigated. Do not treat that as a problem to solve and re-enable test runs
+> there: the rule is simply don't, wherever the fault lies.
 
 When making changes:
 1. Make the smallest correct change; don't refactor unrelated code
 2. Update `CHANGELOG.md` under `[Unreleased]`
-3. Update `manifest.json` version if appropriate for the release
-4. Prefer `report_progress` to commit and push each logical unit of work
-5. For a beta release, push to a dedicated branch (e.g. `fix/v3-x-y`) and
+3. **Never edit the `version` field in `manifest.json`.** Release automation owns
+   it — see below.
+4. Add or update tests in `tests/` for behaviour changes, and keep the suite green —
+   on the development machine, per the warning above
+5. Prefer `report_progress` to commit and push each logical unit of work
+6. For a beta release, push to a dedicated branch (e.g. `fix/v3-x-y`) and
    tag it `vX.Y.Z-betaN` from the GitHub releases page
+
+### Which code is actually deployed — read this before diagnosing a log
+
+`manifest.json` in a committed tree holds the **last released** version, not the
+version of the code beside it. `update-and-release.yaml` sets the field to the
+release tag and commits it back to the branch, so `main` permanently claims to be
+whatever was released last. A working tree several commits ahead still reports the
+old number.
+
+This is a live trap. A log reading `version: 2026.7.1` may be running code eleven
+commits newer, and concluding "they are on the release" from that string alone has
+already produced one wrong diagnosis.
+
+Two reliable signals instead:
+
+- **`+hot.<sha>` suffix.** Hot deploys stamp the deployed copy as
+  `2026.8.1+hot.f23e577`, where the short SHA after `+hot.` is authoritative for
+  what is running. Verified safe: AwesomeVersion parses it as SemVer, and because
+  build metadata is ignored for precedence it compares *equal* to the release, so
+  HACS neither nags nor mis-orders a later version. Do not "fix" the `+` to a `-`;
+  a pre-release suffix compares *older* and would make HACS offer a downgrade.
+- **Log markers.** Behaviour-specific lines date the code far better than the
+  version does. `eff=` / `ema=` / `buckets=` in the Ready at and Heat Schedule
+  transition lines, and `phase-uncertain` on skipped rate samples, all postdate
+  2026.7.1.
 
 ---
 
