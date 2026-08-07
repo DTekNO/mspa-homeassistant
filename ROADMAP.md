@@ -4,81 +4,105 @@ Ideas and planned features that are not yet scheduled for a specific release.
 
 ---
 
-## Pre-roll Hook for the Scheduled Start
+## Hand the Scheduled Start to the User
+
+Supersedes an earlier "pre-roll hook" plan — see *Why not a pre-roll hook* below.
 
 ### Problem
 
 The scheduler's startup is deliberately minimal: at `start_at` it sets the target
-temperature and turns the heater on. Nothing else. That is right for most spas,
-but some hardware needs a preparatory step first.
+temperature and turns the heater on. Nothing else. That is right for most spas, but
+some hardware needs something different first.
 
 Reported by a user whose flow sensor throws F1 unless water is already moving —
-they run the jets briefly before the heater to get flow going. They can do that
-today with a template trigger on the Heat Schedule sensor's `start_at` attribute,
-but it is inference rather than notification, and it has a real gap: `start_at`
-is recomputed every poll, so if it moves earlier by more than the automation's
-lead time — a faster-than-expected cool-down, or a replan after a setpoint change
-— the pre-hook can be skipped entirely and the heater starts with no preparation.
-The one-sided form below latches instead of missing, but it can still fire *late*:
+they run the jets briefly before the heater. There is no way to influence that
+sequence, and no way to opt out of it.
+
+Today the only workaround is to infer the moment from the Heat Schedule sensor's
+`start_at` attribute:
 
 ```jinja
 {% set s = state_attr('sensor.mspa_heat_schedule', 'start_at') %}
 {{ s is not none and now() >= (s | as_datetime) - timedelta(minutes=5) }}
 ```
 
-There is also no ordering guarantee. The integration cannot promise the event
-reaches the automation before it commands the heater, because it never emits one.
+That latches rather than missing (the one-sided form is deliberate — a two-sided
+window can be skipped entirely when `start_at` jumps earlier), but it is inference,
+it can fire late, and it races the integration's own actuation.
 
 ### Design
 
-A configurable **pre-roll**, default unset. When unset nothing changes and no
-event fires — existing installations are unaffected.
+One option, default off, best described to the user as **"Start the spa
+automatically"** (on today's behaviour) versus handing startup over.
 
-When set, `_check_schedule_trigger` fires an event at `start_at − pre_roll`,
-waits out the pre-roll via `async_call_later`, then performs the existing
-setpoint and heater commands. Automations subscribe with `trigger: event`.
+When handed over, at `start_at` the integration:
 
-**The plan must freeze for the duration.** This is the part that turns the event
-from a hint into a guarantee: once the integration has announced "starting in N
-minutes" it must not re-plan, or the heater could fire before the pre-roll
-elapses (start moves earlier) or long after the automation's preparation has
-finished (start moves later). Continuous re-evaluation is the predictor's main
-virtue, so giving it up is a real cost — which is why the pre-roll wants a hard
-cap. **10 minutes** is a reasonable bound: at typical rates around 1 °C/h the
-water moves ~0.17 °C over that window, so the abandoned re-planning is worth far
-less than the ordering guarantee.
+- fires `mspa_schedule_start` with `target_time`, `target_temperature`, `water_temperature`
+  and the device id in the payload
+- sets `_schedule_triggered` exactly as now
+- **does not** set the setpoint and **does not** switch the heater on
 
-Event payload should carry the frozen `start_at`, `target_time` and
-`target_temperature`, so an automation can time itself against the real
-actuation moment rather than hardcoding a delay that duplicates the config.
+Automations subscribe with `trigger: event`. The Heat Schedule sensor's state
+transition is also already triggerable for anyone who prefers that, though only the
+event carries the payload.
+
+### Why not a pre-roll hook
+
+The earlier plan was to fire an event `pre_roll` minutes *before* acting, then act.
+It required **freezing the plan** for the duration, because otherwise the heater
+could fire before the pre-roll elapsed (start moves earlier) or long after the
+user's preparation finished (start moves later). Continuous re-planning is the
+predictor's main virtue, so giving it up — even for ten minutes — was the plan's
+worst compromise, and it needed a hard cap purely to bound the damage.
+
+Handing over removes that entirely. The event *is* the action, so there is nothing
+afterwards to mis-order and nothing to freeze. It also drops three of the four
+must-haves the hook needed (persisting the commitment across a restart, cancelling
+it on a new schedule, managing an `async_call_later` timer) and introduces no new
+state at all — `_schedule_triggered` already means "fired once per schedule" and
+already persists.
+
+It is also more general. The hook could only *prepend* an action, capped at ten
+minutes. Handing over lets a user own the sequence: jets then heater with any gap,
+a staged temperature ramp, a cover check, or skipping the session entirely if
+nobody is home.
+
+### What it costs
+
+Every user who opts in must reimplement the startup. For someone who only wants
+"run the jets for two minutes, then behave normally", the hook was less work and
+less to get wrong. Mitigate by documenting a copy-paste automation that reproduces
+the default startup exactly, so people begin from something that works and edit
+from there.
 
 ### Must-haves
 
-- **Persist the commitment.** A restart inside the pre-roll window must not lose
-  it, or the event re-fires and the heater may start early. This is the same
-  class of bug as the `_schedule_triggered` persistence fix — freeze state and
-  frozen start time belong with the other stored scheduler state.
-- **Cancel on a new schedule.** If the user moves or clears the schedule during
-  the pre-roll, the commitment must be abandoned rather than honouring a plan
-  that has been replaced — mirroring how a new schedule resets
-  `_schedule_triggered`.
-- **Fire at most once per schedule**, guarded like `_schedule_triggered`.
+- **A no-op safety net.** This is the one risk the hook did not have: if the user's
+  automation is broken, disabled, or never written, nothing happens and the spa
+  silently is not ready — while Ready at keeps counting down to a heat-up that never
+  began. If the heater is still off some minutes after the event, log a warning
+  naming the option, so the failure is visible rather than silent. Whether it should
+  also *fall back* to acting is a judgement call: falling back is safer for the
+  spa but defeats the point for a user who deliberately wants no heating.
+- **Fire at most once per schedule**, reusing the existing `_schedule_triggered` guard.
 - **Fire even when no heating is needed.** With the spa already at target,
-  `minutes_needed == 0` and `start_at == target_time`; the preparation step is
-  still wanted, so the event should fire `pre_roll` before the target time.
+  `minutes_needed == 0` and `start_at == target_time`; the preparation step is still
+  wanted, so the event must still fire.
+- **Ready at must follow the real setpoint.** `_compute_ready_at` currently predicts
+  to `sched_temp` once triggered, on the assumption the integration set it. If a
+  user ramps to something else, the ETA is measured against a target that was never
+  applied. Either track the live setpoint after handover or document the estimate as
+  approximate in this mode.
 
 ### Notes
 
-Granularity is bounded by `DEFAULT_SCAN_INTERVAL` (60 s), so the pre-roll is
-minutes, not seconds — a few seconds of lead would sit inside the scheduler's own
-jitter and could land after the heater command. That suits the motivating case
-anyway, where a couple of minutes of jet flow is what actually clears the sensor.
+Granularity is bounded by `DEFAULT_SCAN_INTERVAL` (60 s), so the event can arrive up
+to a minute after the nominal `start_at`. That is inherent and suits the motivating
+case, where a couple of minutes of jet flow is what clears the sensor.
 
-Not built yet, deliberately. One user with a sticky flow sensor is enough to know
-the *shape* is right but not enough to fix the payload. If a second request
-arrives, that will say whether the hook should stay generic (an event, integration
-knows nothing about jets) or become a concrete "run jets for N seconds before
-heating" option.
+Not built yet, deliberately. One user with a sticky flow sensor is enough to know the
+shape is right but not enough to fix the payload or settle the fallback question. If
+a second request arrives, that will say which.
 
 ---
 
