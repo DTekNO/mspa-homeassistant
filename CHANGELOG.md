@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The Ready at time no longer wobbles.** During a long heating session the
+  estimate changed 165 times in 11 hours — 39 times in the worst hour — including
+  14 direction reversals and two jumps of over half an hour. The smoothing added
+  in 2026.8.1 was doing what it was written to do, but it was aimed at the wrong
+  thing: its speed limit was loose enough that ordinary minute-to-minute jitter
+  passed straight through, and it deliberately let *large* corrections bypass
+  smoothing on the assumption they meant you had changed the schedule. In practice
+  the large corrections were the model revising its own estimate as it learned, so
+  the biggest jumps were exactly the ones that escaped smoothing.
+
+  The display now ignores movement under 5 minutes, closes larger gaps gradually,
+  and only jumps when you actually change something — the schedule time, the
+  schedule temperature or the thermostat. It is also rounded to 5 minutes, since
+  minute precision on an estimate hours away was never real. Replayed against the
+  recorded session: **165 changes become 32**, the worst hour drops from 39 to 5,
+  and the estimate still tracks reality to within 5 minutes.
+
 ## [2026.8.1]
 
 A consolidation release for the **⚠️ Experimental [Predictive Scheduling](README.md#experimental-predictive-scheduling)**

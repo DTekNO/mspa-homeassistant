@@ -183,6 +183,71 @@ Shipping the instrumentation early means data accumulates while the existing mod
 
 ---
 
+### Measured evidence (session of 2026-08-06/07)
+
+A 17.5 °C cold start, 22.0 → 39.5 °C, the first long predictive run without test
+cycling in the week. It finished ~55 min late against a 13:00 target. Breaking the
+error down settles what the current design can and cannot do.
+
+**The segmented rates were nearly perfect; `prediction_bias` caused the miss.**
+
+| | predicted | actual | error |
+|---|---|---|---|
+| segmented buckets, no bias | 11.09 h | 11.21 h | **−1.0%** |
+| segmented buckets × bias 0.942 | 10.45 h | 11.21 h | **−6.8%** |
+
+Realised per bucket: cold 1.138 °C/h against 1.11 learned (+2.5%), mid
+0.958 against 1.03 (−7.0%). The mid-bucket shortfall is the part that looks like
+weather — losses grow with water temperature, so a cold night should bite hardest
+there, exactly the shape `AMBIENT_SENSITIVITY` encodes.
+
+**But the ambient correction could not have corrected it, for two independent
+reasons.**
+
+1. **The cold bucket has sensitivity 0.0** and was 7.03 of the 11.21 hours — 63% of
+   the session. No ambient correction is possible there by construction. Defensible
+   physically (a 22 °C tub loses little to 14 °C air) but it means the majority of a
+   cold start is uncorrectable however good the rest of the model is.
+
+2. **The baseline chases the weather, so the factor self-cancels.** `ambient_baseline`
+   is an EMA (`alpha` 0.05) updated *inside the rate-learning block* — i.e. from the
+   same observations that set the rates. Over a season it converges on current
+   conditions, `ambient_now − ambient_baseline → 0`, and the factor returns ~1.0
+   whatever the weather. It can only catch a deviation from *recent* weather, such as
+   one cold snap; it cannot catch the season, because the seasonal signal is absorbed
+   into the baseline instead of corrected for.
+
+   Measured: baseline had drifted to 14.01 °C (from the 15.0 default) and outdoor was
+   13.7–14.3 °C, so every bucket got a factor of 1.000–0.999. To explain the mid-bucket
+   shortfall at sensitivity 0.02 would need `outdoor − baseline = −3.5 °C`, i.e. a
+   baseline near **17.5 °C** — plausibly the conditions the rates were actually learned
+   under, several weeks earlier and warmer. The baseline had since followed the weather
+   down to meet it.
+
+**Why this validates the plan above.** The concept section already has the fix: divide
+the weather factor out *before* updating the bucket EMA, so buckets become "rate at
+reference conditions". The measurement shows why that is the necessary shape rather
+than a refinement — the current arrangement has the rates and the baseline learning
+from the same samples, so they co-move and the correction cancels. The reference
+conditions must be **fixed**, not learned alongside the rates.
+
+Two consequences worth carrying into the design:
+
+- **Bucket rates are net rates** (gross heating minus losses), so a learned rate is
+  only valid at the ambient temperature where it was learned. That is the root
+  justification for normalising rather than for tuning sensitivities.
+- **The cold bucket's zero sensitivity should be re-derived, not assumed.** Once
+  observations are logged with their conditions (see *Instrumentation first*), the
+  cold-bucket gain becomes measurable. It is probably small, but 63% of a cold start
+  is too much of the session to leave at exactly zero on assumption.
+
+Caveat: this is one session. The bias finding is strong (a 6.8% error against a 1.0%
+model), but the 17.5 °C implied baseline rests on assuming the whole mid-bucket
+shortfall is ambient, which is unproven — it could be partly bucket-shape error, since
+losses may grow faster with temperature than three flat buckets can represent.
+
+---
+
 ## Opt-in Analytics & Capability Detection
 
 ### Motivation
