@@ -219,6 +219,82 @@ Whichever route is chosen, the calendar-sync example in the README should gain a
 
 ---
 
+## Learn from a Stored Sample Series, not Incremental State
+
+Supersedes the streaming approach that *Rate Sampling over a Growing Window*
+improved (implemented 2026-08-07). That fix made each observation far less noisy,
+but the estimator still learns from state carried forward poll to poll, and that
+state is the fragile part: every defect fixed on 2026-08-06/07 was a symptom of it.
+
+### Idea
+
+Keep a small persisted series of `(timestamp, water_temperature, heat_state)` —
+appended only when the temperature or heat mode changes — and derive rates from
+that series instead of from an anchor advanced in flight.
+
+A 16-hour heat-up produces roughly 35 temperature changes, so this is a couple of
+kilobytes per session. Keeping the last handful of sessions is ~10 kB, alongside
+the learning state already stored in `_rates_store`.
+
+### Why not the recorder
+
+The obvious source is Home Assistant's own history, which is already timestamped
+and survives restarts. It does not work in practice:
+
+- **The entities are disabled by default.** `water_temperature` sets
+  `_attr_entity_registry_enabled_default = False`, and every `MSpaDiagnosticSensor`
+  — including `heat_state` — does the same. Most users therefore have no history
+  for either. Temperature is partly recoverable from the climate entity's
+  `current_temperature` attribute, but `heat_state` is not, and that is precisely
+  the qualifier that makes a span usable.
+- **The recorder is optional and purges.** Default retention is days, users exclude
+  entities, and some run without it.
+- **It deepens HA coupling** in the module that *Extracting the Prediction Engine*
+  wants to keep dependency-free. A self-kept series keeps the engine pure; a
+  recorder query does not.
+
+### What it buys
+
+- **Restart immunity.** `_rate_last_temp`, `_rate_last_time`, `_rate_first_step`,
+  `_session_scalar` and `_session_fresh_buckets` are all lost on restart today.
+  A hot deploy mid-session costs a crossing of learning and resets the session
+  scalar; from a stored series nothing is lost, because the rate is recomputed
+  from the samples rather than accumulated.
+- **Retrospective recomputation — the big one for development.** Every algorithm
+  change currently needs a fresh 16-hour session to evaluate. With the samples
+  stored, a new rule can be replayed against past sessions immediately. This is
+  exactly what was done by hand from a log and a CSV on 2026-08-07, and it found
+  the truth the in-flight learner had missed: the cold bucket had drifted to
+  0.98 °C/h against a realised 1.14.
+- **Robust fitting instead of a bounds check.** Outliers can be rejected with
+  hindsight rather than by a fixed `_MIN_HEAT_RATE`/`_MAX_HEAT_RATE` window. The
+  paired reporting glitch of 2026-08-06 — 27.5→28.0 at 0.51 °C/h then 28.0→28.5 at
+  29.5 °C/h, one report late and the next early — is obvious in a series and
+  invisible to a streaming bounds test, which rejected the impossible half and
+  learned the spurious half.
+- **Gap tolerance.** If HA is down for an hour mid-session, the series has both
+  endpoints and the span is still measurable, provided heat mode held.
+- **It subsumes the growing window.** A window is the streaming approximation of a
+  fit over a span. With the series available, the bucket rate becomes a regression
+  over that bucket's samples, and the anchor/close/reset rules stop being needed.
+
+### Open questions
+
+- How many sessions to retain, and whether to keep raw samples or per-session
+  summaries once a session is old. Raw is more useful for replay; summaries are
+  smaller.
+- Whether the series should carry ambient conditions per sample. *Learned Weather
+  Factor* needs observations tagged with their conditions, and doing it here is
+  cheaper than a parallel mechanism — but it widens each record.
+- Whether rate learning should then run only at session end, or continuously over
+  the series so far. Continuous is closer to today's behaviour and keeps the ETA
+  responsive; session-end is simpler and probably more accurate.
+- Interaction with `heat_state` gaps. Thermostat cycling near setpoint fragments a
+  session into many short heating spans; the series makes it possible to stitch
+  those by accumulating heating time only, which the streaming version cannot do.
+
+---
+
 ## Learned Weather Factor
 
 ### Motivation
