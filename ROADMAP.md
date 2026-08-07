@@ -219,6 +219,94 @@ Whichever route is chosen, the calendar-sync example in the README should gain a
 
 ---
 
+## Rate Sampling over a Growing Window
+
+A prerequisite for *Learned Weather Factor* below: the weather fit needs clean
+observations more than it needs plentiful ones, and the current sampling produces
+the noisiest estimate the data allows.
+
+### Problem
+
+`_track_heating_rate` advances its anchor on **every** crossing, so each sample is
+exactly one 0.5 °C step:
+
+```python
+# Always advance anchor to new temperature (even if rate rejected).
+self._rate_last_temp = curr_temp
+self._rate_last_time = now_mono
+```
+
+That is the shortest possible span and therefore the worst signal-to-noise. Rate is
+`0.5 °C / elapsed`, so a few minutes of report-timing jitter dominates: on the
+~30 min crossings of the 2026-08-06 session, ±3 min of jitter spans 0.92–1.12 °C/h.
+Measured noise across 22 accepted samples was **15%**, and with a bucket EMA of
+alpha ~0.25 a single sample shifts the effective rate ~2.5% — about 5 min of ETA on
+3.5 h remaining. Consecutive fast/slow samples are what remains of the Ready at
+wobble now that the display smoothing is in.
+
+### Proposal
+
+Anchor once per bucket, at the first *boundary* crossing in that bucket, and compute
+the rate from that anchor to the current crossing. The window grows through the
+bucket and the relative noise falls with it.
+
+This is sound because every crossing lands exactly on a band boundary, so *any*
+boundary-to-boundary span is phase-exact — the property the existing
+phase-uncertainty guard establishes. A 2 °C span is no more biased than a 0.5 °C
+span, and roughly a quarter as noisy.
+
+It is also dimensionally the right quantity: `_segmented_heating_minutes` consumes
+the bucket rate as an average over the whole bucket span, so learning it as a
+whole-bucket average is the same measure. The most recent 0.5 °C is not.
+
+### Measured on the 2026-08-06 session
+
+| bucket[1], 30 → 34 °C | noise |
+|---|---|
+| current, per 0.5 °C step | 3% |
+| growing window from bucket start | 1% |
+| growing window once span ≥ 2 °C | **0.4%** |
+
+The growing window converges on 0.958 °C/h — exactly the realised whole-bucket rate.
+The cold bucket improves 18% → 11%.
+
+Two further benefits fell out of the measurement:
+
+- **Immunity to paired reporting glitches.** That session contained 27.5→28.0 at
+  0.51 °C/h immediately followed by 28.0→28.5 at 29.5 °C/h — one report evidently
+  late and the next early. Per-step sampling rejects the second as out of bounds and
+  *keeps* the first, learning a spuriously slow rate. A longer span absorbs both.
+- **Convergence is visible.** The estimate improves monotonically as the window
+  grows, so a diagnostic can expose span and sample count alongside the rate.
+
+### Must-haves
+
+- **Anchor after the phase-uncertain crossing, not at heater-on.** Anchoring at the
+  raw start inherits the phase artefact — in the measurement above that produced a
+  20.2 °C/h first estimate and 183% apparent noise for the cold bucket. The existing
+  guard already identifies the correct anchor point.
+- **Do not EMA the growing-window estimate on every crossing.** Successive estimates
+  share most of their data and are strongly correlated, so blending each one at
+  alpha 0.25 double-counts the early samples. Treat the window value as this
+  session's estimate for that bucket and fold it into the stored rate once, or scale
+  alpha by how much genuinely new evidence arrived.
+- **Decide what an interruption does.** Heater-off currently resets the anchor. A
+  growing window either restarts (simple, fewer usable windows) or accumulates
+  heating time only (better, more state). Thermostat cycling near setpoint makes this
+  matter most in the hot bucket, which is also where the window will be shortest.
+
+### Open question
+
+Within-bucket rate decline. A whole-bucket average is the correct input for
+predicting the whole bucket, but slightly optimistic for its last stretch. The
+per-step scheme tracked the local rate instead, which is more responsive and much
+noisier. The 2026-08-06 mid bucket shows no strong monotone trend across its eight
+steps, so the effect is probably second-order against a 15% → sub-1% noise
+reduction — but it is worth checking on a session that reaches the hot bucket, where
+the decline should be steepest.
+
+---
+
 ## Learned Weather Factor
 
 ### Motivation
