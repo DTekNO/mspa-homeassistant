@@ -217,7 +217,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # and at least _MIN_RATE_SAMPLE_HOURS have elapsed since the last valid sample.
         # Outliers (caused by adding hot/cold water, sensor noise etc.) are rejected.
         self.computed_heat_rate: float | None = None  # °C/h, None until enough data
-        self._rate_last_temp: float | None = None     # °C at last accepted sample
+        self._rate_last_temp: float | None = None     # °C at the window anchor
+        self._rate_prev_temp: float | None = None     # °C at the previous poll
         self._rate_last_time: float | None = None     # monotonic seconds at last sample
         # True while the rate anchor is phase-uncertain: the temperature reports
         # in 0.5 °C bands, so at heater-on the water sits at an unknown position
@@ -853,8 +854,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # First poll in heat mode — set a phase-uncertain anchor.
                 self._rate_last_temp = curr_temp
                 self._rate_last_time = now_mono
+                self._rate_prev_temp = curr_temp
                 self._rate_first_step = True
-            elif curr_temp != self._rate_last_temp:
+            elif curr_temp != self._rate_prev_temp:
+                # A genuine change since the previous poll.  This must be tested
+                # against the previous *reading*, not against the window anchor:
+                # the anchor is deliberately held across several crossings, so
+                # comparing to it stays true on every poll until the next change
+                # and re-learns the same span once per poll with an ever-growing
+                # elapsed time.  Observed 2026-08-07: one 36.5→37.0 crossing
+                # re-learned every 30 s for twelve minutes, walking bucket[2]
+                # from 1.040 down to 0.822.
+                self._rate_prev_temp = curr_temp
                 if self._rate_first_step:
                     # First crossing: position information only.  Keep the
                     # existing learned rates driving the estimates.
@@ -948,6 +959,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # (and the next first crossing is treated as phase-uncertain again).
             self._rate_last_temp = None
             self._rate_last_time = None
+            self._rate_prev_temp = None
             self._rate_first_step = False
 
     def _track_cooling_rate(self, curr_temp, heat_state, now_mono: float) -> None:

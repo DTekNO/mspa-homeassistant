@@ -22,6 +22,7 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     c.heat_rate_buckets = [None, 1.30, None]
     c._rate_last_temp = None
     c._rate_last_time = None
+    c._rate_prev_temp = None
     c._rate_first_step = False
     c._session_scalar = 1.0
     c._session_scalar_bucket = None
@@ -282,3 +283,42 @@ class TestGrowingWindow:
         c._track_heating_rate(34.0, 3, 50 * _MIN)             # fresh anchor
         c._track_heating_rate(34.5, 3, 53 * _MIN)             # phase-uncertain again
         assert c.computed_heat_rate == before, "first crossing after resume was learned"
+
+
+class TestDwellAfterACrossing:
+    """A held anchor must not re-learn the same span on every poll.
+
+    Regression source: 2026-08-07.  Holding the anchor for the growing window
+    made `curr_temp != self._rate_last_temp` stay true on every poll after a
+    crossing, so one 36.5→37.0 °C step was re-learned every 30 s for twelve
+    minutes with an ever-growing elapsed time, walking bucket[2] from 1.040 down
+    to 0.822.  Change must be detected against the previous *reading*; the span
+    is measured from the anchor.
+
+    The pre-existing dwell test could not catch this because it dwells at the
+    anchor temperature, where the faulty guard is false.
+    """
+
+    def test_dwell_after_a_crossing_learns_exactly_once(self):
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 10 * _MIN)          # phase-uncertain, re-anchors
+        c._track_heating_rate(34.0, 3, 40 * _MIN)          # the one real sample
+        learned = c.computed_heat_rate
+        bucket = list(c.heat_rate_buckets)
+        for i in range(1, 21):                             # ten minutes of dwelling
+            c._track_heating_rate(34.0, 3, (40 + i * 0.5) * _MIN)
+        assert c.computed_heat_rate == learned, "re-learned the same span while dwelling"
+        assert c.heat_rate_buckets == bucket
+
+    def test_the_window_still_spans_both_crossings(self):
+        """The anchor must still be held — the fix must not revert the window."""
+        c = _coord()
+        c._track_heating_rate(33.0, 3, 0.0)
+        c._track_heating_rate(33.5, 3, 10 * _MIN)
+        c._track_heating_rate(34.0, 3, 40 * _MIN)
+        for i in range(1, 6):
+            c._track_heating_rate(34.0, 3, (40 + i) * _MIN)   # dwell
+        assert c._rate_last_temp == 33.5, "anchor moved during the dwell"
+        c._track_heating_rate(34.5, 3, 70 * _MIN)
+        assert c._rate_last_temp == 33.5, "anchor moved on the next crossing"
