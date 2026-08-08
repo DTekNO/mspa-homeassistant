@@ -389,6 +389,38 @@ the coupling at the edge rather than in the core.
 
 ---
 
+## Alternative: a physical heating model instead of buckets
+
+Newton's law gives `dT/dt = (T_inf - T) / tau` for a heated body with constant power
+and losses proportional to `(T - T_ambient)` — the same exponential form as the well
+recharge curve. Rate then falls *linearly* with water temperature, which makes the
+three buckets a piecewise-constant approximation of a straight line, and two
+parameters replace three constants.
+
+The attraction is that `T_inf = T_ambient + P/k`, so **the weather influence falls
+out of the physics** rather than needing a separate sensitivity table — it would
+unify *Learned Weather Factor* and the rate model into two quantities that mean
+something.
+
+**It cannot be fitted from a single session.** Tried on the 2026-08-06/07 heat-up
+(34 clean steps, 22 → 39.5 °C): r² 0.088, tau 152 h, T_inf 189 °C — the same
+degenerate fit seen on the well, where a nearly-flat rate lets the asymptote run to
+infinity to imitate a horizontal line. That session's own buckets were 1.078 / 0.989
+/ 1.052, essentially flat, and both models predicted the total within a minute of
+each other (1011 and 1012 min against 994 actual). One session over a 17 °C span with
+0.1 °C/h of per-step noise cannot resolve the curvature.
+
+It needs the long-term statistics route, where 192 hours show an unmistakable
+1.263 → 1.086 → 0.841 decline (×0.67).
+
+**Decision rule:** if the dwell fix settles the Ready at wobble and a couple of clean
+sessions land as accurately as 2026-08-07 did — raw estimate 992 min against 994
+actual, 0.2% — stay with buckets. They are simpler, already learn per-install, and
+degrade gracefully. Revisit only if the bucket shape keeps drifting flat, or when the
+weather work makes a shared `T_inf` genuinely worth having.
+
+---
+
 ## Learned Weather Factor
 
 ### Motivation
