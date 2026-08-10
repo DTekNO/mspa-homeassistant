@@ -546,6 +546,21 @@ observations rather than hardcode a sensitivity — over merely repairing the ba
   unexplained variance.
 ### Getting wind history for the fit
 
+> **Deferred 2026-08-10.** Nothing blocking; pick up whenever the weather work
+> starts. To resume, all that is needed is a wind series covering the period of the
+> statistics export plus a station identifier — a station ID or the nearest town is
+> enough, no coordinates. If a Frost client ID is used, pass it as an environment
+> variable rather than a file: it is a credential, and this repo's `.gitignore`
+> covers `*.csv` but nothing key-shaped.
+>
+> **Easiest route is [seklima.met.no](https://seklima.met.no/)** — MET's observations
+> and weather-statistics portal. Pick station, elements and period, download CSV, no
+> registration. That is the human-facing front end; Frost's own "front end" is only a
+> Swagger-style API reference where a client ID is pasted, not a data download, which
+> is why it can look as though the portal disappeared.
+
+
+
 Wind is already *collected*: `_read_weather_entity` reads it from the configured
 weather entity, preferring `wind_gust_speed` over `wind_speed` because gusts disrupt
 the boundary layer around the cover more than steady wind does, and every prediction
