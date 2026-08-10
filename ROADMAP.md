@@ -366,37 +366,83 @@ the coupling at the edge rather than in the core.
 
 ## Alternative: a physical heating model instead of buckets
 
-Newton's law gives `dT/dt = (T_inf - T) / tau` for a heated body with constant power
-and losses proportional to `(T - T_ambient)` — the same exponential form as the well
-recharge curve. Rate then falls *linearly* with water temperature, which makes the
-three buckets a piecewise-constant approximation of a straight line, and two
-parameters replace three constants.
+**Status 2026-08-10: fitted, and it holds.** Previously recorded as untestable from a
+single session; the long-term statistics settle it.
 
-The attraction is that `T_inf = T_ambient + P/k`, so **the weather influence falls
-out of the physics** rather than needing a separate sensitivity table — it would
-unify *Learned Weather Factor* and the rate model into two quantities that mean
-something.
+Newton's law gives `dT/dt = (T_air + P/k - T_water) / tau` for a heated body losing
+heat in proportion to `(T_water - T_air)`. Two parameters replace three bucket
+constants, rate falls *linearly* with water temperature — so the buckets are a
+piecewise-constant approximation of a straight line — and the weather influence falls
+out of the physics instead of needing a sensitivity table.
 
-**It cannot be fitted from a single session.** Tried on the 2026-08-06/07 heat-up
-(34 clean steps, 22 → 39.5 °C): r² 0.088, tau 152 h, T_inf 189 °C — the same
-degenerate fit seen on the well, where a nearly-flat rate lets the asymptote run to
-infinity to imitate a horizontal line. That session's own buckets were 1.078 / 0.989
-/ 1.052, essentially flat, and both models predicted the total within a minute of
-each other (1011 and 1012 min against 994 actual). One session over a 17 °C span with
-0.1 °C/h of per-step noise cannot resolve the curvature.
+### The test, and why it is a real test
 
-It needs the long-term statistics route, where 192 hours show an unmistakable
-1.263 → 1.086 → 0.841 decline (×0.67).
+The law makes a falsifiable prediction: regress rate on water *and* air temperature
+and the two coefficients must come out **equal and opposite**, both equal to `1/tau`.
+Nothing about a curve fit forces that; it either happens or the model is wrong.
 
-**Decision rule:** if the dwell fix settles the Ready at wobble and a couple of clean
-sessions land as accurately as 2026-08-07 did — raw estimate 992 min against 994
-actual, 0.2% — stay with buckets. They are simpler, already learn per-install, and
-degrade gracefully. Revisit only if the bucket shape keeps drifting flat, or when the
-weather work makes a shared `T_inf` genuinely worth having.
+On 639 clean full-heat hours from the previous spa, spanning −9 to +20 °C outdoor:
 
----
+```
+water  -0.0161  ±0.0013        air  +0.0167  ±0.0013        ratio 1.04
+```
+
+**Equal and opposite to within 4%**, on coefficients individually significant at
+t ≈ 12. That implies `tau` = 62 h and an asymptote 68.6 °C above air temperature.
+
+It also fits better than the buckets on the same data, with one parameter fewer:
+
+| model | params | rms |
+|---|---|---|
+| Newton (water + air) | 2 | **0.206 °C/h** |
+| three buckets | 3 | 0.235 °C/h |
+
+### Why the earlier attempt failed
+
+Fitted on the single 2026-08-06/07 session it gave `tau` 152 h and an asymptote of
+189 °C — the degenerate fit familiar from the well recharge curve, where a nearly-flat
+rate lets the asymptote run to infinity to imitate a straight line. That was a
+sample-size problem, not a model problem: 34 steps over a 17 °C span with 0.1 °C/h of
+per-step noise cannot resolve the curvature, and 639 hours across a 29 °C outdoor
+range resolves it easily.
+
+### What is not yet settled
+
+The **current** spa gives water −0.0390 ±0.0034 against air +0.0214 ±0.0045 — a ratio
+of 0.55, not 1.04. Both coefficients are individually strong, but there are only 192
+hours over a 2.7–21.4 °C outdoor range, so the air term is poorly constrained. The
+implied `tau` of 25.6 h is plausible for a smaller tub than the 62 h above, but the
+split should not be trusted until this machine has a winter behind it. The statistics
+are accumulating; re-run the fit in spring.
+
+### What adopting it would remove
+
+- **`AMBIENT_SENSITIVITY` and its baseline entirely.** The air-temperature term *is*
+  the weather model, so there is no gain to calibrate, no reference conditions to pin,
+  and none of the self-cancelling behaviour described under *Learned Weather Factor*.
+  This is the strongest argument for it — it deletes a subsystem rather than fixing one.
+- The three bucket constants and their per-bucket correction precedence.
+- Most of `prediction_bias`, which should converge near 1.0 once the shape is right.
+
+### Decision
+
+Unchanged in the short term: buckets predicted the 2026-08-06/07 session to within
+**2 minutes** (992 estimated against 994 actual, 0.2%), so there is nothing to gain
+on accuracy today. What has changed is that the alternative is now evidence-backed
+rather than appealing, and it removes more code than it adds. Revisit when the current
+spa has winter data, or sooner if the bucket shape keeps drifting flat — live buckets
+read 1.03 / 0.99 / 1.01 against a statistics-derived 1.263 / 1.086 / 0.841, and a flat
+shape is exactly what a straight line would fix.
 
 ## Learned Weather Factor
+
+> **Read *Alternative: a physical heating model* first.** On 639 hours of statistics,
+> Newton's law reproduces the air-temperature dependence with coefficients equal and
+> opposite to within 4%. If that model is adopted, most of this entry dissolves: there
+> is no separate gain to learn and no reference conditions to pin, because the air term
+> is the weather model. Everything below remains the plan for keeping the bucket
+> approach; it is no longer the only option.
+
 
 ### Motivation
 
@@ -544,70 +590,42 @@ observations rather than hardcode a sensitivity — over merely repairing the ba
   46-minute error. Expect the weather work to sharpen predictions, not transform them.
 - **Cover state is unmeasured** and is the obvious candidate for much of that
   unexplained variance.
-### Getting wind history for the fit
+### Wind: measured, and not worth modelling (2026-08-10)
 
-> **Deferred 2026-08-10.** Nothing blocking; pick up whenever the weather work
-> starts. To resume, all that is needed is a wind series covering the period of the
-> statistics export plus a station identifier — a station ID or the nearest town is
-> enough, no coordinates. If a Frost client ID is used, pass it as an environment
-> variable rather than a file: it is a credential, and this repo's `.gitignore`
-> covers `*.csv` but nothing key-shaped.
->
-> **Easiest route is [seklima.met.no](https://seklima.met.no/)** — MET's observations
-> and weather-statistics portal. Pick station, elements and period, download CSV, no
-> registration. That is the human-facing front end; Frost's own "front end" is only a
-> Swagger-style API reference where a client ID is pasted, not a data download, which
-> is why it can look as though the portal disappeared.
+**Result: drop the `sqrt(wind)` term.** Wind adds no useful explanatory power once
+water and air temperature are accounted for.
 
+| | r² without wind | with gust | t on the gust term |
+|---|---|---|---|
+| current spa (n=192) | 0.448 | 0.456 | −1.6 |
+| previous spa (n=639) | 0.328 | 0.329 | −1.0 |
 
+`sqrt(gust)` is no better (t = −1.8 and −0.9). The sign is physically right — more
+wind, slower heating — but the magnitude is indistinguishable from zero on either
+dataset, including the 639-hour one spanning −9 to +20 °C and gusts of 1.1 to
+19.5 m/s. Wind was not hiding inside the temperature term either: `corr(air, gust)`
+is only −0.26 and +0.39.
 
-Wind is already *collected*: `_read_weather_entity` reads it from the configured
-weather entity, preferring `wind_gust_speed` over `wind_speed` because gusts disrupt
-the boundary layer around the cover more than steady wind does, and every prediction
-record stores `ambient_wind` at session start — 11.5 m/s on 2026-08-06, for instance.
+Data: [seklima.met.no](https://seklima.met.no/), station **SN50500 Flesland**,
+14,016 hourly rows from 2025-01-01, elements *Høyeste vindkast (1 t)* and *Høyeste
+middelvind (1 t)*. No registration needed — this is the route to use for any future
+weather question, in preference to the Frost API.
 
-What is missing is *history*. Weather-entity attributes are not statistics-eligible,
-so there is no hourly wind series to pair with the 831 heating hours, and prediction
-records keep only the last ten. Three routes, and they are complementary:
+Two traps worth remembering:
 
-**Frost — retrospective, and the only way to get last winter.**
-[frost.met.no](https://frost.met.no/howto.html) is MET Norway's archive of historical
-observations. Note this is a *different service* from the `api.met.no` locationforecast
-that the Home Assistant `met` integration uses — that one is forecast-only, returning
-from the current hour forwards, so it cannot supply history at all.
+- **`norsk normaltid` is CET all year, with no daylight saving.** So UTC = CET − 1 h,
+  *not* the local Norwegian offset, which is +2 in summer. Getting this wrong shifts
+  every join by an hour in summer and looks like noise.
+- Values are semicolon-separated with **decimal commas**, and the last line is a
+  licence notice rather than data.
 
-Registration is an email address, yielding a client ID and secret; **the client ID
-alone is enough for open data**, sent as HTTP Basic with an empty password:
+**The station-versus-sensor mismatch turned out to be minor**, contrary to the
+caution recorded earlier. The stored prediction record read `ambient_wind: 11.5 m/s`
+at 2026-08-06T19:26Z from the weather entity; Flesland's 19:00Z hour recorded a
+11.4 m/s gust. Agreement to 1%, so a coefficient fitted on this station would have
+been directly usable — the concern was overstated.
 
-```bash
-curl --user "<clientID>:"   'https://frost.met.no/observations/v0.jsonld?sources=SN18700&referencetime=2026-01-01/2026-08-01&elements=wind_speed'
-```
-
-Use `Sources/` to find the nearest station and `Observations/AvailableTimeSeries/` to
-check it actually reports gusts — those are far from universal. Add
-`timeoffsets=default&levels=default&qualities=0,1,2,3,4`, or a station with several
-sensors returns duplicate and low-quality series.
-
-**A template sensor — prospective, free, and the only one that matches what we
-predict with.** Mirror exactly what `_read_weather_entity` consumes into a
-`sensor` with `state_class: measurement`, and Home Assistant accumulates hourly
-statistics for it from that day on. Nothing to register, and no station-distance
-question.
-
-**Prediction records** already carry one sample per session, but ten is too few to
-fit anything.
-
-**Prefer the template sensor for the actual fit, and use Frost to bootstrap.** The
-reason is a mismatch that is easy to overlook: Frost returns *station* observations —
-a different location, a different measurement height and exposure, and a different
-gust definition — while the model at runtime consumes the weather entity's
-`wind_gust_speed`. A coefficient fitted on one and applied to the other carries that
-error permanently. Temperature has the same issue but a good local sensor already
-solves it; wind has no local alternative. So Frost is worth it to get a first
-coefficient this season instead of next, with the template sensor superseding it once
-a few months have accumulated.
-
-### Measured evidence (session of 2026-08-06/07)
+## Measured evidence (session of 2026-08-06/07)
 
 A 17.5 °C cold start, 22.0 → 39.5 °C, the first long predictive run without test
 cycling in the week. It finished ~55 min late against a 13:00 target. Breaking the
