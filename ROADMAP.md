@@ -544,17 +544,53 @@ observations rather than hardcode a sensitivity — over merely repairing the ba
   46-minute error. Expect the weather work to sharpen predictions, not transform them.
 - **Cover state is unmeasured** and is the obvious candidate for much of that
   unexplained variance.
-- **Wind is collected but not in the hourly statistics.** `_read_weather_entity`
-  already reads it from the configured weather entity, preferring `wind_gust_speed`
-  over `wind_speed` because gusts disrupt the boundary layer around the cover more
-  than steady wind does, and every prediction record stores `ambient_wind` at session
-  start — 11.5 m/s on 2026-08-06, for instance. But weather-entity *attributes* are
-  not statistics-eligible, so there is no hourly wind history to pair with the 831
-  heating hours. Either fit the wind term from prediction records (only the last ten
-  are kept, so it accumulates slowly), or check whether a separate wind sensor with
-  `state_class: measurement` exists on the instance — that would have long-term
-  statistics like the temperature does, and would make wind fittable retrospectively
-  on the same footing.
+### Getting wind history for the fit
+
+Wind is already *collected*: `_read_weather_entity` reads it from the configured
+weather entity, preferring `wind_gust_speed` over `wind_speed` because gusts disrupt
+the boundary layer around the cover more than steady wind does, and every prediction
+record stores `ambient_wind` at session start — 11.5 m/s on 2026-08-06, for instance.
+
+What is missing is *history*. Weather-entity attributes are not statistics-eligible,
+so there is no hourly wind series to pair with the 831 heating hours, and prediction
+records keep only the last ten. Three routes, and they are complementary:
+
+**Frost — retrospective, and the only way to get last winter.**
+[frost.met.no](https://frost.met.no/howto.html) is MET Norway's archive of historical
+observations. Note this is a *different service* from the `api.met.no` locationforecast
+that the Home Assistant `met` integration uses — that one is forecast-only, returning
+from the current hour forwards, so it cannot supply history at all.
+
+Registration is an email address, yielding a client ID and secret; **the client ID
+alone is enough for open data**, sent as HTTP Basic with an empty password:
+
+```bash
+curl --user "<clientID>:"   'https://frost.met.no/observations/v0.jsonld?sources=SN18700&referencetime=2026-01-01/2026-08-01&elements=wind_speed'
+```
+
+Use `Sources/` to find the nearest station and `Observations/AvailableTimeSeries/` to
+check it actually reports gusts — those are far from universal. Add
+`timeoffsets=default&levels=default&qualities=0,1,2,3,4`, or a station with several
+sensors returns duplicate and low-quality series.
+
+**A template sensor — prospective, free, and the only one that matches what we
+predict with.** Mirror exactly what `_read_weather_entity` consumes into a
+`sensor` with `state_class: measurement`, and Home Assistant accumulates hourly
+statistics for it from that day on. Nothing to register, and no station-distance
+question.
+
+**Prediction records** already carry one sample per session, but ten is too few to
+fit anything.
+
+**Prefer the template sensor for the actual fit, and use Frost to bootstrap.** The
+reason is a mismatch that is easy to overlook: Frost returns *station* observations —
+a different location, a different measurement height and exposure, and a different
+gust definition — while the model at runtime consumes the weather entity's
+`wind_gust_speed`. A coefficient fitted on one and applied to the other carries that
+error permanently. Temperature has the same issue but a good local sensor already
+solves it; wind has no local alternative. So Frost is worth it to get a first
+coefficient this season instead of next, with the template sensor superseding it once
+a few months have accumulated.
 
 ### Measured evidence (session of 2026-08-06/07)
 
