@@ -39,6 +39,7 @@ class _NumberEntity(_HAEntity):        pass
 class _BinarySensorEntity(_HAEntity):  pass
 class _ClimateEntity(_HAEntity):       pass
 class _DateTimeEntity(_HAEntity):      pass
+class _ButtonEntity(_HAEntity):        pass
 class _RestoreEntity(_HAEntity):
     async def async_added_to_hass(self): pass
     async def async_get_last_state(self): return None
@@ -75,6 +76,7 @@ _number_mod          = MagicMock(); _number_mod.NumberEntity = _NumberEntity
 _binary_mod          = MagicMock(); _binary_mod.BinarySensorEntity = _BinarySensorEntity
 _climate_mod         = MagicMock(); _climate_mod.ClimateEntity = _ClimateEntity
 _datetime_mod        = MagicMock(); _datetime_mod.DateTimeEntity = _DateTimeEntity
+_button_mod          = MagicMock(); _button_mod.ButtonEntity = _ButtonEntity
 _coordinator_mod     = MagicMock(); _coordinator_mod.CoordinatorEntity = _CoordinatorEntity; _coordinator_mod.DataUpdateCoordinator = _DataUpdateCoordinator; _coordinator_mod.UpdateFailed = _UpdateFailed
 _storage_mod         = MagicMock(); _storage_mod.Store = _Store
 _restore_mod         = MagicMock(); _restore_mod.RestoreEntity = _RestoreEntity
@@ -114,6 +116,7 @@ sys.modules.update({
     "homeassistant.components.binary_sensor":       _binary_mod,
     "homeassistant.components.climate":             _climate_mod,
     "homeassistant.components.datetime":            _datetime_mod,
+    "homeassistant.components.button":              _button_mod,
     "homeassistant.helpers":                        _helpers_mod,
     "homeassistant.helpers.update_coordinator":     _coordinator_mod,
     "homeassistant.helpers.entity":                 _entity_mod,

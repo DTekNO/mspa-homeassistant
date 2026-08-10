@@ -140,6 +140,7 @@ This section covers two sensors and one control entity that work together:
 | **Ready at** | Sensor | Estimated ready time — "10:34", "10:34 +1d", or "Ready". `ready_at` (ISO 8601 timestamp) and `minutes_remaining` available as attributes. |
 | **Heat Schedule** | Sensor | Predicts when to start heating for a planned session |
 | **Scheduled for** | Control (datetime) | Set when you want the spa ready |
+| **Cancel Heat Schedule** | Button | Clears a pending schedule without touching the heater |
 
 **How it fits together:** set **Scheduled for** to when you want to use the spa. The **Heat Schedule** sensor works backwards through the learned heating rates — corrected for any available weather data while waiting to start — to compute when heating must start, and the integration **starts the spa itself** when that moment arrives. The **Ready at** sensor then tracks the live estimate through to `Ready` and can be used on your dashboard to let you know how long you have to wait! The start time is re-evaluated continuously until it fires, so if the spa cools faster than expected, the start moves earlier rather than quietly missing your target.
 
@@ -335,6 +336,33 @@ actions:
 ```
 
 > **Note on accuracy**: Estimates improve over time as the EMA accumulates more samples. Accuracy is affected by ambient temperature, water fill level, and whether the lid is on. The integration automatically tracks prediction accuracy — grep for `PREDICTION_RESULT` in the Home Assistant log to see estimated vs actual times for each heating session.
+
+### Cancelling a schedule
+
+Press **Cancel Heat Schedule** on the device page. **Scheduled for** returns to
+`unknown`, **Heat Schedule** returns to `Not scheduled`, and the heater is left
+exactly as it is — cancelling a plan for later says nothing about whether the spa
+should be heating now.
+
+The button is momentary, so there is no state to leave in the wrong position, and it
+only appears available while a schedule actually exists. It is automatable in the
+usual way:
+
+```yaml
+action: button.press
+target:
+  entity_id: button.mspa_cancel_heat_schedule
+```
+
+Useful when you have heated the spa manually and no longer want the original
+session to fire. The integration deliberately does *not* cancel by itself when you
+heat manually — it cannot tell "I have had my soak, forget tonight" from "I warmed
+it briefly, still want 18:00" — so the decision stays yours.
+
+> Earlier versions had no way to withdraw a schedule: Home Assistant offers no
+> gesture for clearing a datetime, and editing the date to a day in the past
+> cleared it but switched the heater on as it went. Both are fixed — a target more
+> than an hour old is now abandoned rather than acted on.
 
 ### Dashboard card examples
 
@@ -558,7 +586,15 @@ Replace `calendar.your_calendar` and `datetime.mspa_scheduled_for` with your act
 >
 > **Timezone note**: `as_local()` is required around `as_datetime()`. Home Assistant calendar integrations return start times as timezone-naive strings; without it the comparison against `now()` (always timezone-aware) raises a template error.
 >
-> **Cancelling your last planned session**: deleting a calendar event normally just rolls the sync on to the next one. But if you delete the only remaining event, the calendar reports no start time, the condition above is false, and **Scheduled for** keeps its previous value — so the spa still heats for a session that is no longer planned. To park it, set **Scheduled for** well past the lookahead horizon (a date next year, say): it sits dormant until something replaces it, which the next real calendar event will do. Setting a time in the *past* does not cancel it — that makes the scheduler fire immediately.
+> **Cancelling your last planned session**: deleting a calendar event normally just rolls the sync on to the next one. But if you delete the only remaining event, the calendar reports no start time, the condition above is false, and **Scheduled for** keeps its previous value — so the spa would still heat for a session that is no longer planned. Add an `else` branch that presses **Cancel Heat Schedule**:
+>
+> ```yaml
+>   - conditions: []          # no upcoming event
+>     sequence:
+>       - action: button.press
+>         target:
+>           entity_id: button.mspa_cancel_heat_schedule
+> ```
 
 ---
 

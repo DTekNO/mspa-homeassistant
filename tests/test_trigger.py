@@ -274,3 +274,74 @@ class TestScheduleExpiry:
         )
         c._clear_schedule_if_expired(None)
         assert c.ready_latched is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CANCELLING A SCHEDULE  (github: romd87, 2026-08-08)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestClearSchedule:
+    """clear_schedule is shared by the expiry auto-clear and the Cancel button.
+
+    Its contract: retire the schedule and everything derived from it, and leave the
+    heater alone. Cancelling a plan for later says nothing about whether the spa
+    should be heating now.
+    """
+
+    def test_clears_every_derived_flag(self):
+        c = _coord(scheduled_ready_at=_NOW_UTC + timedelta(hours=5),
+                   schedule_target_temp=40.0)
+        c._schedule_triggered = True
+        c.ready_latched = True
+        c.ready_latched_temp = 39.0
+        c._last_computed_start_at = _NOW_UTC
+        c.clear_schedule("test")
+        assert c.scheduled_ready_at is None
+        assert c._schedule_triggered is False
+        assert c.ready_latched is False
+        assert c.ready_latched_temp is None
+        assert c._last_computed_start_at is None
+
+    def test_does_not_touch_the_heater(self):
+        c = _coord(scheduled_ready_at=_NOW_UTC + timedelta(hours=5),
+                   schedule_target_temp=40.0)
+        c.clear_schedule("test")
+        c.api.set_temperature_setting.assert_not_called()
+        c.api.set_feature_state.assert_not_called()
+
+    def test_is_a_no_op_with_nothing_scheduled(self):
+        c = _coord()
+        c.clear_schedule("test")
+        assert c.scheduled_ready_at is None
+
+
+class TestStaleTargetIsAbandoned:
+    """A target well in the past is an abandoned plan, not a window just opened.
+
+    Reported 2026-08-08: editing the schedule's date to a past day — the only way
+    to clear it before the Cancel button existed — cleared the schedule *and*
+    switched the heater on, because the trigger runs before the expiry clear.
+    """
+
+    def test_a_day_old_target_does_not_start_the_heater(self):
+        c = _coord(scheduled_ready_at=_NOW_UTC - timedelta(days=3),
+                   schedule_target_temp=40.0)
+        _run(c._check_schedule_trigger(20.0, None))
+        c.api.set_temperature_setting.assert_not_called()
+        c.api.set_feature_state.assert_not_called()
+        assert c.scheduled_ready_at is None, "stale schedule should be cleared"
+
+    def test_a_recently_passed_target_still_fires(self):
+        """The deliberate 'fire as soon as the window opens' behaviour must stand."""
+        c = _coord(scheduled_ready_at=_NOW_UTC - timedelta(minutes=10),
+                   schedule_target_temp=40.0)
+        _run(c._check_schedule_trigger(20.0, None))
+        c.api.set_temperature_setting.assert_called_once_with(40.0)
+
+    def test_the_boundary_is_an_hour(self):
+        for mins, should_fire in ((55, True), (65, False)):
+            c = _coord(scheduled_ready_at=_NOW_UTC - timedelta(minutes=mins),
+                       schedule_target_temp=40.0)
+            _run(c._check_schedule_trigger(20.0, None))
+            fired = c.api.set_temperature_setting.called
+            assert fired is should_fire, f"{mins} min late: fired={fired}"

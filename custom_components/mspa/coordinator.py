@@ -53,6 +53,12 @@ _LOGGER = logging.getLogger(__name__)
 # ~5 °C/h, and below the minimum the signal is just sensor noise / drift.
 _MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
 
+# A scheduled ready time older than this is treated as abandoned rather than as a
+# window that has just opened, so it is cleared without commanding the heater.
+# Generous enough not to disturb the deliberate "fire as soon as the window opens"
+# behaviour, which tests pin at 5 and 10 minutes late.
+_SCHEDULE_STALE_AFTER = timedelta(hours=1)
+
 
 # Temperature-bucket boundaries, mirroring sensor._HEAT_BUCKET_T1/_T2.  Defined
 # here too so the coordinator does not import from the sensor platform.
@@ -792,17 +798,33 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         if (self.scheduled_ready_at is not None
                 and dt_util.utcnow() >= dt_util.as_utc(self.scheduled_ready_at)):
-            _LOGGER.info(
-                "Heat schedule: session complete — clearing  "
-                "[water=%.1f°C  sched=%.1f°C  triggered=%s  latched=%s]",
-                current_temp or 0.0, self.schedule_target_temp or 0.0,
-                self._schedule_triggered, self.ready_latched,
-            )
-            self.scheduled_ready_at = None
-            self._schedule_triggered = False
-            self._last_computed_start_at = None
-            self.ready_latched = False
-            self.ready_latched_temp = None
+            self.clear_schedule("session complete", current_temp)
+
+    def clear_schedule(self, reason: str, current_temp: float | None = None) -> None:
+        """Retire the schedule and all state derived from it.
+
+        Deliberately does NOT touch the heater or the setpoint: cancelling a plan
+        for later says nothing about whether the spa should be heating now.  A
+        user who wants it off turns it off.
+
+        Shared by the expiry auto-clear and the Cancel heat schedule button so the
+        two cannot drift — the latch release in particular is easy to omit, and
+        forgetting it once already shipped as a bug where Ready at stayed pinned
+        on "Ready" indefinitely after a session.
+        """
+        if self.scheduled_ready_at is None:
+            return
+        _LOGGER.info(
+            "Heat schedule: %s — clearing  "
+            "[water=%.1f°C  sched=%.1f°C  triggered=%s  latched=%s]",
+            reason, current_temp or 0.0, self.schedule_target_temp or 0.0,
+            self._schedule_triggered, self.ready_latched,
+        )
+        self.scheduled_ready_at = None
+        self._schedule_triggered = False
+        self._last_computed_start_at = None
+        self.ready_latched = False
+        self.ready_latched_temp = None
 
     def _track_heating_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the observed heating rate over a growing per-bucket window.
@@ -1046,6 +1068,23 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         target_temp = self.schedule_target_temp
         target_utc  = dt_util.as_utc(self.scheduled_ready_at)
         now_utc     = dt_util.utcnow()
+
+        # A target well in the past is a stale plan, not a window that just opened.
+        # Firing on it starts the heater for a session the user no longer wants —
+        # reported 2026-08-08, where editing the schedule's *date* to a past day
+        # (the only way to clear it before the Cancel button existed) turned the
+        # heater on.  Inside the grace period the existing behaviour stands: a
+        # target a few minutes ago should still confirm its setpoint, since that
+        # is a window opening rather than an abandoned plan.
+        if now_utc - target_utc > _SCHEDULE_STALE_AFTER:
+            _LOGGER.info(
+                "Heat schedule: target %s is %.1f h in the past — abandoning "
+                "without starting the heater",
+                target_utc.isoformat(),
+                (now_utc - target_utc).total_seconds() / 3600,
+            )
+            self.clear_schedule("stale target", current_temp)
+            return
 
         minutes_needed = self._compute_heating_minutes(current_temp, target_temp)
         if minutes_needed is None:

@@ -5,6 +5,7 @@ from homeassistant.components.number import NumberEntity
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.datetime import DateTimeEntity
+from homeassistant.components.button import ButtonEntity
 from homeassistant.helpers import device_registry as dr
 
 from .const import DOMAIN
@@ -78,4 +79,7 @@ class MSpaNumberEntity(MSpaBaseEntity, CoordinatorEntity, NumberEntity):
     pass
 
 class MSpaDateTimeEntity(MSpaBaseEntity, CoordinatorEntity, DateTimeEntity):
+    pass
+
+class MSpaButtonEntity(MSpaBaseEntity, CoordinatorEntity, ButtonEntity):
     pass

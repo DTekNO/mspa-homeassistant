@@ -194,31 +194,6 @@ mechanical rather than exploratory, and costs nothing if the split never happens
 
 ---
 
-## Cancelling a Heat Schedule
-
-### Problem
-
-There is currently no way to cancel a pending schedule. `scheduled_ready_at` is cleared automatically, but only once its time has *passed* — by which point the spa has already heated. A user who cancels a planned session is left with a schedule that will still fire.
-
-This bites hardest with the documented calendar-sync automation. Deleting a calendar event normally rolls the sync on to the next event, but deleting the *only remaining* event leaves the calendar with no start time, so the automation's condition is false and **Scheduled for** silently retains its old value. The automation cannot fix this itself:
-
-- `datetime.set_value` requires a datetime — there is no way to unset a datetime entity.
-- Writing a past time is actively worse: `_check_schedule_trigger` fires when `now >= start_at`, so a past target triggers an immediate heat-up rather than cancelling one.
-
-The only workaround today is to park **Scheduled for** far beyond the lookahead horizon, which is obscure and leaves a misleading value in the UI.
-
-### Options
-
-- **A `mspa.clear_schedule` service.** Explicit and scriptable, so the calendar automation can add an `else` branch that clears the schedule when no upcoming event exists. Probably the minimum viable fix.
-- **A "Schedule enabled" switch on the device.** Discoverable in the UI and easy to automate, and it preserves the time so the user can re-enable without re-entering it. Costs an extra entity.
-- **Treat a past value as a cancel** rather than an immediate trigger. This would make the natural automation-side gesture work, but it changes existing trigger semantics and risks breaking the deliberate "fire as soon as the window opens" behaviour that `test_fires_when_target_time_passed` covers. Would need care.
-
-### Notes
-
-Whichever route is chosen, the calendar-sync example in the README should gain an `else` branch that cancels when the calendar has no upcoming event, and the datetime entity's restore path should not resurrect a schedule the user had cancelled.
-
----
-
 ## Learn from a Stored Sample Series, not Incremental State
 
 Supersedes the streaming approach that *Rate Sampling over a Growing Window*

@@ -22,6 +22,7 @@ PLATFORMS = [
     Platform.CLIMATE,
     Platform.NUMBER,
     Platform.DATETIME,
+    Platform.BUTTON,
 ]
 
 SERVICES = [

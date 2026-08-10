@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Cancel Heat Schedule button** — clears a pending schedule and leaves the heater
+  alone. Requested on GitHub by romd87. Home Assistant provides no way to clear a
+  datetime entity, so **Scheduled for** was previously a one-way door: the time could
+  be changed but never withdrawn. Pressing the button returns **Scheduled for** to
+  `unknown` and **Heat Schedule** to `Not scheduled`, and it is automatable with
+  `button.press` — useful for an automation that cancels the old plan when you start
+  heating manually. It shows as unavailable when there is no schedule to cancel.
+
 ### Changed
 
 - **Heating rates are now measured over a growing window rather than a single
@@ -31,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected and the slow one kept. A wide span absorbs both.
 
 ### Fixed
+
+- **A schedule left far in the past no longer starts the heater.** Editing the
+  schedule to a past date — the only way to clear it before the button existed —
+  cleared the schedule but switched the heater on as it went, because the trigger
+  runs before the expiry check and could not tell a window that had just opened from
+  a plan abandoned days ago. A target more than an hour old is now retired without
+  commanding anything. A target a few minutes past still fires, which is deliberate:
+  that is a window opening, not a stale plan.
 
 - **The Ready at time no longer wobbles.** During a long heating session the
   estimate changed 165 times in 11 hours — 39 times in the worst hour — including
