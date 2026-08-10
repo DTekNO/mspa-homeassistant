@@ -7,90 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2026.8.2-beta]
 
-> **Beta.** Every heater start now brings the circulation pump up first, which
-> changes how the integration issues its most consequential command. That wants
-> verifying on real hardware before a full release. Everything else here is
-> continued work on the predictive scheduler.
+> **Beta.** Every heater start now brings the circulation pump up first, which changes
+> how the integration issues its most consequential command. That wants verifying on
+> real hardware before a full release.
 
 ### Added
 
 - **Cancel Heat Schedule button** — clears a pending schedule and leaves the heater
-  alone. Requested on GitHub by romd87. Home Assistant provides no way to clear a
-  datetime entity, so **Scheduled for** was previously a one-way door: the time could
-  be changed but never withdrawn. Pressing the button returns **Scheduled for** to
-  `unknown` and **Heat Schedule** to `Not scheduled`, and it is automatable with
-  `button.press` — useful for an automation that cancels the old plan when you start
-  heating manually. It shows as unavailable when there is no schedule to cancel.
-
-  A restart is needed after upgrading for the new button to appear.
+  alone. Requested by romd87. Home Assistant gives no way to clear a datetime, so
+  **Scheduled for** used to be a one-way door. Automatable with `button.press`; needs
+  a restart after upgrading for the new button to appear.
 
 ### Changed
 
-- **The heater now always starts the circulation pump first.** The spa refuses to
-  heat without flow, and the MSpa Link app never enables heating on its own — it
-  starts the pump first. This integration could, from the climate entity, the heater
-  switch, the `mspa.set_heater` action or the scheduler. All four now follow the same
-  sequence: start the pump, wait for the spa to confirm it, then start the heater.
-  An already-running pump is left alone and the heater starts immediately.
+- **The heater always starts the circulation pump first.** The spa refuses to heat
+  without flow, and the MSpa Link app never enables heating on its own. If the pump
+  will not start, the heater is no longer commanded and the scheduler retries.
 
-  If the pump will not start, the heater is no longer commanded — the request fails
-  instead of leaving the spa trying to heat dry, and the scheduler retries on its
-  next poll.
-
-- **Heating rates are now measured over a growing window rather than a single
-  temperature step.** Each 0.5 °C step took about half an hour, and rate is
-  distance over time, so a few minutes of report-timing jitter swamped the
-  measurement — 18% scatter between consecutive samples. That noise was the
-  remaining source of Ready at moving around, and worse, it was dragging the
-  learned cold-water rate *below* the truth: 0.98 °C/h stored against 1.14 °C/h
-  actually achieved.
-
-  Each sample now measures from the first temperature boundary reached in the
-  current range through to the latest one, so the span widens as heating
-  progresses and the estimate keeps sharpening. This is sound because every
-  reported step lands on the same 0.5 °C grid, so a wide span is no less exact
-  than a narrow one — just far less noisy. Scatter falls from 18% to 7% in the
-  cold range and from 3% to 1% in the middle one, reaching 0.4% once the span
-  passes 2 °C, and the learned rates land within a few hundredths of what the
-  spa actually did.
-
-  Side benefit: a pair of glitched readings — one report late, the next early —
-  used to be learned as a spuriously slow rate, because the impossible one was
-  rejected and the slow one kept. A wide span absorbs both.
+- **Heating rates are measured over a wider span.** A single 0.5 °C step was too short
+  to time accurately, which both unsettled the Ready at estimate and taught the model
+  rates below what the spa actually achieved.
 
 ### Fixed
 
-- **The Ready at time no longer wobbles.** During a long heating session the
-  estimate changed 165 times in 11 hours — 39 times in the worst hour — including
-  14 direction reversals and two jumps of over half an hour. The smoothing added
-  in 2026.8.1 was doing what it was written to do, but it was aimed at the wrong
-  thing: its speed limit was loose enough that ordinary minute-to-minute jitter
-  passed straight through, and it deliberately let *large* corrections bypass
-  smoothing on the assumption they meant you had changed the schedule. In practice
-  the large corrections were the model revising its own estimate as it learned, so
-  the biggest jumps were exactly the ones that escaped smoothing.
+- **The Ready at time no longer wobbles.** It used to change 165 times in an 11-hour
+  session, 39 times in the worst hour; now 32 and 5. It also reads in 5-minute steps,
+  since minute precision on an estimate hours away was never real.
 
-  The display now ignores movement under 5 minutes, closes larger gaps gradually,
-  and only jumps when you actually change something — the schedule time, the
-  schedule temperature or the thermostat. It is also rounded to 5 minutes, since
-  minute precision on an estimate hours away was never real. Replayed against the
-  recorded session: **165 changes become 32**, the worst hour drops from 39 to 5,
-  and the estimate still tracks reality to within 5 minutes.
-
-- **A schedule left far in the past no longer starts the heater.** Editing the
-  schedule to a past date — the only way to clear it before the Cancel button
-  existed — cleared the schedule but switched the heater on as it went, because the
-  trigger runs before the expiry check and could not tell a window that had just
-  opened from a plan abandoned days ago. A target more than an hour old is now
-  retired without commanding anything. A target a few minutes past still fires,
-  which is deliberate: that is a window opening, not a stale plan.
+- **A schedule left far in the past no longer starts the heater.** Editing the date to
+  a past day — the only way to clear a schedule before the button existed — cleared it
+  but switched the heater on as it went.
 
 ### Verified
 
-- A full 16.5-hour heat-up from 22.0 to 39.5 °C predicted to within **2 minutes**
-  (992 min estimated against 994 actual, 0.2%), confirming the rate model itself is
-  sound. The remaining error on that session came from the historical bias
-  correction, which is self-correcting and moved from 0.940 to 0.960 on completion.
+- A 16.5-hour heat-up from 22.0 to 39.5 °C predicted to within **2 minutes** (0.2%).
 
 ## [2026.8.1]
 
