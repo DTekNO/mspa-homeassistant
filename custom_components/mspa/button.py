@@ -1,5 +1,6 @@
 """Button platform for MSpa integration — cancel the heat schedule."""
 import logging
+import time
 
 from homeassistant.const import EntityCategory
 
@@ -7,6 +8,14 @@ from .const import DOMAIN
 from .entity import MSpaButtonEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+# Presses are ignored for this long after the entity appears.  A cancel is
+# destructive and silent — it clears a plan the user may still want — so it must not
+# be possible for a restart or a reload to trigger one.  The window covers an
+# automation that fires on `homeassistant.start`, and it means correctness does not
+# depend on DATETIME preceding BUTTON in PLATFORMS, which is what currently
+# guarantees the schedule is restored before this entity exists.
+_PRESS_GRACE_SECONDS = 20
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -43,19 +52,48 @@ class MSpaCancelHeatSchedule(MSpaButtonEntity):
             f"mspa_cancel_heat_schedule_{getattr(coordinator, 'device_id', 'unknown')}"
         )
 
-    @property
-    def available(self) -> bool:
-        """Only offered when there is something to cancel.
+    # NOTE: availability deliberately does NOT depend on whether a schedule exists.
+    #
+    # It did, on the reasoning that a control which does nothing is worse than one
+    # visibly not applicable.  That produced a far worse effect.  A button's state
+    # *is* its last-press timestamp, and ButtonEntity.async_internal_added_to_hass
+    # restores it across restarts.  Gating availability meant the entity sat at
+    # `unavailable` until a schedule appeared, then flipped to that restored
+    # timestamp — a state change the logbook narrates as "Pressed".
+    #
+    # Observed 2026-08-10: the calendar automation set Scheduled for at 11:28:51 and
+    # the feed showed "Cancel Heat Schedule → Pressed" at 11:28:53, in the same second
+    # the schedule was applied.  Nothing had been pressed and nothing was cancelled,
+    # but it was indistinguishable from the button having destroyed the schedule the
+    # automation had just set.  `state` and `_async_press_action` are both @final in
+    # ButtonEntity, so the restore cannot be suppressed — not gating availability is
+    # the fix.  Pressing with nothing scheduled is a logged no-op instead.
 
-        Pressing it with no schedule set would be a no-op, and a control that does
-        nothing is worse than one that is visibly not applicable.
-        """
-        return (
-            super().available
-            and getattr(self.coordinator, "scheduled_ready_at", None) is not None
-        )
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._added_at = time.monotonic()
 
     async def async_press(self) -> None:
+        # Every outcome is logged.  The activity feed only records that the button
+        # was "Pressed", which cannot answer whether a schedule was actually
+        # cleared — the question that matters when a plan goes missing.
+        added_at = getattr(self, "_added_at", None)
+        if added_at is not None and time.monotonic() - added_at < _PRESS_GRACE_SECONDS:
+            _LOGGER.warning(
+                "Cancel Heat Schedule pressed %.0f s after startup — ignored. "
+                "Cancelling is destructive, so presses within %d s of a restart or "
+                "reload are refused in case a schedule is still being restored.",
+                time.monotonic() - added_at, _PRESS_GRACE_SECONDS,
+            )
+            return
+
+        scheduled = getattr(self.coordinator, "scheduled_ready_at", None)
+        if scheduled is None:
+            _LOGGER.info("Cancel Heat Schedule pressed — nothing scheduled, no change")
+            return
+
+        _LOGGER.info("Cancel Heat Schedule pressed — clearing the schedule set for %s",
+                     scheduled)
         self.coordinator.clear_schedule("cancelled by user")
         # The schedule is persisted by the Scheduled for entity's own retained
         # state, not by the rates store, so pushing listeners is what makes the
