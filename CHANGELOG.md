@@ -30,8 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The Ready at time no longer wobbles.** It used to change 165 times in an 11-hour
-  session, 39 times in the worst hour; now 32 and 5. It also reads in 5-minute steps,
+- **The Ready at time no longer wobbles.** It used to change frequently. It also reads in 5-minute steps,
   since minute precision on an estimate hours away was never real.
 
 - **A schedule left far in the past no longer starts the heater.** Editing the date to
