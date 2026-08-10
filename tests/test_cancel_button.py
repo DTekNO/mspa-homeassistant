@@ -41,22 +41,28 @@ def _run(coro):
 
 
 class TestAvailability:
-    """Availability must NOT track whether a schedule exists.
+    """Unavailable when nothing is scheduled — handy, and safe again.
 
-    Regression source: 2026-08-10.  A button's state is its last-press timestamp and
-    ButtonEntity restores it across restarts, so gating availability made the entity
-    flip from `unavailable` to that restored timestamp the moment a schedule was
-    applied — which the logbook reports as "Pressed".  The calendar automation set a
-    schedule at 11:28:51 and the feed showed a press at 11:28:53, looking exactly as
-    though the button had cancelled what the automation had just set.
+    It was removed on 2026-08-10 because it caused a phantom press: a ButtonEntity's
+    state is its last-press timestamp, restored across restarts, so flipping from
+    unavailable to available revealed it and the logbook reported "Pressed". Declining
+    the restore removes the timestamp, so the gate can stay.
     """
 
-    def test_availability_ignores_the_schedule(self):
-        for scheduled in (None, _NOW + timedelta(hours=3)):
-            b = _button(scheduled=scheduled)
-            assert "available" not in type(b).__dict__, (
-                "availability must not be overridden — it makes the restored press "
-                "timestamp surface as a state change")
+    def test_unavailable_with_nothing_scheduled(self):
+        assert _button(scheduled=None).available is False
+
+    def test_available_when_a_schedule_exists(self):
+        assert _button(scheduled=_NOW + timedelta(hours=3)).available is True
+
+
+class TestNoRestoredPressTimestamp:
+    """Nothing to reveal when the entity becomes available."""
+
+    def test_last_state_is_declined(self):
+        b = _button(scheduled=None)
+        assert _run(b.async_get_last_state()) is None, (
+            "restoring a press timestamp makes availability changes look like presses")
 
 
 class TestPress:

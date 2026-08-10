@@ -52,22 +52,46 @@ class MSpaCancelHeatSchedule(MSpaButtonEntity):
             f"mspa_cancel_heat_schedule_{getattr(coordinator, 'device_id', 'unknown')}"
         )
 
-    # NOTE: availability deliberately does NOT depend on whether a schedule exists.
-    #
-    # It did, on the reasoning that a control which does nothing is worse than one
-    # visibly not applicable.  That produced a far worse effect.  A button's state
-    # *is* its last-press timestamp, and ButtonEntity.async_internal_added_to_hass
-    # restores it across restarts.  Gating availability meant the entity sat at
-    # `unavailable` until a schedule appeared, then flipped to that restored
-    # timestamp — a state change the logbook narrates as "Pressed".
-    #
-    # Observed 2026-08-10: the calendar automation set Scheduled for at 11:28:51 and
-    # the feed showed "Cancel Heat Schedule → Pressed" at 11:28:53, in the same second
-    # the schedule was applied.  Nothing had been pressed and nothing was cancelled,
-    # but it was indistinguishable from the button having destroyed the schedule the
-    # automation had just set.  `state` and `_async_press_action` are both @final in
-    # ButtonEntity, so the restore cannot be suppressed — not gating availability is
-    # the fix.  Pressing with nothing scheduled is a logged no-op instead.
+    async def async_get_last_state(self):
+        """Never restore a previous last-press timestamp.
+
+        A ButtonEntity's state *is* the timestamp of its last press, and
+        `ButtonEntity.async_internal_added_to_hass` restores it across restarts so the
+        UI can show "last pressed 3 days ago".  For a cancel button that is worthless,
+        and it actively misleads: the entity is `unavailable` while no schedule exists,
+        so the moment one is applied it flips to that restored timestamp — a state
+        change the logbook narrates as **"Pressed"**.
+
+        Observed 2026-08-10: the calendar automation set Scheduled for at 11:28:51 and
+        the feed showed "Cancel Heat Schedule → Pressed" at 11:28:53. Nothing had been
+        pressed and nothing was cancelled, but it was indistinguishable from the button
+        having destroyed the schedule the automation had just set.
+
+        `state` and `_async_press_action` are both `@final`, so the restore cannot be
+        intercepted there. Returning None here is the supported way to decline it —
+        ButtonEntity's restore is guarded by `if state is not None`. The state then
+        stays `unknown` until a genuine press, so becoming available reveals nothing.
+
+        Verified against homeassistant/components/button at core 72ca26b (2026-08-10).
+        If a future core stops routing the restore through `async_get_last_state`, the
+        phantom press returns — the symptom to look for is the logbook reporting a
+        press at the moment a schedule is applied.
+        """
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Offered only when there is something to cancel.
+
+        Safe now that no timestamp is restored: becoming available exposes `unknown`
+        rather than a stale press time. A press after a genuine one in the same
+        session can still re-surface that timestamp on the next availability change,
+        but it is then a true record rather than a fabricated one.
+        """
+        return (
+            super().available
+            and getattr(self.coordinator, "scheduled_ready_at", None) is not None
+        )
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
