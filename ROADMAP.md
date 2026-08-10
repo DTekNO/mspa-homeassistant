@@ -544,8 +544,17 @@ observations rather than hardcode a sensitivity — over merely repairing the ba
   46-minute error. Expect the weather work to sharpen predictions, not transform them.
 - **Cover state is unmeasured** and is the obvious candidate for much of that
   unexplained variance.
-- **Wind is absent from this dataset.** The local station measures temperature only;
-  met.no would be the source for a `sqrt(wind)` term.
+- **Wind is collected but not in the hourly statistics.** `_read_weather_entity`
+  already reads it from the configured weather entity, preferring `wind_gust_speed`
+  over `wind_speed` because gusts disrupt the boundary layer around the cover more
+  than steady wind does, and every prediction record stores `ambient_wind` at session
+  start — 11.5 m/s on 2026-08-06, for instance. But weather-entity *attributes* are
+  not statistics-eligible, so there is no hourly wind history to pair with the 831
+  heating hours. Either fit the wind term from prediction records (only the last ten
+  are kept, so it accumulates slowly), or check whether a separate wind sensor with
+  `state_class: measurement` exists on the instance — that would have long-term
+  statistics like the temperature does, and would make wind fittable retrospectively
+  on the same footing.
 
 ### Measured evidence (session of 2026-08-06/07)
 
