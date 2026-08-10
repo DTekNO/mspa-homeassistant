@@ -5,20 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2026.8.2-beta]
 
-### Changed
-
-- **The heater now always starts the circulation pump first.** The spa refuses to
-  heat without flow, and the MSpa Link app never enables heating on its own — it
-  starts the pump first. This integration could, from the climate entity, the heater
-  switch, the `mspa.set_heater` action or the scheduler. All four now follow the same
-  sequence: start the pump, wait for the spa to confirm it, then start the heater.
-  Already-running pumps are left alone and the heater starts immediately.
-
-  If the pump will not start, the heater is no longer commanded — the request fails
-  instead of leaving the spa trying to heat dry, and the scheduler retries on its
-  next poll.
+> **Beta.** Every heater start now brings the circulation pump up first, which
+> changes how the integration issues its most consequential command. That wants
+> verifying on real hardware before a full release. Everything else here is
+> continued work on the predictive scheduler.
 
 ### Added
 
@@ -30,7 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `button.press` — useful for an automation that cancels the old plan when you start
   heating manually. It shows as unavailable when there is no schedule to cancel.
 
+  A restart is needed after upgrading for the new button to appear.
+
 ### Changed
+
+- **The heater now always starts the circulation pump first.** The spa refuses to
+  heat without flow, and the MSpa Link app never enables heating on its own — it
+  starts the pump first. This integration could, from the climate entity, the heater
+  switch, the `mspa.set_heater` action or the scheduler. All four now follow the same
+  sequence: start the pump, wait for the spa to confirm it, then start the heater.
+  An already-running pump is left alone and the heater starts immediately.
+
+  If the pump will not start, the heater is no longer commanded — the request fails
+  instead of leaving the spa trying to heat dry, and the scheduler retries on its
+  next poll.
 
 - **Heating rates are now measured over a growing window rather than a single
   temperature step.** Each 0.5 °C step took about half an hour, and rate is
@@ -55,14 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A schedule left far in the past no longer starts the heater.** Editing the
-  schedule to a past date — the only way to clear it before the button existed —
-  cleared the schedule but switched the heater on as it went, because the trigger
-  runs before the expiry check and could not tell a window that had just opened from
-  a plan abandoned days ago. A target more than an hour old is now retired without
-  commanding anything. A target a few minutes past still fires, which is deliberate:
-  that is a window opening, not a stale plan.
-
 - **The Ready at time no longer wobbles.** During a long heating session the
   estimate changed 165 times in 11 hours — 39 times in the worst hour — including
   14 direction reversals and two jumps of over half an hour. The smoothing added
@@ -79,6 +76,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minute precision on an estimate hours away was never real. Replayed against the
   recorded session: **165 changes become 32**, the worst hour drops from 39 to 5,
   and the estimate still tracks reality to within 5 minutes.
+
+- **A schedule left far in the past no longer starts the heater.** Editing the
+  schedule to a past date — the only way to clear it before the Cancel button
+  existed — cleared the schedule but switched the heater on as it went, because the
+  trigger runs before the expiry check and could not tell a window that had just
+  opened from a plan abandoned days ago. A target more than an hour old is now
+  retired without commanding anything. A target a few minutes past still fires,
+  which is deliberate: that is a window opening, not a stale plan.
+
+### Verified
+
+- A full 16.5-hour heat-up from 22.0 to 39.5 °C predicted to within **2 minutes**
+  (992 min estimated against 994 actual, 0.2%), confirming the rate model itself is
+  sound. The remaining error on that session came from the historical bias
+  correction, which is self-correcting and moved from 0.940 to 0.960 on completion.
 
 ## [2026.8.1]
 
