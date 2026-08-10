@@ -59,6 +59,18 @@ _MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
 # behaviour, which tests pin at 5 and 10 minutes late.
 _SCHEDULE_STALE_AFTER = timedelta(hours=1)
 
+# Soft start: the circulation pump must be running before the heater is commanded.
+# The spa refuses to heat without flow, and the MSpa Link app never issues a bare
+# heater-on — it starts the pump first.  Our climate entity, the heater switch, the
+# set_heater service and the scheduler all could, so the ordering is enforced in
+# set_feature_state, the one point they all pass through.
+#
+# The command ack confirms the cloud accepted it, not that water is moving, so a
+# short settle follows.  The API throttle already spaces consecutive commands by
+# 0.4 s; this makes the margin explicit and tunable.  Set to 0 to rely on the ack
+# alone.
+_PUMP_SETTLE_SECONDS = 1.5
+
 
 # Temperature-bucket boundaries, mirroring sensor._HEAT_BUCKET_T1/_T2.  Defined
 # here too so the coordinator does not import from the sensor platform.
@@ -1237,6 +1249,33 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         "uvc": "set_uvc_state",
     }
 
+    async def _start_pump_before_heater(self) -> bool:
+        """Bring the circulation pump up before the heater is commanded.
+
+        Returns True when a pump command was actually sent, so the caller can fold
+        the filter into the rapid-poll expectations and the retry payload.
+
+        Raises if the pump will not start — deliberately, because commanding the
+        heater is then the one thing we must not do.  Callers surface it: the
+        scheduler clears its trigger flag and retries on the next poll, and the
+        climate/switch paths report the failure to the user.
+        """
+        if self._last_data.get("filter") == "on":
+            return False        # already circulating — nothing to do
+
+        _LOGGER.info("Heater requested: starting the circulation pump first")
+        response = await self.api.set_filter_state(1)
+        # send_device_command returns the parsed payload; anything other than
+        # SUCCESS means the spa did not accept it.
+        if not (isinstance(response, dict) and response.get("message") == "SUCCESS"):
+            raise RuntimeError(
+                f"pump did not start (response: {response!r}) — not starting the heater"
+            )
+        self._last_data["filter"] = "on"
+        if _PUMP_SETTLE_SECONDS:
+            await asyncio.sleep(_PUMP_SETTLE_SECONDS)
+        return True
+
     async def set_feature_state(self, feature: str, state: str) -> None:
         """Set a feature state using the API map."""
         _LOGGER.debug(f"Setting MSpa feature {feature} to {state}")
@@ -1245,6 +1284,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 raise ValueError("State must be 'on' or 'off'")
             numerical_state = 1 if state.lower() == "on" else 0
             api_method = getattr(self.api, self.FEATURE_API_MAP[feature])
+
+            # Heating without flow is refused by the spa, so the pump leads.
+            pump_started = False
+            if feature == "heater" and numerical_state == 1:
+                pump_started = await self._start_pump_before_heater()
 
             # Build raw command for potential retry
             if feature == "bubble":
@@ -1265,6 +1309,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if feature == "filter" and numerical_state == 0:
                 expected_changes["heater"] = "off"
                 raw_command["heater_state"] = 0
+            # A soft start changed the filter too.  Registering it keeps the rapid
+            # poll honest, and putting it in raw_command means a heater retry
+            # re-asserts the pump rather than resending a bare heater-on.
+            if pump_started:
+                expected_changes["filter"] = "on"
+                raw_command["filter_state"] = 1
 
             # Enable rapid polling to quickly detect the change
             self._enable_rapid_polling(expected_changes, raw_command)

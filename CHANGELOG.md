@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The heater now always starts the circulation pump first.** The spa refuses to
+  heat without flow, and the MSpa Link app never enables heating on its own — it
+  starts the pump first. This integration could, from the climate entity, the heater
+  switch, the `mspa.set_heater` action or the scheduler. All four now follow the same
+  sequence: start the pump, wait for the spa to confirm it, then start the heater.
+  Already-running pumps are left alone and the heater starts immediately.
+
+  If the pump will not start, the heater is no longer commanded — the request fails
+  instead of leaving the spa trying to heat dry, and the scheduler retries on its
+  next poll.
+
 ### Added
 
 - **Cancel Heat Schedule button** — clears a pending schedule and leaves the heater

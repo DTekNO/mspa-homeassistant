@@ -97,6 +97,27 @@ To enable it:
 
 The Filter status sensor will show `OK` when the filter is clean, and `Dirty` if the filter needs to be changed (when the warning code is `A0`).
 
+## Starting the heater
+
+The spa will not heat without water moving through it, so **every heater-on goes
+through the circulation pump first**:
+
+1. start the pump
+2. wait for the spa to confirm it
+3. start the heater
+
+This applies wherever the request comes from — switching the climate entity to
+`heat`, the heater switch, the `mspa.set_heater` action, or the predictive
+scheduler starting a session by itself. If the pump is already running, the heater
+starts straight away.
+
+If the pump will not start, **the heater is not commanded** and the request fails
+with an error rather than leaving the spa trying to heat dry. The scheduler treats
+that as a failed start and retries on its next poll.
+
+The MSpa Link app behaves the same way, which is why it never lets you enable
+heating on its own.
+
 ## Heating action (hvac_action)
 
 The integration also provides `hvac_action` as part of the climate sensor that indicates the current heating state of the hot tub.

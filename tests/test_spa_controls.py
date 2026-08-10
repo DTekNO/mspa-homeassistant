@@ -12,6 +12,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from custom_components.mspa import coordinator as coordinator_mod
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
 from custom_components.mspa.sensor import (
     _effective_heat_rate,
@@ -67,14 +68,24 @@ def _trigger_coord(**overrides) -> MSpaUpdateCoordinator:
         "bubble_level": 1,
     }
     c.api = MagicMock()
-    c.api.set_heater_state = AsyncMock()
-    c.api.set_filter_state = AsyncMock()
+    # send_device_command returns the parsed payload; the pump soft start checks it.
+    c.calls = []
+    c.api.set_heater_state = AsyncMock(
+        side_effect=lambda *a: c.calls.append("heater") or {"message": "SUCCESS"})
+    c.api.set_filter_state = AsyncMock(
+        side_effect=lambda *a: c.calls.append("filter") or {"message": "SUCCESS"})
     c.api.set_bubble_state = AsyncMock()
     c.api.set_jet_state = AsyncMock()
     c.async_request_refresh = AsyncMock()
     for k, v in overrides.items():
         setattr(c, k, v)
     return c
+
+
+@pytest.fixture(autouse=True)
+def _no_pump_settle(monkeypatch):
+    """Skip the pump settle delay in every test — 1.5 s per heater-on otherwise."""
+    monkeypatch.setattr(coordinator_mod, "_PUMP_SETTLE_SECONDS", 0)
 
 
 def _run(coro):
@@ -199,11 +210,26 @@ class TestFilterHeaterCoupling:
         _run(c.set_feature_state("filter", "off"))
         assert c._pending_changes.get("heater") == "off"
 
-    def test_heater_on_alone_does_not_register_filter_change(self):
-        """Turning heater on independently must not touch filter expectations."""
+    def test_heater_on_registers_the_pump_it_started(self):
+        """Heater-on brings the pump with it, so the filter change is real and
+        must be registered — it is not invented state.
+
+        This replaces an earlier assertion that heater-on must never touch filter
+        expectations, which stopped being true when the soft start was introduced:
+        the spa refuses to heat without flow, so a bare heater-on no longer exists.
+        """
+        c = _trigger_coord()                       # fixture starts with filter off
+        _run(c.set_feature_state("heater", "on"))
+        assert c._pending_changes.get("filter") == "on"
+        assert c._pending_raw_command.get("filter_state") == 1
+
+    def test_heater_on_leaves_filter_alone_when_already_running(self):
+        """No pump command is sent, so nothing about the filter is claimed."""
         c = _trigger_coord()
+        c._last_data["filter"] = "on"
         _run(c.set_feature_state("heater", "on"))
         assert "filter" not in c._pending_changes
+        c.api.set_filter_state.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -277,3 +303,53 @@ class TestBubbleLevelOnCoupling:
         svc = type("ServiceCall", (), {"data": {"level": 3}})()
         _run(c.set_bubble_level(svc))
         assert c._last_data["bubble_level"] == 3
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUMP-BEFORE-HEATER SOFT START
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPumpBeforeHeater:
+    """The spa refuses to heat without flow, and the MSpa Link app never issues a
+    bare heater-on — it starts the pump first.  Every heater path in this
+    integration (climate hvac_mode, the heater switch, the set_heater service and
+    the scheduler) funnels through set_feature_state, so the ordering is enforced
+    there once rather than at four call sites.
+    """
+
+    def test_pump_is_commanded_before_the_heater(self):
+        c = _trigger_coord()
+        _run(c.set_feature_state("heater", "on"))
+        assert c.calls == ["filter", "heater"], f"wrong order: {c.calls}"
+
+    def test_pump_is_skipped_when_already_running(self):
+        c = _trigger_coord()
+        c._last_data["filter"] = "on"
+        _run(c.set_feature_state("heater", "on"))
+        assert c.calls == ["heater"]
+
+    def test_heater_is_not_commanded_if_the_pump_refuses(self):
+        """The one thing that must not happen: heating a spa with no flow."""
+        c = _trigger_coord()
+        c.api.set_filter_state = AsyncMock(return_value={"message": "ERROR"})
+        with pytest.raises(Exception):
+            _run(c.set_feature_state("heater", "on"))
+        c.api.set_heater_state.assert_not_called()
+
+    def test_a_missing_payload_is_treated_as_failure(self):
+        c = _trigger_coord()
+        c.api.set_filter_state = AsyncMock(return_value=None)
+        with pytest.raises(Exception):
+            _run(c.set_feature_state("heater", "on"))
+        c.api.set_heater_state.assert_not_called()
+
+    def test_turning_the_heater_off_never_touches_the_pump(self):
+        c = _trigger_coord()
+        c._last_data["heater"] = "on"
+        _run(c.set_feature_state("heater", "off"))
+        assert c.calls == ["heater"]
+
+    def test_other_features_are_unaffected(self):
+        c = _trigger_coord()
+        _run(c.set_feature_state("jet", "on"))
+        c.api.set_filter_state.assert_not_called()
