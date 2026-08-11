@@ -2,6 +2,7 @@
 import logging
 from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
+from .predictor import HeatPredictor, ambient_rate_factor, bucket_index
 
 from typing import Any, Dict
 import asyncio
@@ -72,15 +73,7 @@ _SCHEDULE_STALE_AFTER = timedelta(hours=1)
 _PUMP_SETTLE_SECONDS = 1.5
 
 
-# Temperature-bucket boundaries, mirroring sensor._HEAT_BUCKET_T1/_T2.  Defined
-# here too so the coordinator does not import from the sensor platform.
-_HEAT_BUCKET_T1 = 30.0
-_HEAT_BUCKET_T2 = 37.0
-
-
-def _heat_bucket_index(temp: float) -> int:
-    """Bucket index for a water temperature: 0 cold, 1 mid, 2 near-setpoint."""
-    return 0 if temp < _HEAT_BUCKET_T1 else 1 if temp < _HEAT_BUCKET_T2 else 2
+_heat_bucket_index = bucket_index      # shared with the sensor via predictor.py
 _MIN_HEAT_RATE = 0.05             # °C/h — below this is noise / flat
 _MAX_HEAT_RATE = 3.0              # °C/h — above this is an outlier
 _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
@@ -453,8 +446,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     and transformed_data.get("heat_state") == _HEAT_STATE_FULL
                     and self._prediction is None):
                 # Lazy import to reuse the sensor's segmented calculation.
-                from .sensor import _segmented_heating_minutes
-                est_minutes = _segmented_heating_minutes(new_temp, new_target, self)
+                est_minutes = self._compute_heating_minutes(new_temp, new_target)
                 if est_minutes is not None:
                     # Store the raw estimate (without bias) for history tracking.
                     # The bias is derived from raw vs actual, so storing the biased
@@ -1165,79 +1157,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._schedule_triggered = False  # allow retry on next poll
             _LOGGER.error("Heat schedule: failed to start conditioning: %s", err)
 
+    def _predictor(self) -> HeatPredictor:
+        """The shared prediction model, built from current learned state."""
+        return HeatPredictor.from_coordinator(self)
+
     def _compute_heating_minutes(self, from_temp: float, to_temp: float) -> float | None:
-        """Heating time (minutes) from from_temp to to_temp using learned bucket rates.
+        """Heating time (minutes) — delegates to the shared model.
 
-        Mirrors the sensor's _segmented_heating_minutes so the coordinator can
-        compute start times without a circular import.
-        Returns 0.0 when from_temp is within 0.5°C of to_temp (the near-target
-        hysteresis band) so the trigger fires at the scheduled time even when
-        rate data is absent or when the spa barely cooled on a warm day.
+        Was a second implementation of the sensor's calculation, kept in sync by
+        hand and documented as mirroring it "to avoid a circular import" that did
+        not exist.  They had drifted; see predictor.py.
         """
-        if from_temp >= to_temp or (to_temp - from_temp) < 0.5:
-            return 0.0
-        _T1, _T2 = 30.0, 37.0
-        boundaries = [from_temp]
-        for t in (_T1, _T2):
-            if from_temp < t < to_temp:
-                boundaries.append(t)
-        boundaries.append(to_temp)
-
-        total = 0.0
-        for i in range(len(boundaries) - 1):
-            seg_start = boundaries[i]
-            seg_end   = boundaries[i + 1]
-            delta     = seg_end - seg_start
-            if delta <= 0:
-                continue
-            rate = self._bucket_rate_at(seg_start)
-            if rate is None or rate <= 0:
-                return None
-            total += (delta / rate) * 60.0
-
-        bias = getattr(self, "prediction_bias", 1.0)
-        return total * bias
-
-    def _bucket_rate_at(self, temp: float) -> float | None:
-        """Best available heating rate (°C/h) for the bucket containing temp."""
-        _T1, _T2 = 30.0, 37.0
-        buckets        = getattr(self, "heat_rate_buckets", [None, None, None])
-        session_scalar = getattr(self, "_session_scalar", 1.0)
-        fresh          = getattr(self, "_session_fresh_buckets", set())
-
-        idx = 0 if temp < _T1 else 1 if temp < _T2 else 2
-        rate, source_idx = None, idx
-        if buckets[idx] is not None:
-            rate = buckets[idx]
-        else:
-            for i in range(3):
-                if buckets[i] is not None:
-                    rate = buckets[i]
-                    source_idx = i
-                    break
-
-        if rate is None:
-            raw = self._last_data.get("device_heat_perhour", 0)
-            try:
-                raw = int(raw)
-                if raw > 0:
-                    return max(0.5, min(2.0, raw / 10.0))
-            except (TypeError, ValueError):
-                pass
-            return None
-
-        # Correction precedence for the bucket the water is actually in (idx):
-        #   1. A bucket observed this session already reflects today's real
-        #      conditions — use it verbatim.
-        #   2. Otherwise the empirical session scalar (observed vs. base rate)
-        #      supersedes the weather model when it is active.
-        #   3. Otherwise apply the ambient (weather-model) correction, which is
-        #      what drives the pre-start estimate before any observation exists.
-        if source_idx in fresh:
-            return rate
-        if session_scalar != 1.0:
-            return rate * session_scalar
-        return rate * ambient_rate_factor(idx, self.ambient_temp, self.ambient_baseline)
+        return self._predictor().heating_minutes(from_temp, to_temp)
 
     # Map of features to their respective API methods
     FEATURE_API_MAP = {

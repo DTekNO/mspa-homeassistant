@@ -17,9 +17,14 @@ from .const import (
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
     DEFAULT_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_LOOKAHEAD_DAYS,
-    ambient_rate_factor,
 )
 from .entity import MSpaSensorEntity, MSpaBinarySensorEntity
+from .predictor import (
+    HEAT_BUCKET_T1,
+    HEAT_BUCKET_T2,
+    HeatPredictor,
+    ambient_rate_factor,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -257,84 +262,22 @@ def _effective_rate(coordinator, water_temp: float, target_temp: float) -> float
 # Bucket 0: T < _HEAT_BUCKET_T1  — cold, minimal thermal losses, fastest heating
 # Bucket 1: _HEAT_BUCKET_T1 ≤ T < _HEAT_BUCKET_T2
 # Bucket 2: T ≥ _HEAT_BUCKET_T2  — near setpoint, highest losses, slowest heating
-_HEAT_BUCKET_T1 = 30.0
-_HEAT_BUCKET_T2 = 37.0
+_HEAT_BUCKET_T1 = HEAT_BUCKET_T1
+_HEAT_BUCKET_T2 = HEAT_BUCKET_T2
 
 
 def _heat_bucket_rate(coordinator, temp: float) -> float | None:
-    """Return the best heating rate (°C/h) learned at a given water temperature.
-
-    Tries the EMA for the bucket containing `temp`, then adjacent buckets,
-    then the global flat EMA / device-reported fallback.  For buckets that have
-    not yet received observations in the current heating session, the result is
-    scaled by the session scalar (derived from the first-observed bucket) to
-    reflect today's ambient conditions.
-    """
-    buckets = getattr(coordinator, "heat_rate_buckets", [None, None, None])
-    session_scalar = getattr(coordinator, "_session_scalar", 1.0)
-    fresh = getattr(coordinator, "_session_fresh_buckets", set())
-    idx = 0 if temp < _HEAT_BUCKET_T1 else 1 if temp < _HEAT_BUCKET_T2 else 2
-    rate = None
-    source_idx = None
-    if buckets[idx] is not None and buckets[idx] > 0:
-        rate = buckets[idx]
-        source_idx = idx
-    else:
-        for offset in (1, -1, 2, -2):
-            i = idx + offset
-            if 0 <= i < 3 and buckets[i] is not None and buckets[i] > 0:
-                rate = buckets[i]
-                source_idx = i
-                break
-    if rate is None:
-        rate = _effective_heat_rate(coordinator)
-    if rate is None:
-        return None
-    # Correction precedence (mirrors coordinator._bucket_rate_at):
-    #   1. A bucket observed this session already reflects today's real data.
-    #   2. Otherwise the empirical session scalar supersedes the weather model.
-    #   3. Otherwise apply the ambient (weather-model) correction.
-    if source_idx in fresh:
-        return rate
-    if session_scalar != 1.0:
-        return rate * session_scalar
-    return rate * ambient_rate_factor(
-        idx,
-        getattr(coordinator, "ambient_temp", None),
-        getattr(coordinator, "ambient_baseline", None),
-    )
+    """Best learned rate (°C/h) at a water temperature — see predictor.HeatPredictor."""
+    return HeatPredictor.from_coordinator(coordinator).bucket_rate(temp)
 
 
 def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) -> float | None:
-    """Heating time (minutes) from `from_temp` to `to_temp` using per-bucket rates.
+    """Heating time (minutes) between two temperatures — see predictor.HeatPredictor.
 
-    Splits the range at bucket boundaries so each segment uses the rate observed
-    at that temperature range, naturally modelling how thermal losses slow heating
-    as the water approaches the setpoint.  Applies a historical bias correction
-    derived from past prediction accuracy.  Returns None if no rate data is
-    available for any required segment.
+    Single implementation, shared with the coordinator's trigger. These used to be
+    two separate copies that had drifted apart; see predictor.py.
     """
-    if from_temp >= to_temp:
-        return 0.0
-    boundaries = [from_temp]
-    for threshold in (_HEAT_BUCKET_T1, _HEAT_BUCKET_T2):
-        if from_temp < threshold < to_temp:
-            boundaries.append(threshold)
-    boundaries.append(to_temp)
-    total_minutes = 0.0
-    for i in range(len(boundaries) - 1):
-        seg_start = boundaries[i]
-        seg_end   = boundaries[i + 1]
-        delta = seg_end - seg_start
-        if delta <= 0:
-            continue
-        rate = _heat_bucket_rate(coordinator, seg_start)
-        if rate is None or rate <= 0:
-            return None
-        total_minutes += (delta / rate) * 60.0
-    # Apply historical bias correction from past prediction accuracy.
-    bias = getattr(coordinator, "prediction_bias", 1.0)
-    return total_minutes * bias
+    return HeatPredictor.from_coordinator(coordinator).heating_minutes(from_temp, to_temp)
 
 
 def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | None":
@@ -441,10 +384,7 @@ def _segmented_effective_rate(coordinator, from_temp, to_temp) -> "float | None"
     """
     if from_temp is None or to_temp is None or to_temp <= from_temp:
         return None
-    mins = _segmented_heating_minutes(from_temp, to_temp, coordinator)
-    if not mins or mins <= 0:
-        return None
-    return (to_temp - from_temp) / (mins / 60.0)
+    return HeatPredictor.from_coordinator(coordinator).effective_rate(from_temp, to_temp)
 
 
 def _spa_direction(coordinator) -> str | None:
