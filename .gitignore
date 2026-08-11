@@ -16,3 +16,4 @@ history.csv
 # Private data: HA history and statistics exports. Never commit these —
 # they carry device aliases and the owner's usage patterns.
 *.csv
+mspa_rates_*

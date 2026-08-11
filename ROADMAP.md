@@ -625,6 +625,78 @@ at 2026-08-06T19:26Z from the weather entity; Flesland's 19:00Z hour recorded a
 11.4 m/s gust. Agreement to 1%, so a coefficient fitted on this station would have
 been directly usable — the concern was overstated.
 
+### Cooling-trajectory band position: measured, deferred (2026-08-11)
+
+**Result: keep band-centre anchoring; do not extrapolate the cooling trajectory yet.**
+Model in `analysis/anchor_position.py`, re-runnable against the private exports.
+
+The proposal was to place the water *within* its 0.5 °C band at a heating start, by
+extrapolating from the last cooling crossing at the learned cool rate, rather than
+holding the band centre. A heating start makes this falsifiable: if the water sits a
+depth *d* below the upper threshold, the first crossing must arrive after *d* / heat
+rate. Scored on the two recorded starts that follow a cool-down:
+
+| rule | assumed depth | predicts | observed 1.0 min |
+|---|---|---|---|
+| verbatim reading (pre-fix) | 0.250 °C | 13.5 min | **+12.5 min** |
+| band centre (shipped) | 0.000 °C | 0.0 min | **−1.0 min** |
+| cooling trajectory (proposed) | 0.100 °C | 5.4 min | **+4.4 min** |
+
+So the band-centre fix is vindicated against the old behaviour — wrong by 12–14 min at
+every session start — but the trajectory refinement would make it *worse*. It expects
+drift during the 55 min the water sat idle; the crossing came one poll after heater-on.
+
+**A competing explanation fits better than band position.** While the water is still
+the sensor reads its own stratum; when circulation starts it reads the warmer mixed
+bulk. The step would then be mixing, not heating, and no cooling model predicts it. The
+following band took 22.6 min against a 25–28 min run average, so the heat revealed was
+real and already in the tub. **The soft start makes this testable** — the pump now runs
+before the heater, so a mixing step should appear at *pump-on*, before any heat.
+
+**The cooling law itself is now measured**, from 60 idle stretches ≥6 h in the hourly
+statistics, spanning a 5–30 °C water-air gap:
+
+| gap band | n | mean gap | mean rate | implied τ |
+|---|---|---|---|---|
+| 0–10 | 7 | 6.6 | 0.084 | 79 h |
+| 10–15 | 8 | 13.3 | 0.129 | 104 h |
+| 15–20 | 18 | 17.8 | 0.157 | 113 h |
+| 20–25 | 19 | 22.2 | 0.279 | 80 h |
+| 25–40 | 8 | 27.3 | 0.437 | 62 h |
+
+Newton linear (`rate = gap / 81 h`) and a power law (`0.00108 · gap^1.75`) fit the
+observed range comparably (RSS 0.622 vs 0.568); cooling accelerates slightly faster
+than linearly, as evaporation does. Recorder crossings agree at full resolution
+(69/103/84 h over one cool-down).
+
+**The stored `cool_rate` scalar is wrong almost everywhere.** At 0.363 °C/h it matches
+only a ~29 °C gap — it was learned from hot water. Near ambient it overstates cooling
+**4×**. Any future use of it for extrapolation must be replaced by `cool_rate(water −
+air)`, which makes the correction depend on the weather entity and means it has to
+degrade to band-centre anchoring when there isn't one.
+
+**When it would be worth having** — drift beyond band-centre, as minutes of ETA at the
+hot-bucket rate, capped at one band (a cell at 39 min means the anchor has simply gone
+stale and a crossing would have re-anchored):
+
+| water | air | gap | 15 min | 30 min | 60 min | 120 min |
+|---|---|---|---|---|---|---|
+| 22 | 14 | 8 | 2 | 4 | 8 | 15 |
+| 30 | 10 | 20 | 5 | 10 | 19 | 39 |
+| 38 | 0 | 38 | 9 | 18 | 37 | 39 |
+| 38 | −10 | 48 | 12 | 23 | 39 | 39 |
+
+Negligible in the summer regime every recorded session sits in; 20–39 min once the air
+is near zero with the water hot — the same order as the disagreement the anchor fix
+just removed. **Cancelling a heat-up and restarting it reaches that regime in any
+season**, so this is not only a winter question.
+
+**Still owed before implementing:** whether the heater-on step is thermal or mixing
+(the soft start tests this), and whether the law extrapolates — nothing observes a gap
+beyond 30 °C, and the two fits diverge ~60% by gap 48. The current tub has no data
+before April 2026, so this needs a winter. See also [Learned Weather
+Factor](#learned-weather-factor), which wants the same measurements.
+
 ## Measured evidence (session of 2026-08-06/07)
 
 A 17.5 °C cold start, 22.0 → 39.5 °C, the first long predictive run without test
