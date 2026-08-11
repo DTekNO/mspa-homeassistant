@@ -292,6 +292,24 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
     """
     anc_time = coordinator.temp_anchor_time
     anc_temp = coordinator.temp_anchor_temp
+
+    # Measure from whichever is later: the anchor, or the moment heating began.
+    #
+    # The anchor marks when the temperature last *changed*.  During a cool-down that
+    # is a cooling transition, so counting elapsed time from it treats minutes of
+    # cooling as if they were heating progress and reports a finish far too early —
+    # up to a full step of it.  Once a crossing occurs while heating the anchor
+    # becomes the later of the two and takes over again, which restores the reason it
+    # exists: an ETA that is stable between readings rather than drifting with the
+    # clock.
+    #
+    # With this, at the instant the heater starts, Ready at and the Heat Schedule
+    # both reduce to `now + heating_minutes(current → target)` and agree by
+    # construction.
+    heating_since = getattr(coordinator, "heating_since", None)
+    if anc_time is not None and heating_since is not None and heating_since > anc_time:
+        anc_time = heating_since
+
     if anc_time is None or anc_temp is None or target_temp is None:
         _LOGGER.debug("ready_at anchor: missing data (anc_time=%s anc_temp=%s target=%.1f) → None",
                       anc_time, anc_temp, target_temp or 0)

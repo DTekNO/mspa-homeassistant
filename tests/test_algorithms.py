@@ -19,7 +19,7 @@ from custom_components.mspa.const import (
     BIAS_CLAMP_MAX,
 )
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-from custom_components.mspa.sensor import _anchor_eta_utc
+from custom_components.mspa.sensor import _anchor_eta_utc, _segmented_heating_minutes
 
 
 # ── Minimal coordinator stub for anchor tests ─────────────────────────────────
@@ -42,6 +42,7 @@ class _Coord:
         self.ambient_temp = None
         self.ambient_baseline = None
         self.heat_rate_buckets = [heat_rate, heat_rate, heat_rate] if heat_rate else [None, None, None]
+        self.heating_since = None
         self.temp_anchor_time = datetime.now(timezone.utc) + timedelta(minutes=anchor_offset_minutes)
         self.temp_anchor_temp = water_temp
         self.temp_anchor_target = target_temp
@@ -259,3 +260,55 @@ class TestBiasSeedFromHistory:
         c = _bias_coord(bias=1.06, history=history)
         c._seed_prediction_bias_from_history()
         assert c.prediction_bias == 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# READY AT AND THE SCHEDULER MUST AGREE AT A SESSION START
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSameStartingPoint:
+    """Observed 2026-08-10: the scheduler started at 16:14 predicting a 01:30 finish
+    while Ready at immediately said 01:10 — ~20 min apart on the same spa.
+
+    The maths was shared; the *starting point* was not. Heat Schedule works back from
+    `now + heating_minutes(current → target)`, while Ready at measured from
+    `temp_anchor_time`, which records when the reading last *changed*. During a
+    cool-down that is a cooling transition, so elapsed cooling minutes were counted
+    as heating progress.
+    """
+
+    _NOW = datetime(2026, 8, 10, 16, 14, tzinfo=timezone.utc)
+
+    def _coord(self, *, anchor_age_min, heating_since_min=0.0):
+        c = _Coord(water_temp=29.5, target_temp=39.5, heat_rate=1.0)
+        c.temp_anchor_time = self._NOW - timedelta(minutes=anchor_age_min)
+        c.temp_anchor_temp = 29.5
+        c.temp_anchor_target = 39.5
+        c.heating_since = self._NOW - timedelta(minutes=heating_since_min)
+        return c
+
+    def _scheduler_finish(self, c):
+        """What Heat Schedule implies: now + the heating time still to do."""
+        mins = _segmented_heating_minutes(29.5, 39.5, c)
+        return self._NOW + timedelta(minutes=mins)
+
+    def test_they_agree_when_heating_has_just_started(self):
+        """The anchor is 40 min old from cooling; heating began now."""
+        c = self._coord(anchor_age_min=40.0, heating_since_min=0.0)
+        eta = _anchor_eta_utc(c, 39.5, self._NOW)
+        drift = abs((eta - self._scheduler_finish(c)).total_seconds()) / 60
+        assert drift < 1.0, f"{drift:.0f} min apart at the moment heating began"
+
+    def test_a_stale_cooling_anchor_no_longer_pulls_the_eta_earlier(self):
+        c = self._coord(anchor_age_min=40.0, heating_since_min=0.0)
+        eta = _anchor_eta_utc(c, 39.5, self._NOW)
+        assert eta > self._NOW, "ETA landed in the past"
+        # 10 °C at 1 °C/h is ~10 h; a 40-minute cooling anchor must not shave that
+        assert (eta - self._NOW).total_seconds() / 3600 > 9.0
+
+    def test_the_anchor_takes_over_once_it_is_the_newer_of_the_two(self):
+        """Its purpose is an ETA stable between readings, and that must survive."""
+        c = self._coord(anchor_age_min=5.0, heating_since_min=60.0)
+        eta_now = _anchor_eta_utc(c, 39.5, self._NOW)
+        eta_later = _anchor_eta_utc(c, 39.5, self._NOW + timedelta(minutes=2))
+        assert eta_now == eta_later, "ETA drifted with the clock between readings"

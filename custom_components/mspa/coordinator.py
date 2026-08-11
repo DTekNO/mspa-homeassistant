@@ -97,6 +97,10 @@ _LATCH_COOL_OFF = 3.0             # °C
 # this so they start and stop on the same signal.
 _HEAT_STATE_FULL = 3
 
+# Reported water temperature is quantised to this step, so a reading is only ever
+# accurate to half of it.
+_TEMP_BAND_C = 0.5
+
 # Maps coordinator _pending_changes keys (transformed names) to their raw API
 # command dict keys.  Used to prune _pending_raw_command incrementally as each
 # pending change is confirmed, so that a retry payload never re-sends fields
@@ -273,6 +277,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Anchor for time-to-target sensors.
         # Set whenever water_temperature or target_temperature changes so both
         # sensors can count down to a fixed future timestamp between temp steps.
+        # UTC datetime full-heat mode last engaged, or None while not heating.  The
+        # ETA measures elapsed heating from here when it is later than the anchor: the
+        # anchor records when the temperature last *changed*, which during a
+        # cool-down is a cooling transition and says nothing about heating progress.
+        self.heating_since: datetime | None = None
         self.temp_anchor_time: datetime | None = None    # UTC datetime of last temp/target change
         self.temp_anchor_temp: float | None = None       # water_temp at that moment
         self.temp_anchor_target: float | None = None     # target_temp at that moment
@@ -427,8 +436,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             new_temp   = transformed_data.get("water_temperature")
             new_target = transformed_data.get("target_temperature")
             if new_temp != self.temp_anchor_temp or new_target != self.temp_anchor_target:
+                # A reading change is a band crossing, and at that instant the true
+                # temperature is the threshold *between* the two reported values —
+                # half a step from either.  Recording the new reading verbatim
+                # therefore carries a systematic error whose sign depends on
+                # direction: 0.25 °C high when warming, 0.25 °C low when cooling.
+                # At ~1 °C/h that is a quarter-hour of ETA each way, and a full half
+                # hour across a cool-down followed by a heat-up — which is what made
+                # Ready at and the scheduler disagree by ~20 min at a session start.
+                prev = self.temp_anchor_temp
+                anchored = new_temp
+                if (prev is not None and new_temp is not None
+                        and abs(new_temp - prev) <= _TEMP_BAND_C + 1e-9
+                        and new_temp != prev):
+                    anchored = (new_temp + prev) / 2.0
                 self.temp_anchor_time   = datetime.now(timezone.utc)
-                self.temp_anchor_temp   = new_temp
+                self.temp_anchor_temp   = anchored
                 self.temp_anchor_target = new_target
 
             # --- Prediction accuracy tracking ---
@@ -624,6 +647,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         try:
                             self.temp_anchor_time   = datetime.fromisoformat(anchor_iso)
                             self.temp_anchor_temp   = new_temp
+                            since = stored.get("heating_since")
+                            if since:
+                                try:
+                                    self.heating_since = datetime.fromisoformat(since)
+                                except (TypeError, ValueError):
+                                    self.heating_since = None
                             self.temp_anchor_target = new_target
                             _LOGGER.debug(
                                 "Restored temp anchor: %.1f°C → %.1f°C at %s",
@@ -707,6 +736,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # the heater newly engages AND delta-to-target is large (> 2°C).
             # This avoids false resets from thermostat cycling near setpoint.
             heater_now_active = (heat_state == _HEAT_STATE_FULL)
+            if heater_now_active and self.heating_since is None:
+                self.heating_since = datetime.now(timezone.utc)
+            elif not heater_now_active:
+                self.heating_since = None
             if heater_now_active and not self._heat_was_active:
                 delta_to_target = abs((new_target or 0) - (curr_temp or 0))
                 if delta_to_target > _NEW_SESSION_DELTA:
@@ -758,6 +791,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "temp_anchor_time": (
                     self.temp_anchor_time.isoformat()
                     if self.temp_anchor_time is not None else None
+                ),
+                "heating_since": (
+                    self.heating_since.isoformat()
+                    if self.heating_since is not None else None
                 ),
                 "temp_anchor_temp": self.temp_anchor_temp,
                 "temp_anchor_target": self.temp_anchor_target,
