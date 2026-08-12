@@ -97,6 +97,24 @@ _const_mod.Platform          = MagicMock()
 _core_mod            = MagicMock()
 _core_mod.callback   = lambda func: func
 
+# Exceptions must be real classes, not MagicMocks: they are raised and caught, and
+# `except MagicMock()` is a TypeError.  Mirrors the real hierarchy so tests can assert
+# on the distinction the UI cares about — ServiceValidationError shows the message
+# without a traceback, HomeAssistantError shows it with one.
+_exc_mod = MagicMock()
+
+
+class _HomeAssistantError(Exception):
+    pass
+
+
+class _ServiceValidationError(_HomeAssistantError):
+    pass
+
+
+_exc_mod.HomeAssistantError = _HomeAssistantError
+_exc_mod.ServiceValidationError = _ServiceValidationError
+
 _helpers_mod         = MagicMock()
 _helpers_mod.update_coordinator = _coordinator_mod
 _helpers_mod.restore_state      = _restore_mod
@@ -109,6 +127,7 @@ sys.modules.update({
     "homeassistant":                                MagicMock(),
     "homeassistant.config_entries":                 MagicMock(),
     "homeassistant.core":                           _core_mod,
+    "homeassistant.exceptions":                     _exc_mod,
     "homeassistant.components":                     MagicMock(),
     "homeassistant.components.sensor":              _sensor_mod,
     "homeassistant.components.switch":              _switch_mod,

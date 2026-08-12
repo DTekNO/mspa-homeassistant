@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 _NOW_UTC = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -345,3 +346,58 @@ class TestStaleTargetIsAbandoned:
             _run(c._check_schedule_trigger(20.0, None))
             fired = c.api.set_temperature_setting.called
             assert fired is should_fire, f"{mins} min late: fired={fired}"
+
+
+class TestFaultBlocksSwitchingOn:
+    """A faulting spa must say so in the UI, not just in the log.
+
+    F1 is the flow fault — raised when the pump starts with a physical problem in the
+    way, and not clearable remotely. So actuation refuses rather than retrying into it,
+    and the refusal is a ServiceValidationError, which Home Assistant renders as a
+    message to the user instead of "unknown error".
+    """
+
+    def _coord(self, fault="OK"):
+        c = MSpaUpdateCoordinator.__new__(MSpaUpdateCoordinator)
+        c._last_data = {"fault": fault, "filter": "on", "heater": "off"}
+        c.api = MagicMock()
+        c.api.set_heater_state = AsyncMock(return_value={"message": "SUCCESS"})
+        c.api.set_filter_state = AsyncMock(return_value={"message": "SUCCESS"})
+        c._enable_rapid_polling = MagicMock()
+        c.async_request_refresh = AsyncMock()
+        return c
+
+    def test_fault_code_is_none_when_healthy(self):
+        assert self._coord("OK").fault_code is None
+        assert self._coord("").fault_code is None
+
+    def test_fault_code_reports_the_code(self):
+        assert self._coord("F1").fault_code == "F1"
+
+    def test_switching_on_during_a_fault_raises_for_the_ui(self):
+        c = self._coord("F1")
+        with pytest.raises(ServiceValidationError) as err:
+            _run(c.set_feature_state("heater", "on"))
+        assert "F1" in str(err.value)
+        c.api.set_heater_state.assert_not_called()
+
+    def test_switching_off_during_a_fault_is_allowed(self):
+        """Shutting a faulting spa down is exactly what the user needs to be able to do."""
+        c = self._coord("F1")
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0)
+
+    def test_healthy_spa_switches_on_normally(self):
+        c = self._coord("OK")
+        _run(c.set_feature_state("heater", "on"))
+        c.api.set_heater_state.assert_awaited_once_with(1)
+
+    def test_pump_refusal_is_reported_to_the_ui(self):
+        """Not a bare RuntimeError, which the frontend shows as 'unknown error'."""
+        c = self._coord("OK")
+        c._last_data["filter"] = "off"
+        c.api.set_filter_state = AsyncMock(return_value={"message": "FAIL"})
+        with pytest.raises(HomeAssistantError) as err:
+            _run(c.set_feature_state("heater", "on"))
+        assert "circulation pump" in str(err.value)
+        c.api.set_heater_state.assert_not_called()

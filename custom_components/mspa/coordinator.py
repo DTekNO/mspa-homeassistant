@@ -13,6 +13,7 @@ from typing import Any, Dict
 import asyncio
 
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -291,6 +292,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # An anchor recorded before this describes stagnant water in the pump housing
         # rather than the tub, so it cannot be extrapolated from.
         self.circulating_since: datetime | None = None
+        self._last_schedule_failure: str | None = None   # dedupes the failure log
         self.temp_anchor_time: datetime | None = None    # UTC datetime of last temp/target change
         self.temp_anchor_temp: float | None = None       # water_temp at that moment
         # Direction of the crossing that set the anchor: True warming, False cooling.
@@ -850,6 +852,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Update failed: {str(err)}")
 
     @property
+    def fault_code(self) -> str | None:
+        """The spa's fault code, or None when healthy.
+
+        F1 is the flow fault, raised when the pump starts with a physical problem in
+        the way — blocked flow, debris, a clogged or worn pump, frozen pipes. It cannot
+        be cleared remotely, which is why actuation refuses rather than retrying into
+        it.
+        """
+        fault = self._last_data.get("fault")
+        return None if fault in (None, "", "OK") else str(fault)
+
+    @property
     def circulating(self) -> bool:
         """Whether the circulation pump is running, so the probe reads tub water.
 
@@ -1295,7 +1309,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 await self.set_feature_state("heater", "on")
         except Exception as err:
             self._schedule_triggered = False  # allow retry on next poll
-            _LOGGER.error("Heat schedule: failed to start conditioning: %s", err)
+            # A fault does not clear by retrying, so the same message would otherwise
+            # land at ERROR on every poll for as long as it persists.  Report each
+            # distinct reason once and drop repeats to debug.
+            msg = str(err)
+            if msg != getattr(self, "_last_schedule_failure", None):
+                self._last_schedule_failure = msg
+                _LOGGER.error("Heat schedule: failed to start conditioning: %s", err)
+            else:
+                _LOGGER.debug(
+                    "Heat schedule: still failing to start conditioning: %s", err
+                )
+        else:
+            self._last_schedule_failure = None
 
     def _predictor(self) -> HeatPredictor:
         """The shared prediction model, built from current learned state."""
@@ -1339,8 +1365,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # send_device_command returns the parsed payload; anything other than
         # SUCCESS means the spa did not accept it.
         if not (isinstance(response, dict) and response.get("message") == "SUCCESS"):
-            raise RuntimeError(
-                f"pump did not start (response: {response!r}) — not starting the heater"
+            raise HomeAssistantError(
+                "The spa refused to start the circulation pump, so the heater was "
+                "not switched on. Check the pump and filter, then try again."
             )
         self._last_data["filter"] = "on"
         if _PUMP_SETTLE_SECONDS:
@@ -1354,6 +1381,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if state.lower() not in ["on", "off"]:
                 raise ValueError("State must be 'on' or 'off'")
             numerical_state = 1 if state.lower() == "on" else 0
+
+            # Refuse to switch things *on* while the spa reports a fault, and say why
+            # in the UI rather than only in the log.  Switching *off* stays allowed:
+            # shutting a faulting spa down is exactly what a user needs to be able to
+            # do, and blocking that would be the worse failure.
+            fault = self.fault_code
+            if fault and numerical_state == 1:
+                raise ServiceValidationError(
+                    f"The spa is reporting fault {fault}, so {feature} was not "
+                    f"switched on. Clear the fault at the control box first."
+                )
             api_method = getattr(self.api, self.FEATURE_API_MAP[feature])
 
             # Heating without flow is refused by the spa, so the pump leads.

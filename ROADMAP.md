@@ -601,7 +601,10 @@ water and air temperature are accounted for.
 | previous spa (n=639) | 0.328 | 0.329 | −1.0 |
 
 `sqrt(gust)` is no better (t = −1.8 and −0.9). The sign is physically right — more
-wind, slower heating — but the magnitude is indistinguishable from zero on either
+wind, slower heating, and the manual names wind explicitly (see [What the Manual Says
+About Heating Rate](#what-the-manual-says-about-heating-rate), which offers a
+reconciliation: wind acts on an exposed surface, and these sessions were probably
+covered) — but the magnitude is indistinguishable from zero on either
 dataset, including the 639-hour one spanning −9 to +20 °C and gusts of 1.1 to
 19.5 m/s. Wind was not hiding inside the temperature term either: `corr(air, gust)`
 is only −0.26 and +0.39.
@@ -624,6 +627,60 @@ caution recorded earlier. The stored prediction record read `ambient_wind: 11.5 
 at 2026-08-06T19:26Z from the weather entity; Flesland's 19:00Z hour recorded a
 11.4 m/s gust. Agreement to 1%, so a coefficient fitted on this station would have
 been directly usable — the concern was overstated.
+
+## What the Manual Says About Heating Rate
+
+Recorded 2026-08-12 from the MSpa manual, because three of its four claims bear on the
+prediction model and one of them contradicts a measurement.
+
+> **IMPORTANT: The following conditions will lead to slow water heating**
+> - An ambient temperature lower than 10 °C (50 °F).
+> - An outdoor wind speed above 3.5–5.4 m/s (8–12 mph).
+> - If the air bubble function is activated when the heater is on.
+> - If the spa cover is not properly in place when the heater is on.
+
+**Ambient below 10 °C — confirms what we fit.** The ambient factor was derived from
+observation without reference to the manual, and the manual names the same threshold.
+Independent agreement, so nothing to change.
+
+**Wind — the manual claims an effect we could not detect.** Measured over 192 hours on
+this spa and 639 on the previous one, the wind term was indistinguishable from zero
+(t = −1.6 and −1.0), which is why `sqrt(wind)` was dropped. The sign was right, the
+magnitude was not there.
+
+A reconciliation that fits both: the manual lists **wind** and **cover not in place** as
+separate bullets, but physically wind acts on an exposed water surface. With the cover
+on there is little for it to act on. If the recorded sessions were mostly covered — the
+normal case — a null wind result is exactly what to expect, and the manual's claim would
+apply to uncovered heating only. That is consistent rather than contradictory, and it
+predicts wind sensitivity we cannot currently test because cover state is not reported.
+
+**Air bubbles — an unexploited signal, and the actionable one.** Bubbles slow heating and
+`bubble_state` **is in the payload**. So rate samples taken while the bubbles are running
+are contaminated, and we currently learn from them as if they were normal. Worth a guard
+in `_track_heating_rate` on the same footing as the phase-uncertainty guard: do not learn
+from a span whose conditions are not representative. Cheap to add, and unlike the weather
+factor it needs no new data source.
+
+**Cover state — not reported, so it stays the largest unmodelled variable.** It is
+plausibly the biggest single source of residual prediction error, and nothing in the API
+exposes it. Only a user-supplied entity could.
+
+Two more facts worth knowing, both about winter:
+
+- **Turning the heater on starts filtration automatically.** So the device already does
+  a form of soft start. Ours adds *ordering and confirmation* — pump first, verified,
+  then heater — which is what the F1-throwing flow sensor case needed; the automatic
+  behaviour evidently was not enough for that user. Belt and braces rather than
+  essential, and worth stating honestly as such.
+- **Below 1 °C water the anti-icing system heats to 3 °C by itself.** So in a hard
+  frost the water can warm with the heater "off" as far as we can see. The extrapolation
+  added on 2026-08-12 is already safe against this, because it takes direction from the
+  observed reading change rather than from heater state — but any future logic that
+  infers direction from the heater would be wrong here.
+
+Also reported by the owner: turning the heater off appears to stop the pump a few
+seconds later. Unverified, and not something to test deliberately.
 
 ## Optional External Temperature Probe
 
