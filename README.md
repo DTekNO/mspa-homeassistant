@@ -551,12 +551,36 @@ Once the schedule has fired the sensor holds a steady `Heating` rather than flic
 
 The sensor works in both directions: if the spa needs to heat up it uses the learned bucket heating rates; if it needs to cool down it uses the learned cooling rate.
 
+### Why the start can be late, and why that is not fixable
+
+The spa reports water temperature in **0.5 °C steps**. That is the whole resolution available — there is no finer reading to ask for. So the integration knows the true temperature exactly only at the moment the reading *changes*; in between, the water is somewhere inside a 0.5 °C band and its position is unknown.
+
+The planned start is computed from the reading, which means **one step of the thermometer is worth a whole band of heating**: 27–44 minutes depending on how fast the spa is heating in that temperature range. While the spa sits cooling, each step down moves the planned start earlier by that much, in a lump.
+
+The consequence is that **a step that lands shortly before the planned start makes the plan late, instantly and unrecoverably.** If the schedule was going to start at 16:00 and the reading drops at 15:50, the plan becomes "should have started at 15:23" — and there is no way to start in the past. Conditioning begins immediately and the session finishes late, by up to that one band of heating.
+
+Nothing in the integration causes this and no setting avoids it; it follows from the temperature resolution the spa exposes. What you can do about it:
+
+- **Build in margin** if the exact ready time matters — set the target 30–45 minutes earlier than you need it.
+- Expect the miss to be *larger*, not smaller, when starting from close to the target, because heating is slowest there and a band therefore takes longer.
+- Don't read a late finish as a broken prediction. Check the `start_at` attribute against when heating actually began: if they match, the plan was simply made on a reading that was about to change.
+
+Work on estimating the temperature *between* crossings — extrapolating from the last reading change at the learned cooling rate — is measured and recorded in [ROADMAP.md](ROADMAP.md). It is not enabled: on the sessions measured so far it made the estimate worse rather than better, and it needs cold-weather data to settle. That is the only route to reducing this, and it is not yet good enough to trust.
+
+### The displayed start holds steady on purpose
+
+The start time is recomputed on every poll, and two things move it: the temperature steps above, and a smaller drift as the outdoor temperature rescales the whole estimate. The second grows with how far off the start is — on 2026-08-12 a 1.5 °C outdoor rise moved a nine-hour-out estimate by 28 minutes, and a temperature step reversed it two minutes later.
+
+So the **state** does not follow every recomputation. A change of reading is shown at once; drift alone has to exceed 30 minutes (bringing the start forward) or 60 minutes (pushing it back) before the display moves. Within **45 minutes of starting** the displayed time is always live, so it is exact when it is close enough to act on. In the measured cool-down this cut the displayed value from 31 changes to 12, and from 5 direction reversals to 1.
+
+The `start_at` **attribute is always the live plan**, so automations act on the real time. It can therefore differ from the displayed `Start at HH:MM` while the start is still hours away — that is deliberate, not a bug.
+
 ### Attributes
 
 | Attribute | Description |
 |-----------|-------------|
 | `target_time` | ISO 8601 timestamp of the planned ready time |
-| `start_at` | ISO 8601 timestamp when heating should begin |
+| `start_at` | ISO 8601 timestamp when heating should begin — always live, so it can differ from the displayed state while the start is far off |
 | `target_temperature` | The configured target temperature (°C) |
 
 ### No automation required

@@ -90,9 +90,16 @@ class _HeatScheduleStub:
     def __init__(self, coordinator, config_entry):
         self.coordinator = coordinator
         self._config_entry = config_entry
+        # A fresh stub has nothing held, so _slew_start adopts the live value and
+        # every existing scenario sees the unsmoothed start.  Tests that exercise
+        # the smoothing reuse one stub across updates.
+        self._start_shown = None
+        self._start_key = None
 
     _schedule_data = MSpaHeatScheduleSensor._schedule_data
     extra_state_attributes = MSpaHeatScheduleSensor.extra_state_attributes
+    _slew_start = MSpaHeatScheduleSensor._slew_start
+    _plan_key = MSpaHeatScheduleSensor._plan_key
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -830,3 +837,131 @@ class TestEtaSmoothing:
             last = e._slew_eta(raw, self._BASE + timedelta(minutes=i))
         assert abs((last - raw).total_seconds() / 60) <= 5, (
             f"display stalled at {last}, raw was {raw}")
+
+
+class TestScheduleStartSlew:
+    """The displayed schedule start holds steady against uninformative drift.
+
+    Recomputed every poll from a quantized reading, the start moves two ways: a
+    lump of roughly a band's heating when the reading crosses, and a percentage
+    drift as the ambient factor rescales the estimate.  Only the first is worth
+    showing.  Measured on the 2026-08-11/12 cool-down, this takes the displayed
+    value from 31 changes with 5 direction reversals to 12 changes with 1.
+    """
+
+    _BASE = datetime(2026, 8, 11, 13, 0, tzinfo=timezone.utc)
+
+    class _Coord:
+        """Only what _plan_key reads, so the real key function is exercised."""
+
+        def __init__(self, water):
+            self.scheduled_ready_at = datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc)
+            self.schedule_target_temp = 39.5
+            self._last_data = {"water_temperature": str(water)}
+
+    def _stub(self):
+        return _HeatScheduleStub(self._Coord(33.0), MockConfigEntry())
+
+    def _slew(self, stub, start_min, now_min, water):
+        """Slew a start `start_min` min ahead of now, with the reading at `water`."""
+        stub.coordinator._last_data["water_temperature"] = str(water)
+        now = self._BASE + timedelta(minutes=now_min)
+        raw = now + timedelta(minutes=start_min)
+        return stub._slew_start(raw, now), raw
+
+    def test_first_value_is_adopted(self):
+        stub = self._stub()
+        shown, raw = self._slew(stub, 600, 0, 33.0)
+        assert shown == raw
+
+    def test_ambient_drift_within_one_reading_is_held(self):
+        """A 28 min push-back with the reading unchanged is drift, and is hidden."""
+        stub = self._stub()
+        first, _ = self._slew(stub, 600, 0, 33.0)
+        shown, raw = self._slew(stub, 628, 0, 33.0)
+        assert shown == first, "drift should not move the display"
+        assert shown != raw
+
+    def test_reading_change_is_adopted_immediately(self):
+        """A crossing is real movement however small, so cause beats size."""
+        stub = self._stub()
+        self._slew(stub, 600, 0, 33.0)
+        shown, raw = self._slew(stub, 610, 0, 32.5)
+        assert shown == raw
+
+    def test_small_crossing_step_still_shows(self):
+        """At a fast bucket rate a band is worth ~15 min — under any size deadband."""
+        stub = self._stub()
+        first, _ = self._slew(stub, 600, 0, 33.0)
+        shown, raw = self._slew(stub, 585, 0, 32.5)
+        assert shown == raw and shown != first
+
+    def test_large_earlier_drift_is_eventually_believed(self):
+        stub = self._stub()
+        self._slew(stub, 600, 0, 33.0)
+        shown, raw = self._slew(stub, 600 - 31, 0, 33.0)
+        assert shown == raw
+
+    def test_later_drift_needs_a_full_band_before_it_is_believed(self):
+        """Asymmetric: later-drift runs against the cool-down trend, so it waits.
+
+        On 2026-08-12 07:29 a +40 min ambient drift was followed two minutes later
+        by a crossing that took the start back to within 7 min of the held value.
+        Adopting the 40 would have shown a swing that never happened.
+        """
+        stub = self._stub()
+        first, _ = self._slew(stub, 600, 0, 33.0)
+        shown, _ = self._slew(stub, 640, 0, 33.0)
+        assert shown == first, "+40 min of later-drift should still be held"
+        shown, raw = self._slew(stub, 661, 0, 33.0)
+        assert shown == raw, "beyond a band's worth it is believed"
+
+    def test_live_value_shown_once_the_start_is_close(self):
+        """Inside the tracking window accuracy beats stability."""
+        stub = self._stub()
+        first, _ = self._slew(stub, 600, 0, 33.0)
+        shown, raw = self._slew(stub, 40, 10, 33.0)
+        assert shown == raw and shown != first
+
+    def test_start_now_still_fires_on_time(self):
+        """A start in the past is inside the tracking window, so it is never held."""
+        stub = self._stub()
+        self._slew(stub, 600, 0, 33.0)
+        shown, raw = self._slew(stub, -1, 10, 33.0)
+        assert shown == raw
+
+    def test_plan_change_snaps(self):
+        """Moving the schedule is the user replanning, not the model drifting."""
+        stub = self._stub()
+        first, _ = self._slew(stub, 600, 0, 33.0)
+        stub.coordinator.scheduled_ready_at = datetime(
+            2026, 8, 13, 21, 0, tzinfo=timezone.utc)
+        shown, raw = self._slew(stub, 610, 0, 33.0)
+        assert shown == raw and shown != first
+
+    def test_idempotent(self):
+        """native_value and extra_state_attributes both evaluate on one update."""
+        stub = self._stub()
+        self._slew(stub, 600, 0, 33.0)
+        a, _ = self._slew(stub, 628, 0, 33.0)
+        b, _ = self._slew(stub, 628, 0, 33.0)
+        c, _ = self._slew(stub, 628, 0, 33.0)
+        assert a == b == c
+
+    def test_unreadable_temperature_does_not_raise(self):
+        stub = self._stub()
+        stub.coordinator._last_data["water_temperature"] = "unavailable"
+        shown, raw = self._slew(stub, 600, 0, "unavailable")
+        assert shown == raw
+
+    def test_held_value_never_exceeds_a_band_of_staleness_while_cooling(self):
+        """Replay of the measured cool-down: hold, but never by more than a band."""
+        stub = self._stub()
+        water = 33.0
+        for i in range(0, 240, 10):
+            if i and i % 70 == 0:                 # a crossing every ~70 min
+                water -= 0.5
+            drift = 20 if (i // 10) % 2 else -8   # ambient wobbling either way
+            held, raw = self._slew(stub, 600 - i + drift, i, water)
+            gap = abs((held - raw).total_seconds() / 60)
+            assert gap < 60, f"held {gap:.0f} min from live at step {i}"

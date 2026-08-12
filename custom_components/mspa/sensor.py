@@ -452,6 +452,14 @@ _ETA_ROUND_MIN = 5            # display granularity, minutes
 # display is rounded because minute precision on an estimate hours out is
 # spurious: it guarantees visible churn however the slew is tuned.
 
+# Displayed schedule start (Heat Schedule sensor).  Same lesson, applied to the
+# other sensor: hold the shown start steady against drift that carries no
+# information.  See MSpaHeatScheduleSensor._slew_start for why cause rather than
+# size does the separating.
+_START_DRIFT_EARLIER_MIN = 30     # drift bringing the start forward
+_START_DRIFT_LATER_MIN = 60       # drift pushing it back — see _slew_start
+_START_TRACK_WITHIN_MIN = 45      # this close to starting, always show the live value
+
 
 def _fmt_local(dt_utc: "datetime") -> str:
     """Format a UTC datetime as a local-time string, e.g. '14:30' or '14:30 +1d'."""
@@ -1018,6 +1026,11 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 
     State: "Not scheduled" / "Ready" / "Start now" / "Start at HH:MM [+Nd]"
     Attributes: target_time, start_at (ISO 8601), target_temperature
+
+    The state's "HH:MM" is held steady by _slew_start; the `start_at` attribute is
+    always the live plan, because an automation acting on it needs the real time
+    rather than a stable one.  They can therefore differ by up to
+    _START_DRIFT_DEADBAND_MIN while the start is still far off.
     """
 
     name = "Heat Schedule"
@@ -1029,6 +1042,81 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         device_id = getattr(coordinator, "device_id", "unknown")
         self._attr_unique_id = f"mspa_heat_schedule_{device_id}"
         self._attr_device_info = self.device_info
+        self._start_shown = None      # displayed start, held against ambient drift
+        self._start_key = None        # plan + reading it was computed from
+
+    def _plan_key(self):
+        """Plan identity, plus the reading that drives real movement in the start.
+
+        The water temperature belongs in the key because a change of reading is
+        exactly what makes the start time move for a reason: it is a 0.5 °C band
+        crossing, worth a band's heating either way.  Everything else that moves
+        the estimate — chiefly the ambient factor rescaling it — leaves the
+        reading alone, and is drift.
+        """
+        c = self.coordinator
+        try:
+            water = float(c._last_data.get("water_temperature"))
+        except (TypeError, ValueError):
+            water = None
+        return (c.scheduled_ready_at, c.schedule_target_temp, water)
+
+    def _slew_start(self, raw_start, now_utc):
+        """Hold the displayed start steady against drift that carries no information.
+
+        The start is recomputed every poll, and it moves in two distinct ways:
+
+          * a lump of about a band's worth of heating each time the water reading
+            crosses a 0.5 °C boundary — always earlier while cooling, and real:
+            the plan genuinely does need to start sooner.
+          * a smaller drift as the ambient factor rescales the whole estimate.
+            This one grows with lead time, because it is a percentage of a long
+            span: a 1.5 °C outdoor rise moved a 9 h estimate by 28 min on
+            2026-08-12, and reversed 2 min later when the water crossed a band.
+
+        Size cannot separate them — at the cold bucket rate a crossing is worth
+        about 15 min and at the hot bucket about 40, which straddles the drift —
+        so this discriminates on cause, as _slew_eta does. A change of reading is
+        adopted at once; drift within one reading has to clear a wide deadband.
+
+        The deadband is asymmetric, because during a cool-down drift in the two
+        directions means different things. The water is cooling, so the start is
+        marching earlier and every crossing moves it earlier again. Drift that
+        pushes the start *back* is therefore running against the plan's own trend
+        and the next crossing will more than cancel it: a band is worth 27-44 min
+        of heating across the bucket rates, so any later-drift smaller than that
+        is transient by construction. On 2026-08-12 holding at 15:45 through a
+        +40 min ambient drift was closer to the eventual 15:52 than adopting the
+        16:25 it briefly computed. So later-drift has to clear a full band's worth
+        before it is believed; earlier-drift, which is where the plan is heading
+        anyway, is adopted sooner.
+
+        Once the start is within _START_TRACK_WITHIN_MIN the live value is shown
+        regardless, so the displayed time is exact when it is close enough to act
+        on, and only approximate hours out where the churn was.
+
+        Deliberately no rate cap and no wall-clock term: unlike the ETA there is
+        nothing here to ramp smoothly toward, and staying a pure function of
+        (raw, held, now) keeps it idempotent — `native_value` and
+        `extra_state_attributes` both evaluate the schedule on the same update.
+        """
+        key = self._plan_key()
+        shown = self._start_shown
+
+        if shown is None or key != self._start_key:
+            shown = raw_start                     # new plan, or the reading moved
+        elif raw_start - now_utc <= timedelta(minutes=_START_TRACK_WITHIN_MIN):
+            shown = raw_start                     # close enough to act on
+        else:
+            drift_min = (raw_start - shown).total_seconds() / 60.0
+            limit = (_START_DRIFT_LATER_MIN if drift_min > 0
+                     else _START_DRIFT_EARLIER_MIN)
+            if abs(drift_min) >= limit:
+                shown = raw_start                 # too large to keep hiding
+
+        self._start_shown = shown
+        self._start_key = key
+        return shown
 
     def _schedule_data(self):
         """Return (target_dt_utc, target_temp, start_at_utc) or a sentinel string."""
@@ -1093,6 +1181,13 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
     @property
     def native_value(self):
         result = self._schedule_data()
+        # Render from the held start, not the live one.  Inside the tracking window
+        # _slew_start returns the live value anyway, so "Start now" still fires at
+        # the moment the coordinator's own recompute triggers the heater.
+        if isinstance(result, tuple) and len(result) == 3:
+            target_utc, target_temp, raw_start = result
+            result = (target_utc, target_temp,
+                      self._slew_start(raw_start, dt_util.utcnow()))
         val = _compute_schedule_value(result)
         prev = getattr(self, "_logged_state", _UNSET)
         if val != prev:
