@@ -568,10 +568,46 @@ Averaged over a dwell this gives nothing away: it runs half a band warm just aft
 So:
 
 - **Leave the circulation pump running** if you use scheduling. This is the recommended configuration.
-- **If you prefer to leave the spa fully idle**, have an automation start the pump about **an hour before** the earliest the schedule might fire. The reading corrects to the real tub temperature, the planned start corrects with it, and the correction lands *before* the start matters rather than after. The integration will not do this for you — it never starts hardware on your behalf to take a measurement.
+- **If you prefer to leave the spa fully idle**, drive the pump off the `start_at` attribute (see the automation below). The integration will not do this for you — it never starts hardware on your behalf to take a measurement.
 - **Build in margin** if the exact ready time is critical. Some residual error always remains.
 - Expect any remaining miss to be *larger* close to the target, because heating is slowest there and a band therefore takes longer.
 - Don't read a late finish as a broken prediction. Compare the `start_at` attribute with when heating actually began.
+
+#### Starting the pump ahead of the schedule
+
+`start_at` is a live timestamp, so there is no need to guess. Trigger the pump from it:
+
+```yaml
+alias: "MSpa – Circulate before the scheduled start"
+description: "Give the probe time to read tub water before the plan has to be right."
+mode: single
+variables:
+  # How far ahead to start circulating. Only has to exceed the time for tub water to
+  # reach the probe, which is a few minutes — the rest is margin.
+  lead_minutes: 60
+triggers:
+  - trigger: template
+    value_template: >
+      {% set s = state_attr('sensor.mspa_heat_schedule', 'start_at') %}
+      {{ s is not none
+         and now() >= (s | as_datetime) - timedelta(minutes=lead_minutes) }}
+conditions:
+  - condition: state
+    entity_id: switch.mspa_filter
+    state: "off"
+actions:
+  - action: switch.turn_on
+    target:
+      entity_id: switch.mspa_filter
+```
+
+**Why this is safe in the direction it matters.** While the pump is off the reading comes from the cold housing water, so the plan over-states the work and `start_at` is the *earliest* the schedule could fire. Any lead time therefore lands before the real start. Once circulation begins the reading corrects upward, `start_at` moves **later**, and the correction has arrived before it mattered.
+
+**Use the one-sided comparison shown.** `now() >= start_at - lead` stays true once reached, so the automation cannot miss its window. A two-sided window (`... and now() <= start_at`) can be skipped entirely if `start_at` jumps past it.
+
+Note `start_at` is `null` beyond the lookahead horizon, which is why the template checks for `none` first. Turning the pump back off afterwards is your call — it is needed during heating anyway, so the natural point is once **Ready at** reports `Ready`.
+
+Entity ids above are shown unprefixed; yours carry your device name, as in `switch.mspa_hot_tub_filter`. Check them in **Developer tools → States**.
 
 ### The temperature probe is in the pump, not the tub
 

@@ -815,9 +815,10 @@ extrapolation. Only the scheduler lacked one.
 measurement to extrapolate, and housings differ between spa models so no offset can be
 calibrated. The fallback is the old lumpy behaviour, the `circulating` and
 `temperature_basis` attributes report the condition, and the README recommends either
-leaving the pump running or starting it an hour before the schedule might fire. The
-durable fix is the [Optional External Temperature
-Probe](#optional-external-temperature-probe).
+leaving the pump running or driving it from the `start_at` attribute — which is safe in
+the one direction that matters, since a stagnant reading over-states the work and so
+makes `start_at` the earliest the schedule could fire. The durable fix is the [Optional
+External Temperature Probe](#optional-external-temperature-probe).
 
 **Still owed:** whether the cooling law extrapolates — nothing observes a gap beyond
 30 °C, and the two fits diverge ~60% by gap 48. The current tub has no data before April
