@@ -19,6 +19,7 @@ from custom_components.mspa.const import (
     BIAS_CLAMP_MAX,
 )
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+from custom_components.mspa.predictor import extrapolate_within_band
 from custom_components.mspa.sensor import _anchor_eta_utc, _segmented_heating_minutes
 
 
@@ -312,3 +313,98 @@ class TestSameStartingPoint:
         eta_now = _anchor_eta_utc(c, 39.5, self._NOW)
         eta_later = _anchor_eta_utc(c, 39.5, self._NOW + timedelta(minutes=2))
         assert eta_now == eta_later, "ETA drifted with the clock between readings"
+
+
+class TestTempAnchorOnlyMovesOnRealChange:
+    """The anchor must move at a crossing and stay put in between.
+
+    Regression for a bug shipped 2026-08-11 and caught 2026-08-12 by noticing that the
+    Heat Schedule sensor and the coordinator logged start times 6 min apart 30 s apart.
+    Change detection compared the raw reading against `temp_anchor_temp`, which
+    band-centre anchoring had made a *midpoint* — so it never matched, the anchor
+    re-fired every poll, and `temp_anchor_time` reset each time.
+
+    Three things broke together, silently, and none was visible from outside:
+      * the half-step correction decayed geometrically back to the raw reading
+      * elapsed-time measurement never accumulated, so extrapolation started late
+      * the clamp was measured from a moving anchor, so the estimate could leave the
+        reading's band — the one guard that was explicitly asked for
+    """
+
+    def _coord(self):
+        c = MSpaUpdateCoordinator.__new__(MSpaUpdateCoordinator)
+        c.temp_anchor_time = None
+        c.temp_anchor_temp = None
+        c.temp_anchor_target = None
+        c.temp_anchor_rising = None
+        c._anchor_prev_reading = None
+        return c
+
+    def test_steady_reading_does_not_re_anchor(self):
+        c = self._coord()
+        c._update_temp_anchor(32.5, 39.5)          # first sighting
+        c._update_temp_anchor(32.0, 39.5)          # a crossing
+        anchored_at, anchored_temp = c.temp_anchor_time, c.temp_anchor_temp
+        for _ in range(20):                        # ten minutes of 30 s polls
+            c._update_temp_anchor(32.0, 39.5)
+        assert c.temp_anchor_time is anchored_at, "anchor time reset without a change"
+        assert c.temp_anchor_temp == anchored_temp, "anchor drifted without a change"
+
+    def test_crossing_anchors_at_the_midpoint_of_the_two_readings(self):
+        c = self._coord()
+        c._update_temp_anchor(32.5, 39.5)
+        c._update_temp_anchor(32.0, 39.5)
+        assert c.temp_anchor_temp == pytest.approx(32.25)
+
+    def test_midpoint_does_not_decay_over_repeated_polls(self):
+        """The half-step correction is the whole point; it must not bleed away."""
+        c = self._coord()
+        c._update_temp_anchor(32.5, 39.5)
+        c._update_temp_anchor(32.0, 39.5)
+        for _ in range(50):
+            c._update_temp_anchor(32.0, 39.5)
+        assert c.temp_anchor_temp == pytest.approx(32.25)
+
+    def test_direction_follows_the_crossing(self):
+        c = self._coord()
+        c._update_temp_anchor(32.5, 39.5)
+        c._update_temp_anchor(32.0, 39.5)
+        assert c.temp_anchor_rising is False
+        c._update_temp_anchor(32.5, 39.5)
+        assert c.temp_anchor_rising is True
+
+    def test_first_sighting_has_no_direction(self):
+        """Nothing to compare against, so the extrapolation must decline it."""
+        c = self._coord()
+        c._update_temp_anchor(32.0, 39.5)
+        assert c.temp_anchor_rising is None
+        assert c.temp_anchor_temp == pytest.approx(32.0)
+
+    def test_target_change_re_anchors(self):
+        c = self._coord()
+        c._update_temp_anchor(32.0, 39.5)
+        first = c.temp_anchor_time
+        c._update_temp_anchor(32.0, 38.0)
+        assert c.temp_anchor_time is not first
+        assert c.temp_anchor_target == 38.0
+
+    def test_a_jump_of_more_than_one_band_is_not_midpointed(self):
+        """Two bands at once means a reading was missed, so the threshold is unknown."""
+        c = self._coord()
+        c._update_temp_anchor(32.5, 39.5)
+        c._update_temp_anchor(31.0, 39.5)
+        assert c.temp_anchor_temp == pytest.approx(31.0)
+        assert c.temp_anchor_rising is None
+
+    def test_estimate_stays_inside_the_readings_own_band(self):
+        """With the midpoint correct, the clamp bounds the estimate to +/-0.25 of the
+        reading — which is the guard that was asked for, and which the bug defeated."""
+        c = self._coord()
+        c._update_temp_anchor(32.5, 39.5)
+        c._update_temp_anchor(32.0, 39.5)
+        reading = 32.0
+        for hours in (0.0, 0.5, 1.0, 2.0, 100.0):
+            est = extrapolate_within_band(
+                c.temp_anchor_temp, hours, 0.36, cooling=not c.temp_anchor_rising)
+            assert reading - 0.25 - 1e-9 <= est <= reading + 0.25 + 1e-9, (
+                f"estimate {est} left the band of reading {reading} after {hours} h")

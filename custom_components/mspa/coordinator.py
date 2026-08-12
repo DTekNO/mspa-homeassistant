@@ -299,6 +299,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Taken from the observed reading change rather than from heater state, because
         # water keeps moving after the heater stops and can warm with it off.
         self.temp_anchor_rising: bool | None = None
+        # The raw reading the anchor was derived from.  Change detection has to compare
+        # readings with readings: temp_anchor_temp is a band *midpoint*, so comparing a
+        # reading against it never matches and the anchor would re-fire every poll.
+        self._anchor_prev_reading: float | None = None
         self.temp_anchor_target: float | None = None     # target_temp at that moment
 
         # Shared hysteresis flag for the time-to-target sensors.
@@ -445,32 +449,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
             )
 
-            # Update anchor whenever water_temp or target_temp changes.
-            # Sensors use (anchor_time, anchor_temp, anchor_target) to count down
-            # between temperature steps without needing per-sensor state.
             new_temp   = transformed_data.get("water_temperature")
             new_target = transformed_data.get("target_temperature")
-            if new_temp != self.temp_anchor_temp or new_target != self.temp_anchor_target:
-                # A reading change is a band crossing, and at that instant the true
-                # temperature is the threshold *between* the two reported values —
-                # half a step from either.  Recording the new reading verbatim
-                # therefore carries a systematic error whose sign depends on
-                # direction: 0.25 °C high when warming, 0.25 °C low when cooling.
-                # At ~1 °C/h that is a quarter-hour of ETA each way, and a full half
-                # hour across a cool-down followed by a heat-up — which is what made
-                # Ready at and the scheduler disagree by ~20 min at a session start.
-                prev = self.temp_anchor_temp
-                anchored = new_temp
-                rising = None
-                if (prev is not None and new_temp is not None
-                        and abs(new_temp - prev) <= _TEMP_BAND_C + 1e-9
-                        and new_temp != prev):
-                    anchored = (new_temp + prev) / 2.0
-                    rising = new_temp > prev
-                self.temp_anchor_time   = datetime.now(timezone.utc)
-                self.temp_anchor_temp   = anchored
-                self.temp_anchor_target = new_target
-                self.temp_anchor_rising = rising
+            self._update_temp_anchor(new_temp, new_target)
 
             # --- Prediction accuracy tracking ---
             # Start tracking when a big heating session begins (delta > 2°C).
@@ -658,13 +639,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     # override it back to the persisted time when the water temp
                     # and target still match — otherwise the step advanced while
                     # HA was down and the fresh anchor is the correct one.
+                    # Compare the stored *reading*, not the stored anchor: the anchor
+                    # is a band midpoint and never equals a reading, so comparing it
+                    # meant the persisted anchor was never actually restored.
                     anchor_iso = stored.get("temp_anchor_time")
+                    stored_reading = stored.get("anchor_prev_reading",
+                                                stored.get("temp_anchor_temp"))
                     if (anchor_iso is not None
-                            and stored.get("temp_anchor_temp") == new_temp
+                            and stored_reading == new_temp
                             and stored.get("temp_anchor_target") == new_target):
                         try:
                             self.temp_anchor_time   = datetime.fromisoformat(anchor_iso)
-                            self.temp_anchor_temp   = new_temp
+                            # Keep the persisted midpoint; overwriting it with the raw
+                            # reading threw away the half-step correction it exists for.
+                            self.temp_anchor_temp   = stored.get(
+                                "temp_anchor_temp", new_temp)
+                            self._anchor_prev_reading = new_temp
                             self.temp_anchor_rising = stored.get("temp_anchor_rising")
                             since = stored.get("heating_since")
                             if since:
@@ -822,6 +812,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     if self.heating_since is not None else None
                 ),
                 "temp_anchor_rising": self.temp_anchor_rising,
+                "anchor_prev_reading": self._anchor_prev_reading,
                 "temp_anchor_temp": self.temp_anchor_temp,
                 "temp_anchor_target": self.temp_anchor_target,
             })
@@ -850,6 +841,52 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error("Error updating MSpa data: %s", str(err))
             raise UpdateFailed(f"Update failed: {str(err)}")
+
+    def _update_temp_anchor(self, new_temp, new_target) -> None:
+        """Re-anchor when the reading or target changes, at the band centre.
+
+        Sensors use (anchor_time, anchor_temp, anchor_target) to measure elapsed
+        progress between reported temperature steps without keeping per-sensor state,
+        and `scheduling_temp` extrapolates from it.  Both depend on the anchor moving
+        *only* at a real change.
+
+        A reading change is a band crossing, and at that instant the true temperature is
+        the threshold *between* the two reported values — half a step from either.
+        Recording the new reading verbatim carries a systematic error whose sign depends
+        on direction: 0.25 °C high when warming, 0.25 °C low when cooling. At ~1 °C/h
+        that is a quarter-hour of ETA each way, and a full half hour across a cool-down
+        followed by a heat-up, which is what made Ready at and the scheduler disagree by
+        ~20 min at a session start.
+
+        **Change detection compares readings with readings.** `temp_anchor_temp` is a
+        midpoint, so testing the reading against it never matches: the anchor re-fired
+        on every poll, halving its way back toward the raw reading and resetting
+        `temp_anchor_time` each time. That silently defeated three things at once — the
+        half-step correction decayed away, elapsed-time measurement never accumulated,
+        and `scheduling_temp`'s clamp was measured from a moving anchor so the estimate
+        could leave the reading's band entirely. Extracted from `_async_update_data` and
+        given tests precisely because none of that was visible from outside.
+
+        With the midpoint correct, the clamp in `predictor.extrapolate_within_band`
+        bounds the estimate to exactly the reported reading's own band.
+        """
+        if (new_temp == self._anchor_prev_reading
+                and new_target == self.temp_anchor_target):
+            return
+
+        prev = self._anchor_prev_reading
+        anchored = new_temp
+        rising = None
+        if (prev is not None and new_temp is not None
+                and abs(new_temp - prev) <= _TEMP_BAND_C + 1e-9
+                and new_temp != prev):
+            anchored = (new_temp + prev) / 2.0
+            rising = new_temp > prev
+        self.temp_anchor_time     = datetime.now(timezone.utc)
+        self.temp_anchor_temp     = anchored
+        self.temp_anchor_target   = new_target
+        self.temp_anchor_rising   = rising
+        self._anchor_prev_reading = new_temp
 
     @property
     def fault_code(self) -> str | None:

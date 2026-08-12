@@ -636,7 +636,7 @@ The sensors deliberately stay **available** when the pump is off, rather than go
 
 The start time is recomputed on every poll, and two things move it: the temperature steps above, and a smaller drift as the outdoor temperature rescales the whole estimate. The second grows with how far off the start is — on 2026-08-12 a 1.5 °C outdoor rise moved a nine-hour-out estimate by 28 minutes, and a temperature step reversed it two minutes later.
 
-So the **state** does not follow every recomputation. A change of reading is shown at once; drift alone has to exceed 30 minutes (bringing the start forward) or 60 minutes (pushing it back) before the display moves. Within **45 minutes of starting** the displayed time is always live, so it is exact when it is close enough to act on. In the measured cool-down this cut the displayed value from 31 changes to 12, and from 5 direction reversals to 1.
+So the **state** does not follow every recomputation. A change of reading is shown at once; drift alone has to exceed 10 minutes (bringing the start forward) or 60 minutes (pushing it back) before the display moves. Within **45 minutes of starting** the displayed time is always live, so it is exact when it is close enough to act on. In the measured cool-down this cut the displayed value from 31 changes to 12, and from 5 direction reversals to 1.
 
 The `start_at` **attribute is always the live plan**, so automations act on the real time. It can therefore differ from the displayed `Start at HH:MM` while the start is still hours away — that is deliberate, not a bug.
 

@@ -456,7 +456,7 @@ _ETA_ROUND_MIN = 5            # display granularity, minutes
 # other sensor: hold the shown start steady against drift that carries no
 # information.  See MSpaHeatScheduleSensor._slew_start for why cause rather than
 # size does the separating.
-_START_DRIFT_EARLIER_MIN = 30     # drift bringing the start forward
+_START_DRIFT_EARLIER_MIN = 10     # drift bringing the start forward
 _START_DRIFT_LATER_MIN = 60       # drift pushing it back — see _slew_start
 _START_TRACK_WITHIN_MIN = 45      # this close to starting, always show the live value
 
