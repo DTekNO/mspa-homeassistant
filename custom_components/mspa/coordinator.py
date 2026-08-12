@@ -2,7 +2,12 @@
 import logging
 from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
-from .predictor import HeatPredictor, ambient_rate_factor, bucket_index
+from .predictor import (
+    HeatPredictor,
+    ambient_rate_factor,
+    bucket_index,
+    extrapolate_within_band,
+)
 
 from typing import Any, Dict
 import asyncio
@@ -282,8 +287,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # anchor records when the temperature last *changed*, which during a
         # cool-down is a cooling transition and says nothing about heating progress.
         self.heating_since: datetime | None = None
+        # UTC datetime the circulation pump last started, or None while it is off.
+        # An anchor recorded before this describes stagnant water in the pump housing
+        # rather than the tub, so it cannot be extrapolated from.
+        self.circulating_since: datetime | None = None
         self.temp_anchor_time: datetime | None = None    # UTC datetime of last temp/target change
         self.temp_anchor_temp: float | None = None       # water_temp at that moment
+        # Direction of the crossing that set the anchor: True warming, False cooling.
+        # Taken from the observed reading change rather than from heater state, because
+        # water keeps moving after the heater stops and can warm with it off.
+        self.temp_anchor_rising: bool | None = None
         self.temp_anchor_target: float | None = None     # target_temp at that moment
 
         # Shared hysteresis flag for the time-to-target sensors.
@@ -446,13 +459,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # Ready at and the scheduler disagree by ~20 min at a session start.
                 prev = self.temp_anchor_temp
                 anchored = new_temp
+                rising = None
                 if (prev is not None and new_temp is not None
                         and abs(new_temp - prev) <= _TEMP_BAND_C + 1e-9
                         and new_temp != prev):
                     anchored = (new_temp + prev) / 2.0
+                    rising = new_temp > prev
                 self.temp_anchor_time   = datetime.now(timezone.utc)
                 self.temp_anchor_temp   = anchored
                 self.temp_anchor_target = new_target
+                self.temp_anchor_rising = rising
 
             # --- Prediction accuracy tracking ---
             # Start tracking when a big heating session begins (delta > 2°C).
@@ -647,6 +663,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         try:
                             self.temp_anchor_time   = datetime.fromisoformat(anchor_iso)
                             self.temp_anchor_temp   = new_temp
+                            self.temp_anchor_rising = stored.get("temp_anchor_rising")
                             since = stored.get("heating_since")
                             if since:
                                 try:
@@ -735,6 +752,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Detect new heating session.  Only reset the session scalar when
             # the heater newly engages AND delta-to-target is large (> 2°C).
             # This avoids false resets from thermostat cycling near setpoint.
+            if self.circulating:
+                if self.circulating_since is None:
+                    self.circulating_since = datetime.now(timezone.utc)
+            else:
+                self.circulating_since = None
+
             heater_now_active = (heat_state == _HEAT_STATE_FULL)
             if heater_now_active and self.heating_since is None:
                 self.heating_since = datetime.now(timezone.utc)
@@ -796,6 +819,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self.heating_since.isoformat()
                     if self.heating_since is not None else None
                 ),
+                "temp_anchor_rising": self.temp_anchor_rising,
                 "temp_anchor_temp": self.temp_anchor_temp,
                 "temp_anchor_target": self.temp_anchor_target,
             })
@@ -824,6 +848,79 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error("Error updating MSpa data: %s", str(err))
             raise UpdateFailed(f"Update failed: {str(err)}")
+
+    @property
+    def circulating(self) -> bool:
+        """Whether the circulation pump is running, so the probe reads tub water.
+
+        The probe sits in the external pump housing.  With the pump off it measures a
+        separate stagnant volume that runs at or below tub temperature, and housings
+        differ between spa models, so there is no offset to calibrate.
+        """
+        return self._last_data.get("filter") == "on"
+
+    def scheduling_temp(self) -> float | None:
+        """Water temperature to plan from — extrapolated inside its band when sound.
+
+        The reported value is quantised to 0.5 °C and the scheduler recomputes from it
+        every poll, so a crossing moves the planned start by a whole band of heating in
+        one step — 27-44 min across the bucket rates.  That lump is what makes the
+        schedule "miss": a crossing landing shortly before the planned start turns the
+        plan into one that should already have begun, and there is no way to start in
+        the past.
+
+        Extrapolating from the crossing that entered the band removes the lump, and it
+        costs nothing: averaged over a dwell the estimate is neutral against holding the
+        reading, because it runs half a band warm just after a crossing and half a band
+        cold just before the next, and the reading is the mean of the two.
+
+        Every guard falls back to the reported reading, which is exactly today's
+        behaviour, so nothing here can do worse than not being here:
+
+        * **Not circulating** — the probe is in stagnant housing water and is not
+          measuring the tub at all.  This is the one guard that is about the hardware
+          rather than the model, and it is why accurate scheduling wants the pump left
+          running.
+        * **Anchor predates circulation** — the crossing was recorded while the probe
+          was reading housing water, so its threshold does not describe the tub.
+        * **Heater state changed after the anchor** — the water may have reversed
+          direction since, making the recorded direction stale.
+        * **Direction unknown** — the anchor came from a restart or a jump of more than
+          one band, not from an observed crossing.
+        * **No learned rate** — nothing to extrapolate along.
+        """
+        try:
+            reading = float(self._last_data.get("water_temperature"))
+        except (TypeError, ValueError):
+            return None
+
+        if not self.circulating:
+            return reading
+        anc_t, anc_temp = self.temp_anchor_time, self.temp_anchor_temp
+        rising = self.temp_anchor_rising
+        if anc_t is None or anc_temp is None or rising is None:
+            return reading
+        if self.circulating_since is None or anc_t < self.circulating_since:
+            return reading
+        if self.heating_since is not None and self.heating_since > anc_t:
+            return reading
+
+        rate = (self._predictor().bucket_rate(anc_temp) if rising
+                else self.computed_cool_rate)
+        elapsed_h = (datetime.now(timezone.utc) - anc_t).total_seconds() / 3600.0
+        est = extrapolate_within_band(anc_temp, elapsed_h, rate, cooling=not rising)
+        if est is None:
+            return reading
+
+        if abs(est - anc_temp) >= _TEMP_BAND_C - 1e-9:
+            # Pinned at the far edge: the model expected a crossing that has not
+            # arrived, so the rate is optimistic in this regime.
+            _LOGGER.debug(
+                "scheduling_temp: band saturated after %.0f min at %.3f °C/h "
+                "(anchor %.2f, reading %.1f) — rate is optimistic",
+                elapsed_h * 60, rate or 0.0, anc_temp, reading,
+            )
+        return est
 
     def _clear_schedule_if_expired(self, current_temp) -> None:
         """Retire the schedule once its ready time has passed.
@@ -1127,7 +1224,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self.clear_schedule("stale target", current_temp)
             return
 
-        minutes_needed = self._compute_heating_minutes(current_temp, target_temp)
+        # Plan from the in-band estimate, not the quantised reading, so the start
+        # ramps instead of lurching a whole band at each crossing.  Falls back to the
+        # reading whenever the estimate is not sound — see scheduling_temp.
+        plan_temp = self.scheduling_temp()
+        if plan_temp is None:
+            plan_temp = current_temp
+        minutes_needed = self._compute_heating_minutes(plan_temp, target_temp)
         if minutes_needed is None:
             # No learned rate data yet.  If the scheduled time has already arrived,
             # fire immediately with 0 lead time — raising the setpoint now is
@@ -1147,8 +1250,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if prev_start is None or abs((start_at - prev_start).total_seconds()) > 900:
             if prev_start is not None:
                 eff = (
-                    (self.schedule_target_temp - current_temp) / (minutes_needed / 60.0)
-                    if minutes_needed and current_temp is not None
+                    (self.schedule_target_temp - plan_temp) / (minutes_needed / 60.0)
+                    if minutes_needed and plan_temp is not None
                     and self.schedule_target_temp is not None else None
                 )
                 _LOGGER.info(

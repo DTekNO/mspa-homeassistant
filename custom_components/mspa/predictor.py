@@ -55,6 +55,45 @@ AMBIENT_FACTOR_MIN = 0.3   # never slow a bucket below 30% of its learned rate
 AMBIENT_FACTOR_MAX = 1.5   # never speed a bucket beyond 150% of its learned rate
 
 
+# Reported temperature is quantised to this step, so a reading locates the true value
+# only to within a band.  At a crossing it is known exactly — it is the threshold.
+TEMP_BAND_C = 0.5
+
+
+def extrapolate_within_band(anchor_temp, elapsed_hours, rate_c_per_h, *, cooling):
+    """True-temperature estimate now, from the crossing that entered the current band.
+
+    At a crossing the true temperature is the threshold between the two reported
+    values, which is what `anchor_temp` records.  Afterwards it keeps moving while the
+    reported value stays put until the next threshold is reached, so between crossings
+    the position is unobserved.  Extrapolating at the known rate recovers it, which
+    turns the scheduler's per-crossing lump into a smooth ramp.
+
+    **The clamp to one band is a deduction, not a safety margin.** The reading has not
+    changed, therefore the next threshold has not been crossed, therefore the drift
+    cannot exceed a band.  It also makes the estimate continuous through a crossing: a
+    full band of drift lands exactly on the anchor the next crossing will set, so
+    handing over introduces no step.
+
+    Saturating the clamp is meaningful — the model expected a crossing that has not
+    arrived, so the rate is optimistic. The value stays pinned at the band edge, and
+    callers may want to report the condition.
+
+    Averaged across a dwell this is neutral against simply holding the reported value:
+    it runs half a band warm just after a crossing and half a band cold just before the
+    next, and the reported value is the mean of the two. So it removes the lumps
+    without trading away any of the conservatism that holding the reading provided.
+
+    Returns None when it cannot be computed, so callers fall back to the reading.
+    """
+    if anchor_temp is None or elapsed_hours is None:
+        return None
+    if rate_c_per_h is None or rate_c_per_h <= 0 or elapsed_hours < 0:
+        return None
+    drift = min(rate_c_per_h * elapsed_hours, TEMP_BAND_C)
+    return anchor_temp - drift if cooling else anchor_temp + drift
+
+
 def bucket_index(temp: float) -> int:
     """Bucket for a water temperature: 0 cold, 1 mid, 2 near-setpoint."""
     return 0 if temp < HEAT_BUCKET_T1 else 1 if temp < HEAT_BUCKET_T2 else 2

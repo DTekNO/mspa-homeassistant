@@ -1166,10 +1166,11 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 
         target_temp = float(self.coordinator.schedule_target_temp)
 
-        data = self.coordinator._last_data
-        try:
-            current_temp = float(data.get("water_temperature"))
-        except (TypeError, ValueError):
+        # The same estimate the trigger plans from, so the displayed start and the
+        # moment it actually fires cannot disagree — the defect c5010d3 fixed for
+        # Ready at, kept fixed here.  Degrades to the reported reading on its own.
+        current_temp = self.coordinator.scheduling_temp()
+        if current_temp is None:
             return None
 
         # Single source of truth: the Heat Schedule is "ready" exactly when the

@@ -551,21 +551,27 @@ Once the schedule has fired the sensor holds a steady `Heating` rather than flic
 
 The sensor works in both directions: if the spa needs to heat up it uses the learned bucket heating rates; if it needs to cool down it uses the learned cooling rate.
 
-### Why the start can be late, and why that is not fixable
+### Keep the circulation pump running for accurate scheduling
 
-The spa reports water temperature in **0.5 °C steps**. That is the whole resolution available — there is no finer reading to ask for. So the integration knows the true temperature exactly only at the moment the reading *changes*; in between, the water is somewhere inside a 0.5 °C band and its position is unknown.
+**This is the single most important thing you can do for scheduling accuracy.**
 
-The planned start is computed from the reading, which means **one step of the thermometer is worth a whole band of heating**: 27–44 minutes depending on how fast the spa is heating in that temperature range. While the spa sits cooling, each step down moves the planned start earlier by that much, in a lump.
+The spa reports water temperature in **0.5 °C steps** — that is the whole resolution available. So the true temperature is known exactly only at the moment the reading *changes*; in between, the water is somewhere inside a 0.5 °C band.
 
-The consequence is that **a step that lands shortly before the planned start makes the plan late, instantly and unrecoverably.** If the schedule was going to start at 16:00 and the reading drops at 15:50, the plan becomes "should have started at 15:23" — and there is no way to start in the past. Conditioning begins immediately and the session finishes late, by up to that one band of heating.
+One step of the thermometer is worth a whole band of heating: **27–44 minutes** depending on how fast the spa heats in that range. If the planned start were recomputed from the reading alone, each step down would shove it earlier in a lump that size — and a step landing shortly before the planned start would make the plan one that should *already* have begun, with no way to start in the past. The session would then start late by up to a band.
 
-Nothing in the integration causes this and no setting avoids it; it follows from the temperature resolution the spa exposes. What you can do about it:
+The integration avoids that by tracking where the water sits *inside* its band, extrapolating from the crossing that entered it at the learned cooling rate. The planned start then ramps smoothly instead of lurching, and there is no lump left to be caught out by. It is clamped to one band, which is a deduction rather than a safety margin: the reading has not changed, so the next threshold cannot have been crossed. That also makes the estimate continuous — a full band of drift lands exactly on the anchor the next crossing will set.
 
-- **Build in margin** if the exact ready time matters — set the target 30–45 minutes earlier than you need it.
-- Expect the miss to be *larger*, not smaller, when starting from close to the target, because heating is slowest there and a band therefore takes longer.
-- Don't read a late finish as a broken prediction. Check the `start_at` attribute against when heating actually began: if they match, the plan was simply made on a reading that was about to change.
+Averaged over a dwell this gives nothing away: it runs half a band warm just after a crossing and half a band cold just before the next, and the reported reading is the mean of the two.
 
-Estimating the temperature *between* crossings was investigated and rejected — see [ROADMAP.md](ROADMAP.md) for the measurements. The blocker is not the model but the hardware: see below.
+**But it only works while the circulation pump is running**, because only then is the probe measuring tub water at all (see below). With the pump off the integration falls back to the reported reading — the original lumpy behaviour — because there is no sound trajectory to extrapolate.
+
+So:
+
+- **Leave the circulation pump running** if you use scheduling. This is the recommended configuration.
+- **If you prefer to leave the spa fully idle**, have an automation start the pump about **an hour before** the earliest the schedule might fire. The reading corrects to the real tub temperature, the planned start corrects with it, and the correction lands *before* the start matters rather than after. The integration will not do this for you — it never starts hardware on your behalf to take a measurement.
+- **Build in margin** if the exact ready time is critical. Some residual error always remains.
+- Expect any remaining miss to be *larger* close to the target, because heating is slowest there and a band therefore takes longer.
+- Don't read a late finish as a broken prediction. Compare the `start_at` attribute with when heating actually began.
 
 ### The temperature probe is in the pump, not the tub
 

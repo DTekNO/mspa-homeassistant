@@ -747,7 +747,7 @@ than linearly, as evaporation does. Recorder crossings agree at full resolution
 
 **The stored `cool_rate` scalar is wrong almost everywhere.** At 0.363 °C/h it matches
 only a ~29 °C gap — it was learned from hot water. Near ambient it overstates cooling
-**4×**. Any future use of it for extrapolation must be replaced by `cool_rate(water −
+**4×**. (These stretches were all circulating, so they do describe the tub.) Any future use of it for extrapolation must be replaced by `cool_rate(water −
 air)`, which makes the correction depend on the weather entity and means it has to
 degrade to band-centre anchoring when there isn't one.
 
@@ -767,40 +767,61 @@ is near zero with the water hot — the same order as the disagreement the ancho
 just removed. **Cancelling a heat-up and restarting it reaches that regime in any
 season**, so this is not only a winter question.
 
-### Closed, 2026-08-12: not implementing this
+### Implemented for circulating water, 2026-08-12
 
-The open question was whether the step at heater-on was thermal or an artefact. It is an
-artefact, and of the probe's *location* rather than of mixing: with the pump off the
-reading describes stagnant housing water, not the tub. So there is no tub trajectory in
-that data to extrapolate. Three things follow, and together they close the item:
+Three corrections to the analysis above, all from the owner, and together they turned
+this from "rejected" into "shipped, narrowly scoped".
 
-- **The ETA never needed it.** `eta = anchor_time + minutes(anchor_temp → target)` is
-  algebraically identical to `now + minutes(extrapolated_temp(now) → target)` when the
-  extrapolation uses the predictor's own local rate — verified numerically, exactly zero
-  difference until the band clamp saturates, past which the existing staleness correction
-  already takes over. The anchor *is* the extrapolation.
-- **The scheduler was the only lever**, since it works from the raw reading with no
-  anchor and so moves in 32-min lumps. But it plans while the spa is idle and the pump is
-  off, which is precisely when the reading is not the tub's. Interpolating it would have
-  smoothed the lumps at the cost of ~0.25 °C of conservatism, buying smoothness with
-  margin on a signal that is not measuring the right water.
-- **No calibration is possible.** Housings differ between spa models, so the offset
-  cannot be characterised even in principle.
+**The step at heater-on is an artefact of where the probe is, not of mixing.** It sits in
+the external pump housing; with the pump off it reads a separate stagnant volume. So the
+2026-08-11 scoring above was comparing rules against data that was not measuring the tub,
+which is why the trajectory rule looked wrong. It was not being tested fairly.
 
-The measurements stay on record because they remain the best account of the cooling law,
-with one caveat now attached: **the 60 idle stretches were pump-off**, so τ ≈ 81 h and
-the stored `cool_rate` may describe the housing rather than the tub. The functional form
-(rate ∝ gap) is unaffected — both bodies lose heat to the same air — but the constant
-should be re-fitted from tub data before anything depends on its absolute value.
+**The scheduler plans while the *heater* is idle, not while the spa is idle** — the pump
+can perfectly well be circulating then, and it is recommended that it is. That is the
+window the extrapolation needed, and it is available.
 
-What replaces this item is the [Optional External Temperature
-Probe](#optional-external-temperature-probe), which removes the cause rather than
-modelling around it. Shipped in the meantime: `circulating` and `temperature_basis`
-attributes, so the condition is visible without pretending it can be fixed.
+**The conservatism objection was arithmetic error on my part.** I claimed smoothing cost
+~0.25 °C of margin and ~20 min of start time. It costs nothing: the estimate runs half a
+band warm just after a crossing and half a band cold just before the next, and the
+reported reading *is* the mean of the two. Measured over a dwell the mean difference is
+0.0 min. The clamp also makes the hand-off exactly continuous — a full band of drift
+lands on the anchor the next crossing will set.
 
-**Still owed if it is ever revisited:** whether the law extrapolates — nothing observes a
-gap beyond 30 °C, and the two fits diverge ~60% by gap 48. The current tub has no data
-before April 2026, so this needs a winter. See also [Learned Weather
+**Also corrected: the cooling rates were all measured on circulating water**, so τ ≈ 81 h
+and the stored `cool_rate` describe the tub after all. An earlier note here claiming they
+might describe the housing was wrong and has been removed.
+
+**What shipped.** `predictor.extrapolate_within_band()` (pure, clamped) and
+`coordinator.scheduling_temp()`, used by both the trigger and the Heat Schedule display
+so the two cannot diverge. The planned start now ramps in even steps through a dwell
+instead of sitting flat and lurching 32 min at each crossing, which removes the mechanism
+behind the "miss" entirely for circulating water.
+
+Every guard degrades to the reported reading, i.e. to the previous behaviour, so the
+feature cannot do worse than its own absence: not circulating; anchor recorded before
+circulation started; heater state changed after the anchor (direction may have reversed);
+direction unknown, from a restart or a jump of more than one band; no learned rate. Band
+saturation is logged at debug, since it means the rate is optimistic in that regime.
+
+**The ETA was left alone, because it never needed this.** `anchor_time +
+minutes(anchor_temp → target)` is algebraically identical to `now +
+minutes(extrapolated_temp(now) → target)` when the extrapolation uses the predictor's own
+local rate — verified numerically as exactly zero difference until the clamp saturates,
+past which the existing staleness correction takes over. The anchor *is* the
+extrapolation. Only the scheduler lacked one.
+
+**Still not addressed, and not addressable here:** with the pump off there is no tub
+measurement to extrapolate, and housings differ between spa models so no offset can be
+calibrated. The fallback is the old lumpy behaviour, the `circulating` and
+`temperature_basis` attributes report the condition, and the README recommends either
+leaving the pump running or starting it an hour before the schedule might fire. The
+durable fix is the [Optional External Temperature
+Probe](#optional-external-temperature-probe).
+
+**Still owed:** whether the cooling law extrapolates — nothing observes a gap beyond
+30 °C, and the two fits diverge ~60% by gap 48. The current tub has no data before April
+2026, so this needs a winter. See also [Learned Weather
 Factor](#learned-weather-factor), which wants the same measurements.
 
 ## Measured evidence (session of 2026-08-06/07)

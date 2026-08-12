@@ -20,6 +20,8 @@ from custom_components.mspa.const import (
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
     DEFAULT_SCHEDULE_LOOKAHEAD_DAYS,
 )
+from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+from custom_components.mspa.predictor import HeatPredictor, extrapolate_within_band
 
 _NOW_UTC   = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
 _NOW_LOCAL = _NOW_UTC
@@ -67,16 +69,35 @@ class MockCoordinator:
         self.temp_anchor_time = datetime.now(timezone.utc) + timedelta(minutes=anchor_offset_minutes)
         self.temp_anchor_temp = water_temp
         self.temp_anchor_target = target_temp
+        # Default to the fallback path so existing scenarios see the reported reading,
+        # which is what they were written against.  TestSchedulingTemp sets these up to
+        # exercise the extrapolation.
+        self.temp_anchor_rising = None
+        self.circulating_since = None
+        self.heating_since = None
         self.heat_rate_buckets = [heat_rate, heat_rate, heat_rate] if heat_rate else [None, None, None]
 
         _heater = heater if heater is not None else ("on" if target_temp > water_temp else "off")
         self._last_data = {
+            "filter": "on",
             "water_temperature": str(water_temp),
             "target_temperature": str(target_temp),
             "device_heat_perhour": device_heat_perhour,
             "is_online": is_online,
             "heater": _heater,
         }
+
+
+    # Borrowed, not reimplemented: a mock that restates the logic under test proves
+    # only that the mock agrees with itself.
+    circulating = MSpaUpdateCoordinator.circulating
+    scheduling_temp = MSpaUpdateCoordinator.scheduling_temp
+
+    def _predictor(self):
+        return HeatPredictor(
+            buckets=tuple(self.heat_rate_buckets),
+            prediction_bias=self.prediction_bias,
+        )
 
 
 class MockConfigEntry:
@@ -1013,3 +1034,134 @@ class TestTemperatureBasis:
         """An attribute, not unavailability — dropping the state breaks history."""
         c = self._coord("off")
         assert _heat_schedule(c) not in (None, "unavailable", "unknown")
+
+
+class TestExtrapolateWithinBand:
+    """The pure in-band extrapolation: clamp, continuity, neutrality."""
+
+    def test_clamped_to_one_band_however_long_it_runs(self):
+        """The reading has not changed, so the next threshold cannot be crossed.
+
+        A band takes 0.5/0.36 = 1.39 h at this rate, so 1 h does *not* saturate — the
+        clamp is a bound on the deduction, not a cap applied early.
+        """
+        assert extrapolate_within_band(33.25, 1.0, 0.36, cooling=True) == pytest.approx(32.89)
+        for hours in (2, 10, 1000):
+            est = extrapolate_within_band(33.25, hours, 0.36, cooling=True)
+            assert est == pytest.approx(33.25 - 0.5)
+
+    def test_clamped_in_the_warming_direction_too(self):
+        est = extrapolate_within_band(33.25, 1000, 0.9, cooling=False)
+        assert est == pytest.approx(33.25 + 0.5)
+
+    def test_a_full_band_of_drift_lands_on_the_next_anchor(self):
+        """Continuity: handing over at a crossing introduces no step.
+
+        Cooling out of reading 33.0 (anchor 33.25), the next crossing is to 32.5, whose
+        band-centre anchor is 32.75 — exactly where a full band of drift arrives.
+        """
+        assert extrapolate_within_band(33.25, 10, 0.36, cooling=True) == pytest.approx(32.75)
+
+    def test_neutral_against_holding_the_reading_at_the_dwell_midpoint(self):
+        """Half a band warm at the start, half a band cold at the end, reading in the middle."""
+        rate = 0.36
+        dwell_h = 0.5 / rate
+        mid = extrapolate_within_band(33.25, dwell_h / 2, rate, cooling=True)
+        assert mid == pytest.approx(33.0), "midpoint should equal the reported reading"
+
+    def test_no_rate_or_bad_input_returns_none(self):
+        assert extrapolate_within_band(33.25, 1.0, None, cooling=True) is None
+        assert extrapolate_within_band(33.25, 1.0, 0.0, cooling=True) is None
+        assert extrapolate_within_band(None, 1.0, 0.36, cooling=True) is None
+        assert extrapolate_within_band(33.25, -1.0, 0.36, cooling=True) is None
+
+
+class TestSchedulingTemp:
+    """Every guard falls back to the reported reading, i.e. to today's behaviour."""
+
+    def _coord(self, **kw):
+        anchor_min = kw.pop("anchor_offset_minutes", -40.0)
+        c = MockCoordinator(
+            water_temp=33.0, target_temp=39.5, cool_rate=0.36,
+            anchor_offset_minutes=anchor_min,
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=9),
+            schedule_target_temp=39.5,
+        )
+        # a cooling crossing into the 33.0 band, recorded while circulating
+        c.temp_anchor_temp = 33.25
+        c.temp_anchor_rising = False
+        c.circulating_since = c.temp_anchor_time - timedelta(hours=1)
+        for k, v in kw.items():
+            setattr(c, k, v)
+        return c
+
+    def test_extrapolates_when_everything_is_sound(self):
+        c = self._coord()
+        est = c.scheduling_temp()
+        assert est is not None and est < 33.25, "should have drifted below the anchor"
+        assert est > 32.75 - 1e-9
+
+    def test_not_circulating_falls_back_to_the_reading(self):
+        """Stagnant housing water is not the tub, so there is nothing to extrapolate."""
+        c = self._coord()
+        c._last_data["filter"] = "off"
+        assert c.scheduling_temp() == pytest.approx(33.0)
+
+    def test_anchor_predating_circulation_falls_back(self):
+        """That crossing was recorded on housing water."""
+        c = self._coord()
+        c.circulating_since = c.temp_anchor_time + timedelta(minutes=1)
+        assert c.scheduling_temp() == pytest.approx(33.0)
+
+    def test_heater_started_after_the_anchor_falls_back(self):
+        """Direction may have reversed since the crossing."""
+        c = self._coord()
+        c.heating_since = c.temp_anchor_time + timedelta(minutes=1)
+        assert c.scheduling_temp() == pytest.approx(33.0)
+
+    def test_unknown_direction_falls_back(self):
+        """A restart, or a jump of more than one band — not an observed crossing."""
+        c = self._coord(temp_anchor_rising=None)
+        assert c.scheduling_temp() == pytest.approx(33.0)
+
+    def test_no_cool_rate_falls_back(self):
+        c = self._coord(computed_cool_rate=None)
+        assert c.scheduling_temp() == pytest.approx(33.0)
+
+    def test_unreadable_reading_returns_none(self):
+        c = self._coord()
+        c._last_data["water_temperature"] = "unavailable"
+        assert c.scheduling_temp() is None
+
+    def test_never_leaves_the_band_even_with_an_absurd_rate(self):
+        """Belt and braces: a corrupt rate must not move the estimate out of the band."""
+        c = self._coord(computed_cool_rate=99.0)
+        assert c.scheduling_temp() == pytest.approx(32.75)
+
+
+class TestStartTimeRampsInsteadOfLumping:
+    """End to end: the planned start moves smoothly through a dwell."""
+
+    def _start_minutes(self, elapsed_min):
+        c = MockCoordinator(
+            water_temp=33.0, target_temp=39.5, cool_rate=0.36,
+            anchor_offset_minutes=-elapsed_min,
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=12),
+            schedule_target_temp=39.5,
+        )
+        c.temp_anchor_temp = 33.25
+        c.temp_anchor_rising = False
+        c.circulating_since = c.temp_anchor_time - timedelta(hours=1)
+        attrs = _heat_schedule_attrs(c)
+        start = datetime.fromisoformat(attrs["start_at"])
+        return (start - _NOW_UTC).total_seconds() / 60.0
+
+    def test_start_moves_monotonically_earlier_through_the_dwell(self):
+        starts = [self._start_minutes(m) for m in (0, 20, 40, 60, 83)]
+        assert starts == sorted(starts, reverse=True), f"not monotonic: {starts}"
+
+    def test_no_single_step_is_a_whole_band(self):
+        """The lump this replaces was 32 min; sampled every 20 min it must be smaller."""
+        starts = [self._start_minutes(m) for m in range(0, 84, 20)]
+        steps = [abs(b - a) for a, b in zip(starts, starts[1:])]
+        assert max(steps) < 20, f"still lumpy: {steps}"
