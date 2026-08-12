@@ -717,6 +717,32 @@ def _log_readiness_change(coordinator, old_state: object, new_state: "str | None
     )
 
 
+def _temperature_basis(coordinator) -> "tuple[bool, str]":
+    """Whether the reported water temperature describes the tub, and what it describes.
+
+    The probe sits in the external pump housing rather than in the tub.  While the
+    circulation pump runs, tub water passes over it and the reading is the tub
+    temperature.  With the pump off it measures a small, separate, stagnant volume
+    which loses heat faster than the insulated tub, so it reads at or below the
+    real tub temperature — and by an amount that depends on how long it has been
+    standing and on the weather, so it cannot be calibrated out.
+
+    An estimate built on a reading that runs cold asks for more heating than is
+    needed and therefore starts early, which is the harmless direction.  So this
+    is reported, not corrected: no modelling recovers a temperature the hardware
+    is not measuring, and a correction would only trade a safe error for a
+    confident wrong one.
+
+    Deliberately *not* surfaced by making the sensor unavailable.  The estimate is
+    still useful and still errs safe, and dropping the state would break history
+    and any automation reading it — an attribute says "treat this as a lower
+    bound" without taking the value away.
+    """
+    circulating = coordinator._last_data.get("filter") == "on"
+    return circulating, ("tub water" if circulating
+                         else "stagnant water in the external pump housing")
+
+
 def _day_offset_suffix(dt_utc) -> str:
     """' +Nd' when dt_utc falls N local days after today, else ''."""
     local = dt_util.as_local(dt_utc)
@@ -988,10 +1014,18 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         else:
             ambient_factor = None
 
+        circulating, temperature_basis = _temperature_basis(self.coordinator)
+
         return {
             "direction": direction,
             "minutes_remaining": rounded,
             "color": color,
+            # Whether the temperature this estimate is built on is the tub's at all.
+            # False means the probe is sitting in stagnant water in the pump
+            # housing, which reads at or below tub temperature — so the estimate
+            # is a safe over-estimate of the work remaining, not a wrong one.
+            "circulating": circulating,
+            "temperature_basis": temperature_basis,
             # ISO 8601 UTC, or None when the state is "Ready"/unknown.  Templates:
             #   {{ state_attr('sensor..._ready_at','ready_at') | as_datetime | as_local }}
             "ready_at": ready_at_ts,
@@ -1200,6 +1234,7 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         result = self._schedule_data()
         if not isinstance(result, tuple):
             return {}
+        circulating, temperature_basis = _temperature_basis(self.coordinator)
         if len(result) == 2:
             # Beyond the lookahead horizon — the target is known, the start is not.
             _, target_utc = result
@@ -1209,12 +1244,19 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
                 "target_temperature": getattr(
                     self.coordinator, "schedule_target_temp", None
                 ),
+                "circulating": circulating,
+                "temperature_basis": temperature_basis,
             }
         target_utc, target_temp, start_at_utc = result
         return {
             "target_time": target_utc.isoformat(),
             "start_at": start_at_utc.isoformat(),
             "target_temperature": target_temp,
+            # The planned start is computed from the water temperature, so it
+            # inherits whatever that reading describes.  With the pump off it is
+            # built on stagnant housing water and plans to start early.
+            "circulating": circulating,
+            "temperature_basis": temperature_basis,
         }
 
 

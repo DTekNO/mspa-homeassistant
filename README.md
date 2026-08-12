@@ -565,7 +565,30 @@ Nothing in the integration causes this and no setting avoids it; it follows from
 - Expect the miss to be *larger*, not smaller, when starting from close to the target, because heating is slowest there and a band therefore takes longer.
 - Don't read a late finish as a broken prediction. Check the `start_at` attribute against when heating actually began: if they match, the plan was simply made on a reading that was about to change.
 
-Work on estimating the temperature *between* crossings — extrapolating from the last reading change at the learned cooling rate — is measured and recorded in [ROADMAP.md](ROADMAP.md). It is not enabled: on the sessions measured so far it made the estimate worse rather than better, and it needs cold-weather data to settle. That is the only route to reducing this, and it is not yet good enough to trust.
+Estimating the temperature *between* crossings was investigated and rejected — see [ROADMAP.md](ROADMAP.md) for the measurements. The blocker is not the model but the hardware: see below.
+
+### The temperature probe is in the pump, not the tub
+
+The probe sits in the **external pump housing**. While the circulation pump runs, tub water passes over it and the reading is the tub temperature. With the pump off it is measuring a small, separate, stagnant volume of water, which loses heat faster than the insulated tub — so it reads **at or below** the real tub temperature, by an amount that depends on how long it has been standing and on the weather.
+
+This is why the reading can jump the moment circulation starts: the water did not heat, the probe started measuring different water.
+
+The bias runs in the harmless direction. A reading that is too cold asks for more heating than is needed, so the schedule starts early and finishes early rather than late. But **the tub temperature is genuinely unknown while the pump is off, and no modelling recovers it** — housings differ between spa models, so there is no offset to calibrate. The integration therefore reports the condition instead of correcting it:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `circulating` | `true` when the circulation pump is running, so the reading is tub water |
+| `temperature_basis` | `tub water`, or `stagnant water in the external pump housing` |
+
+Both appear on **Ready at** and **Heat Schedule**. Use them to gate anything that needs a trustworthy temperature:
+
+```jinja
+{{ state_attr('sensor.mspa_ready_at', 'circulating') }}
+```
+
+The sensors deliberately stay **available** when the pump is off, rather than going `unavailable`. The estimate is still useful and still errs safe, and dropping the state would break history and any automation reading it. Treat the value as a lower bound, not as wrong.
+
+> **An external floating thermometer would solve this properly**, and support for configuring one is on the roadmap. It would remove the stagnant-water problem, and with finer resolution than 0.5 °C it would also remove most of the quantization miss described above.
 
 ### The displayed start holds steady on purpose
 

@@ -625,6 +625,70 @@ at 2026-08-06T19:26Z from the weather entity; Flesland's 19:00Z hour recorded a
 11.4 m/s gust. Agreement to 1%, so a coefficient fitted on this station would have
 been directly usable — the concern was overstated.
 
+## Optional External Temperature Probe
+
+**Status: wanted, blocked on hardware availability** (owner's Ondilo ICO out of service,
+expected back late August 2026). Raised 2026-08-12.
+
+A floating thermometer in the tub measures the water the user actually cares about,
+independent of pump state. That makes it the clean answer to the pump-housing problem
+below — and because housings differ between spa models there is no per-housing offset to
+calibrate, so this is the *only* answer.
+
+It is a bigger change than "read a different entity", because most of the awkward
+machinery in the predictor exists to work around the built-in probe's limitations.
+
+**What it would let us delete or simplify**
+
+| Machinery | Why it exists | With a 0.1 °C tub probe |
+|---|---|---|
+| Band-centre anchoring | 0.5 °C quantization; true value known only at a crossing | Unnecessary, or a 0.1 °C band |
+| Phase-uncertainty guard | First crossing after a state change measures position, not rate | Unnecessary — every sample is usable |
+| Growing per-bucket window | Crossings are scarce and noisy | Plain regression on dense samples |
+| Three-bucket rate model | Too few samples to fit anything better | Fit the physical model directly |
+| `prediction_bias`, ambient factor | Empirical patches over an empirical rate model | Largely subsumed by the physical fit |
+| Schedule-start deadband | 33 min lumps per crossing | Harmless but no longer needed |
+
+The last row of that table is the real prize. Newton's law already fits the recorded
+data to 4% over 639 hours, but it cannot be used as *the* model while the input is
+quantized to 0.5 °C and only trustworthy while the pump runs. Dense tub-temperature data
+makes `dT/dt = (T_air + P/k − T_water)/τ` directly fittable, which would replace the
+buckets, the ambient factor and the bias with one physical model — the direction the
+[Learned Weather Factor](#learned-weather-factor) work already points in.
+
+It would also make the quantization miss documented in the README mostly disappear, since
+the start time would move smoothly rather than in lumps.
+
+**What it must not break, and this is the subtle part**
+
+*The spa's own thermostat still runs off the internal probe.* The device decides it is
+finished when **its** sensor reads the setpoint, so "done" is defined in internal-probe
+terms no matter what the external probe says. Predicting from the external probe alone
+could therefore promise a time the device never honours.
+
+The split that resolves it: use the external probe to know the **starting** temperature
+and to learn **rates** (both are questions about the tub), and keep the internal probe as
+the definition of **done**. During heating the pump is running and the two agree closely,
+so the mismatch is confined to planning while idle — which is exactly where the external
+probe helps and the internal one cannot.
+
+**Guards needed**
+
+- Fall back to the internal reading when the probe is unavailable, stale, or absent —
+  and expose which one is in use, alongside the existing `temperature_basis`.
+- A staleness threshold: a battery probe reporting every 15–60 min is not a substitute
+  for a 30 s poll during a heat-up.
+- Do not assume the probe is truth either. A *floating* probe reads surface water, which
+  runs warmer than the bulk while heating — the real stratification, as opposed to the
+  housing artefact that was mistaken for it.
+- Unit handling has to go through the existing temperature-unit control.
+- Rates learned from a probe must not be blended with rates learned from the internal
+  sensor; they measure different things. A probe being added or removed should be treated
+  as a new learning regime, not a continuation.
+
+**Not in scope:** sampling the tub by briefly running the pump. Considered and rejected
+2026-08-12 — the integration should not start hardware to take a measurement.
+
 ### Cooling-trajectory band position: measured, deferred (2026-08-11)
 
 **Result: keep band-centre anchoring; do not extrapolate the cooling trajectory yet.**
@@ -646,12 +710,24 @@ So the band-centre fix is vindicated against the old behaviour — wrong by 12�
 every session start — but the trajectory refinement would make it *worse*. It expects
 drift during the 55 min the water sat idle; the crossing came one poll after heater-on.
 
-**A competing explanation fits better than band position.** While the water is still
-the sensor reads its own stratum; when circulation starts it reads the warmer mixed
-bulk. The step would then be mixing, not heating, and no cooling model predicts it. The
-following band took 22.6 min against a 25–28 min run average, so the heat revealed was
-real and already in the tub. **The soft start makes this testable** — the pump now runs
-before the heater, so a mixing step should appear at *pump-on*, before any heat.
+**A competing explanation fits better than band position, and it is not
+stratification** (owner, 2026-08-12, superseding the guess recorded here first).
+**The probe sits in the external pump housing, not in the tub.** With the circulation
+pump off it measures a small separate volume of stagnant water, which loses heat faster
+than the insulated tub and so reads at or below the real tub temperature. When
+circulation resumes the reading steps up to the tub's actual temperature — not because
+the water heated, but because the probe started measuring different water.
+
+The following band took 22.6 min against a 25–28 min run average, so the heat the step
+revealed was real and already in the tub, which fits this reading exactly.
+
+This is a hardware placement fact, not a modelling gap, and it has a hard consequence:
+**with the pump off, the tub temperature is not measured and cannot be recovered.** No
+extrapolation reaches it. The bias direction is benign — a cold reading over-states the
+work remaining and starts early — so the integration reports the condition rather than
+attempting to correct it, via the `circulating` and `temperature_basis` attributes on
+Ready at and Heat Schedule. Sampling by briefly running the pump was considered and
+ruled out as out of scope.
 
 **The cooling law itself is now measured**, from 60 idle stretches ≥6 h in the hourly
 statistics, spanning a 5–30 °C water-air gap:
@@ -691,9 +767,39 @@ is near zero with the water hot — the same order as the disagreement the ancho
 just removed. **Cancelling a heat-up and restarting it reaches that regime in any
 season**, so this is not only a winter question.
 
-**Still owed before implementing:** whether the heater-on step is thermal or mixing
-(the soft start tests this), and whether the law extrapolates — nothing observes a gap
-beyond 30 °C, and the two fits diverge ~60% by gap 48. The current tub has no data
+### Closed, 2026-08-12: not implementing this
+
+The open question was whether the step at heater-on was thermal or an artefact. It is an
+artefact, and of the probe's *location* rather than of mixing: with the pump off the
+reading describes stagnant housing water, not the tub. So there is no tub trajectory in
+that data to extrapolate. Three things follow, and together they close the item:
+
+- **The ETA never needed it.** `eta = anchor_time + minutes(anchor_temp → target)` is
+  algebraically identical to `now + minutes(extrapolated_temp(now) → target)` when the
+  extrapolation uses the predictor's own local rate — verified numerically, exactly zero
+  difference until the band clamp saturates, past which the existing staleness correction
+  already takes over. The anchor *is* the extrapolation.
+- **The scheduler was the only lever**, since it works from the raw reading with no
+  anchor and so moves in 32-min lumps. But it plans while the spa is idle and the pump is
+  off, which is precisely when the reading is not the tub's. Interpolating it would have
+  smoothed the lumps at the cost of ~0.25 °C of conservatism, buying smoothness with
+  margin on a signal that is not measuring the right water.
+- **No calibration is possible.** Housings differ between spa models, so the offset
+  cannot be characterised even in principle.
+
+The measurements stay on record because they remain the best account of the cooling law,
+with one caveat now attached: **the 60 idle stretches were pump-off**, so τ ≈ 81 h and
+the stored `cool_rate` may describe the housing rather than the tub. The functional form
+(rate ∝ gap) is unaffected — both bodies lose heat to the same air — but the constant
+should be re-fitted from tub data before anything depends on its absolute value.
+
+What replaces this item is the [Optional External Temperature
+Probe](#optional-external-temperature-probe), which removes the cause rather than
+modelling around it. Shipped in the meantime: `circulating` and `temperature_basis`
+attributes, so the condition is visible without pretending it can be fixed.
+
+**Still owed if it is ever revisited:** whether the law extrapolates — nothing observes a
+gap beyond 30 °C, and the two fits diverge ~60% by gap 48. The current tub has no data
 before April 2026, so this needs a winter. See also [Learned Weather
 Factor](#learned-weather-factor), which wants the same measurements.
 

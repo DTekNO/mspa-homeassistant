@@ -965,3 +965,51 @@ class TestScheduleStartSlew:
             held, raw = self._slew(stub, 600 - i + drift, i, water)
             gap = abs((held - raw).total_seconds() / 60)
             assert gap < 60, f"held {gap:.0f} min from live at step {i}"
+
+
+class TestTemperatureBasis:
+    """The probe reads the pump housing, not the tub, whenever circulation stops.
+
+    Reported rather than corrected: a stagnant reading runs at or below tub
+    temperature, so the estimate over-states the work remaining, which is the safe
+    direction.  The attribute tells a template to treat it as a lower bound.
+    """
+
+    def _coord(self, filter_state):
+        c = MockCoordinator(
+            water_temp=33.0, target_temp=39.5,
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=9),
+            schedule_target_temp=39.5,
+        )
+        c._last_data["filter"] = filter_state
+        return c
+
+    def test_pump_running_reports_tub_water(self):
+        c = self._coord("on")
+        attrs = _heat_schedule_attrs(c)
+        assert attrs["circulating"] is True
+        assert attrs["temperature_basis"] == "tub water"
+
+    def test_pump_stopped_reports_housing(self):
+        c = self._coord("off")
+        attrs = _heat_schedule_attrs(c)
+        assert attrs["circulating"] is False
+        assert "pump housing" in attrs["temperature_basis"]
+
+    def test_missing_filter_key_is_treated_as_not_circulating(self):
+        """Absent is not the same as running — default to declaring it unknown."""
+        c = self._coord("on")
+        del c._last_data["filter"]
+        attrs = _heat_schedule_attrs(c)
+        assert attrs["circulating"] is False
+
+    def test_state_is_unaffected(self):
+        """Reported, not corrected: the estimate itself must not move."""
+        on = _heat_schedule(self._coord("on"))
+        off = _heat_schedule(self._coord("off"))
+        assert on == off, "pump state must not change the prediction"
+
+    def test_sensor_stays_available_when_not_circulating(self):
+        """An attribute, not unavailability — dropping the state breaks history."""
+        c = self._coord("off")
+        assert _heat_schedule(c) not in (None, "unavailable", "unknown")
