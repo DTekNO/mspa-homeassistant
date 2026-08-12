@@ -361,8 +361,17 @@ class TestFaultBlocksSwitchingOn:
         c = MSpaUpdateCoordinator.__new__(MSpaUpdateCoordinator)
         c._last_data = {"fault": fault, "filter": "on", "heater": "off"}
         c.api = MagicMock()
-        c.api.set_heater_state = AsyncMock(return_value={"message": "SUCCESS"})
-        c.api.set_filter_state = AsyncMock(return_value={"message": "SUCCESS"})
+        c.spa = {"heater_state": 0, "filter_state": 1 if fault != "__nopump__" else 0}
+
+        def _cmd(key):
+            def _fn(value, *_a):
+                c.spa[key] = int(value)
+                return {"message": "SUCCESS"}
+            return _fn
+
+        c.api.set_heater_state = AsyncMock(side_effect=_cmd("heater_state"))
+        c.api.set_filter_state = AsyncMock(side_effect=_cmd("filter_state"))
+        c.api.get_hot_tub_status = AsyncMock(side_effect=lambda *a, **k: dict(c.spa))
         c._enable_rapid_polling = MagicMock()
         c.async_request_refresh = AsyncMock()
         return c

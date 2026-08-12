@@ -857,8 +857,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
         F1 is the flow fault, raised when the pump starts with a physical problem in
         the way — blocked flow, debris, a clogged or worn pump, frozen pipes. It cannot
-        be cleared remotely, which is why actuation refuses rather than retrying into
-        it.
+        be cleared remotely, so switching anything on while it stands is pointless at
+        best; refusing and saying so is more useful than retrying into it.
         """
         fault = self._last_data.get("fault")
         return None if fault in (None, "", "OK") else str(fault)
@@ -1346,16 +1346,77 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         "uvc": "set_uvc_state",
     }
 
+    async def _confirm_feature(self, feature: str, want: str) -> bool:
+        """Poll the spa until `feature` really reads `want`.
+
+        A SUCCESS response says the command was accepted for delivery, not that the
+        hardware acted on it.  That distinction is the whole point of the heater start
+        sequence: the pump must actually be *running* before the heater is commanded,
+        and we must *know* the heater came on rather than assume it and count down to a
+        session that never began.
+
+        Bounded by RAPID_POLL_TIMEOUT at RAPID_SCAN_INTERVAL — the same budget the
+        background confirmation logic already allows for a change to appear, so a
+        timeout here means the same thing it means there.
+
+        Returns True on confirmation and False on timeout rather than raising, because
+        the two callers want different things from a failure: a pump that never starts
+        must stop the sequence, while an unconfirmed heater has to be reported but has
+        already been commanded.
+        """
+        raw_key = _PENDING_TO_RAW_KEY.get(feature)
+        if raw_key is None:
+            return True                          # nothing to compare against
+        want_num = 1 if want == "on" else 0
+        deadline = time.monotonic() + RAPID_POLL_TIMEOUT
+        while True:
+            try:
+                status = await self.api.get_hot_tub_status()
+            except Exception as err:              # a dropped poll is not a verdict
+                _LOGGER.debug("Confirm %s=%s: status read failed: %s",
+                              feature, want, err)
+                status = None
+            if isinstance(status, dict):
+                try:
+                    if int(status.get(raw_key)) == want_num:
+                        self._last_data[feature] = want
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if time.monotonic() >= deadline:
+                _LOGGER.warning(
+                    "Confirm %s=%s: spa did not report the change within %s s",
+                    feature, want, RAPID_POLL_TIMEOUT,
+                )
+                return False
+            await asyncio.sleep(RAPID_SCAN_INTERVAL)
+
     async def _start_pump_before_heater(self) -> bool:
         """Bring the circulation pump up before the heater is commanded.
 
-        Returns True when a pump command was actually sent, so the caller can fold
-        the filter into the rapid-poll expectations and the retry payload.
+        **Not** about avoiding an F1 fault — F1 comes from starting the pump into a
+        physical problem, and this starts the pump, so it cannot help there. The reason
+        is command acceptance:
 
-        Raises if the pump will not start — deliberately, because commanding the
-        heater is then the one thing we must not do.  Callers surface it: the
-        scheduler clears its trigger flag and retries on the next poll, and the
-        climate/switch paths report the failure to the user.
+        * A heater command issued while the pump is off can simply be **refused** by
+          the spa. The integration would then believe heating had begun when it had
+          not, and Ready at would count down to a session that never started.
+        * Asserting `heater_state` and `filter_state` in a **single payload** is
+          untested on this hardware. Two separate commands in a known order, with the
+          first acknowledged before the second is sent, keeps us on ground we have
+          actually observed.
+
+        Hence the ordering and the settle delay, rather than one combined call.
+
+        Returns True when a pump command was actually sent, so the caller can fold the
+        filter into the rapid-poll expectations.  Note it returns False — no command,
+        nothing to wait for — when the pump is already running, which is the normal
+        case for anyone following the README's advice to leave it on.
+
+        Raises if the pump will not start, deliberately, because commanding the heater
+        is then the one thing we must not do.  Callers surface it: the scheduler clears
+        its trigger flag and retries on the next poll, and the climate and switch paths
+        raise to the UI.
         """
         if self._last_data.get("filter") == "on":
             return False        # already circulating — nothing to do
@@ -1369,7 +1430,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "The spa refused to start the circulation pump, so the heater was "
                 "not switched on. Check the pump and filter, then try again."
             )
+        # SUCCESS is delivery, not action.  Wait until the spa itself reports the pump
+        # running before the heater is commanded at all.
+        if not await self._confirm_feature("filter", "on"):
+            raise HomeAssistantError(
+                f"The circulation pump did not start within {RAPID_POLL_TIMEOUT} "
+                "seconds, so the heater was not switched on. Check the pump and "
+                "filter, then try again."
+            )
         self._last_data["filter"] = "on"
+        # A short pause after confirmation, for flow to stabilise before the heater
+        # loads it.  This used to stand in for confirmation; now it is only what it
+        # says.
         if _PUMP_SETTLE_SECONDS:
             await asyncio.sleep(_PUMP_SETTLE_SECONDS)
         return True
@@ -1418,16 +1490,34 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if feature == "filter" and numerical_state == 0:
                 expected_changes["heater"] = "off"
                 raw_command["heater_state"] = 0
-            # A soft start changed the filter too.  Registering it keeps the rapid
-            # poll honest, and putting it in raw_command means a heater retry
-            # re-asserts the pump rather than resending a bare heater-on.
+            # A soft start changed the filter too, so register it to keep the rapid
+            # poll's expectations honest.
+            #
+            # Deliberately NOT added to raw_command.  That payload is resent whole as a
+            # single device command if the spa does not confirm, so including the pump
+            # here would retry `{heater_state: 1, filter_state: 1}` together — the one
+            # combination the soft start exists to avoid, and untested on this
+            # hardware.  A bare heater-on is the right retry: the pump was already
+            # commanded and acknowledged with SUCCESS before the heater was touched.
             if pump_started:
                 expected_changes["filter"] = "on"
-                raw_command["filter_state"] = 1
 
             # Enable rapid polling to quickly detect the change
             self._enable_rapid_polling(expected_changes, raw_command)
             await self.async_request_refresh()
+
+            # Close the loop on a heater start: pump on, confirmed, heater on, and now
+            # confirmed too.  Without this a refused heater command reads as success and
+            # Ready at counts down to a session that never began.  Only the heater is
+            # checked synchronously — the other features have no ordering requirement
+            # and the background retry already covers them.
+            if feature == "heater" and numerical_state == 1:
+                if not await self._confirm_feature("heater", "on"):
+                    raise HomeAssistantError(
+                        "The spa accepted the heater command but has not reported the "
+                        f"heater running within {RAPID_POLL_TIMEOUT} seconds. The pump "
+                        "is on; check the spa and try again."
+                    )
         except Exception as err:
             _LOGGER.error("Failed to set %s to %s: %s", feature, state, str(err))
             raise

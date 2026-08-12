@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from custom_components.mspa import coordinator as coordinator_mod
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+from homeassistant.exceptions import HomeAssistantError
 from custom_components.mspa.sensor import (
     _effective_heat_rate,
     _effective_cool_rate,
@@ -68,12 +69,23 @@ def _trigger_coord(**overrides) -> MSpaUpdateCoordinator:
         "bubble_level": 1,
     }
     c.api = MagicMock()
-    # send_device_command returns the parsed payload; the pump soft start checks it.
+    # A minimal spa: commands mutate raw state, get_hot_tub_status reports it.  The
+    # start sequence confirms each half by reading back, so a mock that only
+    # acknowledges commands would leave it polling until it timed out — and would prove
+    # nothing about the ordering, which is the thing under test.
     c.calls = []
-    c.api.set_heater_state = AsyncMock(
-        side_effect=lambda *a: c.calls.append("heater") or {"message": "SUCCESS"})
-    c.api.set_filter_state = AsyncMock(
-        side_effect=lambda *a: c.calls.append("filter") or {"message": "SUCCESS"})
+    c.spa = {"heater_state": 0, "filter_state": 0}
+
+    def _cmd(name, key):
+        def _fn(value, *_a):
+            c.calls.append(name)
+            c.spa[key] = int(value)
+            return {"message": "SUCCESS"}
+        return _fn
+
+    c.api.set_heater_state = AsyncMock(side_effect=_cmd("heater", "heater_state"))
+    c.api.set_filter_state = AsyncMock(side_effect=_cmd("filter", "filter_state"))
+    c.api.get_hot_tub_status = AsyncMock(side_effect=lambda *a, **k: dict(c.spa))
     c.api.set_bubble_state = AsyncMock()
     c.api.set_jet_state = AsyncMock()
     c.async_request_refresh = AsyncMock()
@@ -211,17 +223,26 @@ class TestFilterHeaterCoupling:
         assert c._pending_changes.get("heater") == "off"
 
     def test_heater_on_registers_the_pump_it_started(self):
-        """Heater-on brings the pump with it, so the filter change is real and
-        must be registered — it is not invented state.
+        """Heater-on brings the pump with it, so the filter change is real and must be
+        registered as an *expectation* — it is not invented state.
 
-        This replaces an earlier assertion that heater-on must never touch filter
-        expectations, which stopped being true when the soft start was introduced:
-        the spa refuses to heat without flow, so a bare heater-on no longer exists.
+        But it must stay out of the retry *payload*. `_pending_raw_command` is resent
+        whole as a single device command when the spa does not confirm, so including
+        the pump would retry `{heater_state: 1, filter_state: 1}` together — the one
+        combination the soft start exists to avoid, and untested on this hardware. The
+        soft start is about command acceptance and known-good sequencing, not about
+        avoiding F1 (which the pump start itself is what risks).
+
+        A bare heater-on is the correct retry: the pump was commanded and acknowledged
+        with SUCCESS before the heater was touched.
         """
         c = _trigger_coord()                       # fixture starts with filter off
         _run(c.set_feature_state("heater", "on"))
         assert c._pending_changes.get("filter") == "on"
-        assert c._pending_raw_command.get("filter_state") == 1
+        assert "filter_state" not in c._pending_raw_command, (
+            "the pump must not ride along in the heater's retry payload"
+        )
+        assert c._pending_raw_command.get("heater_state") == 1
 
     def test_heater_on_leaves_filter_alone_when_already_running(self):
         """No pump command is sent, so nothing about the filter is claimed."""
@@ -353,3 +374,66 @@ class TestPumpBeforeHeater:
         c = _trigger_coord()
         _run(c.set_feature_state("jet", "on"))
         c.api.set_filter_state.assert_not_called()
+
+
+class TestStartSequenceIsConfirmed:
+    """pump on -> confirmed -> heater on -> confirmed.
+
+    The soft start is not about avoiding an F1 fault — F1 comes from starting the pump
+    into a physical obstruction, and this starts the pump. It is about command
+    acceptance: a heater command issued with the pump off can simply be refused, and
+    asserting heater_state and filter_state in one payload is untested on this hardware.
+    So the two are separate commands in a known order, each read back before proceeding.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fast_confirm(self, monkeypatch):
+        """Collapse the confirmation budget so timeout paths do not really wait."""
+        monkeypatch.setattr(coordinator_mod, "RAPID_SCAN_INTERVAL", 0)
+        monkeypatch.setattr(coordinator_mod, "RAPID_POLL_TIMEOUT", 0)
+
+    def test_full_sequence_order(self):
+        c = _trigger_coord()
+        _run(c.set_feature_state("heater", "on"))
+        assert c.calls == ["filter", "heater"], "pump must be commanded first"
+        assert c.spa == {"heater_state": 1, "filter_state": 1}
+
+    def test_heater_is_not_commanded_until_the_pump_reads_on(self):
+        """A pump that acknowledges but never runs must stop the sequence."""
+        c = _trigger_coord()
+        c.api.set_filter_state = AsyncMock(return_value={"message": "SUCCESS"})  # no state change
+        with pytest.raises(HomeAssistantError) as err:
+            _run(c.set_feature_state("heater", "on"))
+        assert "circulation pump did not start" in str(err.value)
+        c.api.set_heater_state.assert_not_called()
+
+    def test_unconfirmed_heater_is_reported_rather_than_assumed(self):
+        """Otherwise Ready at counts down to a session that never began."""
+        c = _trigger_coord()
+        c._last_data["filter"] = "on"
+        c.spa["filter_state"] = 1
+        c.api.set_heater_state = AsyncMock(return_value={"message": "SUCCESS"})  # no state change
+        with pytest.raises(HomeAssistantError) as err:
+            _run(c.set_feature_state("heater", "on"))
+        assert "has not reported the heater running" in str(err.value)
+
+    def test_confirmation_ignores_a_dropped_status_read(self):
+        """A failed poll is not a verdict — only the deadline is."""
+        c = _trigger_coord()
+        c.spa["filter_state"] = 1
+        c.api.get_hot_tub_status = AsyncMock(side_effect=RuntimeError("network"))
+        assert _run(c._confirm_feature("filter", "on")) is False
+
+    def test_confirmation_succeeds_when_already_in_the_wanted_state(self):
+        c = _trigger_coord()
+        c.spa["filter_state"] = 1
+        assert _run(c._confirm_feature("filter", "on")) is True
+        assert c._last_data["filter"] == "on"
+
+    def test_turning_the_heater_off_is_not_confirmation_gated(self):
+        """Only the start sequence has an ordering requirement."""
+        c = _trigger_coord()
+        c.spa["heater_state"] = 1
+        c._last_data["heater"] = "on"
+        _run(c.set_feature_state("heater", "off"))
+        assert c.spa["heater_state"] == 0

@@ -669,10 +669,13 @@ exposes it. Only a user-supplied entity could.
 Two more facts worth knowing, both about winter:
 
 - **Turning the heater on starts filtration automatically.** So the device already does
-  a form of soft start. Ours adds *ordering and confirmation* — pump first, verified,
-  then heater — which is what the F1-throwing flow sensor case needed; the automatic
-  behaviour evidently was not enough for that user. Belt and braces rather than
-  essential, and worth stating honestly as such.
+  something in this area. Ours is not a duplicate of it and is *not* about avoiding F1
+  — F1 comes from starting the pump into an obstruction, and our sequence starts the
+  pump, so it cannot help there. It exists for **command acceptance**: a heater command
+  issued while the pump is off can simply be refused, leaving the integration believing
+  a session started when it did not; and asserting `heater_state` and `filter_state` in
+  a single payload is untested on this hardware. Two commands, known order, each read
+  back before proceeding.
 - **Below 1 °C water the anti-icing system heats to 3 °C by itself.** So in a hard
   frost the water can warm with the heater "off" as far as we can see. The extrapolation
   added on 2026-08-12 is already safe against this, because it takes direction from the
