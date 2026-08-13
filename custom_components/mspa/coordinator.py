@@ -42,6 +42,8 @@ from .const import (
     AMBIENT_BASELINE_DEFAULT,
     ambient_rate_factor,
     BIAS_EMA_ALPHA,
+    BIAS_ALPHA_MAX,
+    BIAS_SPAN_FULL_C,
     BIAS_CLAMP_MIN,
     BIAS_CLAMP_MAX,
     BIAS_MIN_DELTA_C,
@@ -83,6 +85,10 @@ _heat_bucket_index = bucket_index      # shared with the sensor via predictor.py
 _MIN_HEAT_RATE = 0.05             # °C/h — below this is noise / flat
 _MAX_HEAT_RATE = 3.0              # °C/h — above this is an outlier
 _EMA_ALPHA = 0.25                 # smoothing factor (lower = slower to adapt)
+# Span, in °C, at which a growing-window sample earns the full _EMA_ALPHA. Shorter
+# spans earn proportionally less, because they measure proportionally less of the
+# bucket they are updating.
+_BUCKET_SPAN_FULL_C = 4.0
 
 # A gap this large between water and setpoint defines a genuine heating
 # session, as opposed to thermostat cycling near the setpoint (±0.5–1 °C).
@@ -240,6 +246,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.computed_heat_rate: float | None = None  # °C/h, None until enough data
         self._rate_last_temp: float | None = None     # °C at the window anchor
         self._rate_prev_temp: float | None = None     # °C at the previous poll
+        # The bucket's value when the current growing window opened.  Nested samples
+        # recompute from this rather than compounding on each other — see the bucket
+        # write in _track_heating_rate.
+        self._bucket_base_bucket: int | None = None
+        self._bucket_base_value: float | None = None
         self._rate_last_time: float | None = None     # monotonic seconds at last sample
         # True while the rate anchor is phase-uncertain: the temperature reports
         # in 0.5 °C bands, so at heater-on the water sits at an unknown position
@@ -380,7 +391,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return None
         return ratio
 
-    def _apply_bias_sample(self, ratio: float) -> None:
+    def _apply_bias_sample(self, ratio: float, span_c: float | None = None) -> None:
         """Fold one completed session's accuracy ratio into prediction_bias.
 
         An incremental EMA, so the bias is monotone with respect to evidence: a
@@ -388,8 +399,26 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         previous implementation recomputed a weather-weighted mean over the last
         10 sessions on every call, which could move the bias *up* after a session
         that should have lowered it — and changed it on restart with no new data.
+
+        **The step is weighted by how much the session actually measured.** The
+        ratio's precision is set by the ±0.25 °C quantisation at each end of the
+        span, so a 0.5 °C top-up determines it to about ±50% while a full cold
+        start determines it to a few percent. A fixed step treats those as equal
+        evidence, which is why a bias of 0.971 survived three consecutive sessions
+        whose raw estimates were accurate to +2, −2 and −0 minutes: it was closing
+        only 30% of the gap each time and costing 60, 25 and 14 minutes on the way.
+
+        A full-span session now corrects it almost completely in one run, which is
+        the point — the bias is a residual on a rate model that currently predicts
+        to better than 0.1%, so a precisely measured residual should be believed.
+        Extreme ratios are still bounded by BIAS_CLAMP_MIN/MAX rather than by the
+        step size, so weighting up does not widen the worst case.
         """
-        updated = self.prediction_bias + BIAS_EMA_ALPHA * (ratio - self.prediction_bias)
+        alpha = BIAS_EMA_ALPHA
+        if span_c:
+            alpha = BIAS_ALPHA_MAX * min(1.0, abs(span_c) / BIAS_SPAN_FULL_C)
+            alpha = max(alpha, BIAS_EMA_ALPHA)      # never slower than before
+        updated = self.prediction_bias + alpha * (ratio - self.prediction_bias)
         self.prediction_bias = max(BIAS_CLAMP_MIN, min(BIAS_CLAMP_MAX, updated))
 
     def _seed_prediction_bias_from_history(self) -> None:
@@ -542,7 +571,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self._prediction = None
                 ratio = self._bias_ratio(result)
                 if ratio is not None:
-                    self._apply_bias_sample(ratio)
+                    self._apply_bias_sample(
+                        ratio,
+                        span_c=(result.get("target_temp", 0)
+                                - result.get("start_temp", 0)),
+                    )
                 _LOGGER.info(
                     "PREDICTION_RESULT: %.1f°C → %.1f°C | estimated %.0f min, actual %.0f min | error %+.0f min (%+.1f%%) | bias=%.3f",
                     result["start_temp"], result["target_temp"],
@@ -1109,9 +1142,31 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # Also update the temperature bucket for this observation.
                         # The window anchor is the *start* temperature of the span.
                         _bi = anchor_bucket
-                        _bp = self.heat_rate_buckets[_bi]
+                        # Weight the sample by how much of the bucket it measured, and
+                        # recompute from the value the window started at.
+                        #
+                        # Samples from a growing window are nested — each shares most
+                        # of its data with the last — so feeding every one into an EMA
+                        # at full weight compounds the same evidence repeatedly, and
+                        # weights the shortest, least representative span exactly as
+                        # heavily as the longest. Measured on 2026-08-12: the first
+                        # mid-bucket sample covered 0.5 °C of a 7 °C bucket and moved
+                        # its rate 9.9% (0.93 → 1.02), while the tenth covered 5.0 °C,
+                        # had converged on the truth, and moved it 1.3%. The bucket
+                        # finished at 0.988 against a realised 0.947, and every nudge
+                        # in between shifted the ETA — most of the residual wobble.
+                        #
+                        # Recomputing from `_bucket_base_value` makes the update
+                        # idempotent with respect to nesting: ten nested samples land
+                        # where the last one alone would.
+                        if self._bucket_base_bucket != _bi:
+                            self._bucket_base_bucket = _bi
+                            self._bucket_base_value = self.heat_rate_buckets[_bi]
+                        _bp = self._bucket_base_value
+                        _span = abs(curr_temp - self._rate_last_temp)
+                        _alpha = _EMA_ALPHA * min(1.0, _span / _BUCKET_SPAN_FULL_C)
                         self.heat_rate_buckets[_bi] = (
-                            _EMA_ALPHA * rate + (1 - _EMA_ALPHA) * _bp
+                            _alpha * rate + (1 - _alpha) * _bp
                         ) if _bp is not None else rate
                         self._session_fresh_buckets.add(_bi)
                         # Track the baseline outdoor temperature under which
@@ -1169,6 +1224,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Heater off/preheat — reset anchor so next on-cycle starts fresh
             # (and the next first crossing is treated as phase-uncertain again).
             self._rate_last_temp = None
+            self._bucket_base_bucket = None      # heater off — next window re-bases
             self._rate_last_time = None
             self._rate_prev_temp = None
             self._rate_first_step = False

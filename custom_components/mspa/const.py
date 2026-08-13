@@ -103,6 +103,12 @@ DEFAULT_SCHEDULE_LOOKAHEAD_DAYS = 5
 BIAS_EMA_ALPHA = 0.3     # newest session weight; last ~3 sessions ≈ 2/3 of total
 BIAS_CLAMP_MIN = 0.9     # the segmented rate model does the real work — cap the
 BIAS_CLAMP_MAX = 1.1     # residual tightly so it cannot double-correct
+# The bias step scales with the span a session actually measured, because that is
+# what sets the ratio's precision: ±0.25 °C of quantisation at each end is a few
+# percent over a full cold start and ~50% over a 0.5 °C top-up.  A full-span run
+# therefore corrects the bias in one session instead of five.
+BIAS_ALPHA_MAX = 0.8     # weight given to a session spanning BIAS_SPAN_FULL_C
+BIAS_SPAN_FULL_C = 8.0   # °C of heating that counts as a fully determined ratio
 BIAS_MIN_DELTA_C = 3.0   # short runs carry too much variance to learn from
 BIAS_RATIO_MIN = 0.3     # reject outlier ratios (e.g. water added mid-session)
 BIAS_RATIO_MAX = 3.0

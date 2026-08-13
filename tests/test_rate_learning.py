@@ -23,6 +23,8 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     c._rate_last_temp = None
     c._rate_last_time = None
     c._rate_prev_temp = None
+    c._bucket_base_bucket = None
+    c._bucket_base_value = None
     c._rate_first_step = False
     c._session_scalar = 1.0
     c._session_scalar_bucket = None
@@ -246,10 +248,49 @@ class TestGrowingWindow:
         c._track_heating_rate(34.5, 3, 55 * _MIN)             # window: 1.0 °C / 0.75 h = 1.333
         # per-step would have been 0.5 °C / 0.25 h = 2.0 °C/h, pulling the bucket
         # far higher; the window keeps it near the true ~1.2
-        expected = after_first + 0.25 * (1.0 / 0.75 - after_first)
+        #
+        # The update recomputes from the value the window opened at (1.20) rather than
+        # from `after_first`, and weights by the span measured — so nested samples do
+        # not compound. Before that change this read
+        # `after_first + 0.25 * (rate - after_first)`, which double-counted the first
+        # 0.5 °C every time a longer span arrived.
+        alpha = 0.25 * (1.0 / 4.0)                            # 1.0 °C of a 4 °C reference
+        expected = 1.20 + alpha * (1.0 / 0.75 - 1.20)
         assert abs(c.heat_rate_buckets[1] - expected) < 1e-6
         per_step = after_first + 0.25 * (2.0 - after_first)
         assert c.heat_rate_buckets[1] < per_step - 0.05, "looks like per-step sampling"
+
+    def test_nested_samples_do_not_compound(self):
+        """Ten nested samples must land where the last one alone would.
+
+        The growing window re-measures the same span, so each sample carries almost no
+        new evidence. Feeding them all into an EMA at full weight moved the 2026-08-12
+        mid bucket 0.93 → 1.062 → 0.988 on a realised rate of 0.947, and shifted the
+        ETA on every step.
+        """
+        c = _coord(heat_rate_buckets=[None, 1.00, None], computed_heat_rate=1.00)
+        c._track_heating_rate(31.0, 3, 0.0)
+        c._track_heating_rate(31.5, 3, 10 * _MIN)             # anchor
+        for i, temp in enumerate([32.0, 32.5, 33.0, 33.5, 34.0], start=1):
+            c._track_heating_rate(temp, 3, (10 + 30 * i) * _MIN)
+        many = c.heat_rate_buckets[1]
+
+        d = _coord(heat_rate_buckets=[None, 1.00, None], computed_heat_rate=1.00)
+        d._track_heating_rate(31.0, 3, 0.0)
+        d._track_heating_rate(31.5, 3, 10 * _MIN)
+        d._track_heating_rate(34.0, 3, 160 * _MIN)            # one sample, same span
+        once = d.heat_rate_buckets[1]
+        assert abs(many - once) < 1e-9, (
+            f"nested samples compounded: {many} via steps vs {once} in one")
+
+    def test_a_short_span_moves_the_bucket_only_slightly(self):
+        """0.5 °C of a 7 °C bucket must not move its rate by 10%."""
+        c = _coord(heat_rate_buckets=[None, 0.93, None], computed_heat_rate=0.93)
+        c._track_heating_rate(31.0, 3, 0.0)
+        c._track_heating_rate(31.5, 3, 10 * _MIN)
+        c._track_heating_rate(32.0, 3, 33 * _MIN)             # 0.5 °C at ~1.3 °C/h
+        moved = abs(c.heat_rate_buckets[1] - 0.93) / 0.93
+        assert moved < 0.02, f"a 0.5 °C span moved the whole bucket {moved:.1%}"
 
     def test_window_closes_at_a_bucket_boundary(self):
         """Each bucket models a different loss regime and must be measured alone."""
