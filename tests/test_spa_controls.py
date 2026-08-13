@@ -10,7 +10,7 @@ Run with: python -m pytest tests/test_spa_controls.py -v
 """
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from custom_components.mspa import coordinator as coordinator_mod
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
@@ -479,3 +479,46 @@ class TestSwitchCallerTracing:
         sw = self._switch(context=MagicMock(user_id=None, parent_id="p1"))
         sw.hass.states.async_all = MagicMock(side_effect=RuntimeError("boom"))
         assert "p1" in sw._describe_caller()
+
+
+class TestExternalChangeVisibility:
+    """Every control key that moves must be reported, commanded or not.
+
+    Both blind spots here made the 2026-08-12 filter-off untraceable: detection was
+    skipped entirely while a command was pending — exactly when a cascade happens —
+    and it stopped after the first changed key, which is precisely a cascade's
+    signature (heater and filter moving together).
+    """
+
+    def _run_detection(self, snapshot, data, pending=None):
+        """Drive the Phase-4 detection block and collect what it logged."""
+        c = _trigger_coord()
+        c._last_snapshot = snapshot
+        c._pending_changes = pending or {}
+        c._external_change_until = None
+        c._last_state_change_time = 0
+        c._last_heat_state = None
+        c._last_data = dict(data)
+        seen = []
+        with patch.object(coordinator_mod._LOGGER, "info",
+                          side_effect=lambda msg, *a: seen.append(msg % a if a else msg)):
+            _run(c._check_adaptive_polling(data))
+        return [m for m in seen if "External change" in m]
+
+    def test_both_keys_of_a_cascade_are_reported(self):
+        msgs = self._run_detection(
+            {"heater": "on", "filter": "on"}, {"heater": "off", "filter": "off"})
+        assert any("heater" in m for m in msgs), msgs
+        assert any("filter" in m for m in msgs), f"cascade's second key lost: {msgs}"
+
+    def test_changes_are_reported_even_while_a_command_is_pending(self):
+        """A cascade arrives inside the confirmation window, not outside it."""
+        msgs = self._run_detection(
+            {"heater": "on", "filter": "on"}, {"heater": "off", "filter": "off"},
+            pending={"bubble": "on"})
+        assert len(msgs) == 2, f"suppressed by an unrelated pending change: {msgs}"
+
+    def test_a_change_we_commanded_is_not_called_external(self):
+        msgs = self._run_detection(
+            {"filter": "on"}, {"filter": "off"}, pending={"filter": "off"})
+        assert msgs == [], f"our own command reported as external: {msgs}"

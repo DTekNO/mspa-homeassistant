@@ -108,6 +108,9 @@ _LATCH_COOL_OFF = 3.0             # °C
 # (0 = off, 2 = preheat).  Rate sampling and prediction tracking both key off
 # this so they start and stop on the same signal.
 _HEAT_STATE_FULL = 3
+# Observed values for the `heat_state` field.  4 is the resting state, confirmed by
+# correlating a whole recorded cool-down against it; 2 precedes 3 on every heat-up.
+_HEAT_STATE_NAMES = {0: "off", 1: "idle", 2: "preheat", 3: "heating", 4: "standby"}
 
 # Reported water temperature is quantised to this step, so a reading is only ever
 # accurate to half of it.
@@ -1720,6 +1723,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         current_time = time.monotonic()
 
+        # Keys confirmed on *this* poll.  Phase 1 removes them from _pending_changes,
+        # so without this Phase 4 would see a change it can no longer attribute and
+        # report every commanded change as external.
+        just_confirmed: set[str] = set()
+
         # --- Phase 1: Handle pending command confirmations (rapid tier) ---
         if self._pending_changes:
             confirmed = []
@@ -1728,6 +1736,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("Pending change confirmed: %s = %s", key, expected_value)
                     confirmed.append(key)
 
+            just_confirmed.update(confirmed)
             for key in confirmed:
                 del self._pending_changes[key]
                 raw_key = _PENDING_TO_RAW_KEY.get(key)
@@ -1773,23 +1782,48 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Compare control keys against last snapshot; if something changed that
         # we didn't command, someone used the physical panel or MSpa Link app.
         _CONTROL_KEYS = ("heater", "filter", "bubble", "jet", "ozone", "uvc", "target_temperature")
-        if self._last_snapshot and not self._pending_changes:
+        if self._last_snapshot:
+            # Report *every* key that moved, and whether we asked for it.
+            #
+            # Two blind spots made the 2026-08-12 filter-off untraceable. This ran only
+            # when nothing was pending, so any change arriving inside a command's
+            # confirmation window was invisible — exactly when a cascade happens. And
+            # it broke after the first key, so a heater and filter moving together
+            # reported only the heater, which is precisely the cascade's signature.
+            #
+            # Changes we did ask for are logged too, at debug, so the sequence is
+            # complete: reading "commanded" next to "not commanded by HA" is what
+            # separates our own cascade from the unit acting on its own.
+            unexpected = False
             for key in _CONTROL_KEYS:
                 old_val = self._last_snapshot.get(key)
                 new_val = data.get(key)
-                if old_val is not None and new_val is not None and old_val != new_val:
-                    _LOGGER.info(
-                        "External change detected: %s changed %s → %s (not commanded by HA)",
-                        key, old_val, new_val,
-                    )
-                    self._external_change_until = time.time() + EXTERNAL_CHANGE_TIMEOUT
-                    self._last_state_change_time = current_time
-                    break
+                if old_val is None or new_val is None or old_val == new_val:
+                    continue
+                if key in just_confirmed or self._pending_changes.get(key) == new_val:
+                    _LOGGER.debug("Confirmed change: %s %s → %s (commanded)",
+                                  key, old_val, new_val)
+                    continue
+                _LOGGER.info(
+                    "External change detected: %s changed %s → %s (not commanded by HA)",
+                    key, old_val, new_val,
+                )
+                unexpected = True
+            if unexpected:
+                self._external_change_until = time.time() + EXTERNAL_CHANGE_TIMEOUT
+                self._last_state_change_time = current_time
 
         # --- Phase 5: Track heat state transitions for logging ---
         current_heat_state = data.get("heat_state")
         if self._last_heat_state != current_heat_state:
-            _LOGGER.debug("Heat state changed: %s -> %s", self._last_heat_state, current_heat_state)
+            # INFO: infrequent, and it is the spa telling us what it is doing.  These
+            # transitions were the most informative lines in the 2026-08-12
+            # investigation and were only available at debug, which was not on.
+            _LOGGER.info(
+                "Heat state: %s → %s",
+                _HEAT_STATE_NAMES.get(self._last_heat_state, self._last_heat_state),
+                _HEAT_STATE_NAMES.get(current_heat_state, current_heat_state),
+            )
             self._last_heat_state = current_heat_state
             self._last_state_change_time = current_time
 
