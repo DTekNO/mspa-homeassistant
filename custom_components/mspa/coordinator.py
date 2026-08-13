@@ -875,8 +875,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return transformed_data
 
         except Exception as err:
-            _LOGGER.error("Error updating MSpa data: %s", str(err))
-            raise UpdateFailed(f"Update failed: {str(err)}")
+            # DEBUG, not ERROR.  DataUpdateCoordinator already logs
+            # "Error fetching mspa data: <this same message>" at ERROR when an
+            # UpdateFailed reaches it, so this line duplicated it in the same
+            # millisecond — visible on every network blip in the logs.
+            #
+            # It was also worse than redundant on a sustained outage: HA logs the first
+            # failure and then stays quiet until the next success, while this fired on
+            # every poll.  Kept at debug because it is raised from a different place
+            # than HA reports, which is occasionally useful when tracing.
+            _LOGGER.debug("Update failed: %s", err, exc_info=True)
+            raise UpdateFailed(f"Update failed: {err}") from err
 
     def _update_temp_anchor(self, new_temp, new_target) -> None:
         """Re-anchor when the reading or target changes, at the band centre.
