@@ -1553,7 +1553,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         try:
             if state.lower() not in ["on", "off"]:
                 raise ValueError("State must be 'on' or 'off'")
-            numerical_state = 1 if state.lower() == "on" else 0
+            # Normalise once and use it everywhere.  The expectation below used to keep
+            # the caller's original casing while the poll reports lowercase, so
+            # `mspa.set_filter` with `state: "OFF"` sent the command correctly and then
+            # waited for a value that could never arrive — producing a "Spa did not
+            # confirm" warning for a command the spa had actually accepted.
+            state = state.lower()
+            numerical_state = 1 if state == "on" else 0
 
             # Refuse to switch things *on* while the spa reports a fault, and say why
             # in the UI rather than only in the log.  Switching *off* stays allowed:
@@ -1579,7 +1585,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 await api_method(numerical_state, bubble_level)
                 raw_command = {"bubble_state": numerical_state, "bubble_level": bubble_level}
             else:
-                await api_method(numerical_state)
+                response = await api_method(numerical_state)
+                # The response was previously discarded, so a command the spa *refused*
+                # still armed the confirmation wait and surfaced 15 s later as "Spa did
+                # not confirm" — indistinguishable from a command that was accepted and
+                # simply slow. Say which it was. The retry still runs, since a refusal
+                # can be transient.
+                if not (isinstance(response, dict)
+                        and response.get("message") == "SUCCESS"):
+                    _LOGGER.warning(
+                        "Command: spa did not accept %s → %s (response: %r) — the "
+                        "confirmation wait that follows may never be satisfied",
+                        feature, state, response,
+                    )
                 raw_key = _PENDING_TO_RAW_KEY.get(feature)
                 raw_command = {raw_key: numerical_state} if raw_key else {}
 

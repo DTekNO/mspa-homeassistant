@@ -522,3 +522,60 @@ class TestExternalChangeVisibility:
         msgs = self._run_detection(
             {"filter": "on"}, {"filter": "off"}, pending={"filter": "off"})
         assert msgs == [], f"our own command reported as external: {msgs}"
+
+
+class TestConfirmationWaitIsSatisfiable:
+    """An armed confirmation wait must be capable of being satisfied.
+
+    Reviewed 2026-08-13 after asking whether the `{'filter': 'off'}` wait seen on
+    2026-08-12 could have been spurious — armed for a command never actually sent.
+    It could not: the API call is awaited *before* _enable_rapid_polling arms the
+    wait, and the only other writer of a `filter` expectation sets it to "on".
+    But two ways were found for the wait to be armed and then never satisfiable.
+    """
+
+    def test_expectation_is_normalised_to_match_the_polled_value(self):
+        """`state: "OFF"` via mspa.set_filter sent the command but waited forever.
+
+        The poll reports lowercase, and the expectation kept the caller's casing.
+        """
+        c = _trigger_coord()
+        c.spa["filter_state"] = 1
+        c._last_data["filter"] = "on"
+        _run(c.set_feature_state("filter", "OFF"))
+        assert c._pending_changes.get("filter") == "off", (
+            f"unsatisfiable expectation: {c._pending_changes}")
+
+    def test_uppercase_still_sends_the_right_command(self):
+        c = _trigger_coord()
+        c._last_data["filter"] = "on"
+        _run(c.set_feature_state("filter", "OFF"))
+        assert c.spa["filter_state"] == 0
+
+    def test_a_refused_command_is_reported_before_the_wait(self):
+        """Otherwise it surfaces 15 s later as 'did not confirm', which reads as slow
+        rather than as refused."""
+        c = _trigger_coord()
+        c.api.set_filter_state = AsyncMock(return_value={"message": "DENIED"})
+        seen = []
+        with patch.object(coordinator_mod._LOGGER, "warning",
+                          side_effect=lambda m, *a: seen.append(m % a if a else m)):
+            _run(c.set_feature_state("filter", "off"))
+        assert any("did not accept" in m for m in seen), seen
+
+    def test_an_accepted_command_is_not_reported_as_refused(self):
+        c = _trigger_coord()
+        seen = []
+        with patch.object(coordinator_mod._LOGGER, "warning",
+                          side_effect=lambda m, *a: seen.append(m % a if a else m)):
+            _run(c.set_feature_state("filter", "off"))
+        assert not any("did not accept" in m for m in seen), seen
+
+    def test_the_wait_is_armed_only_after_the_command_is_dispatched(self):
+        """A failed dispatch must leave no expectation behind to time out on."""
+        c = _trigger_coord()
+        c.api.set_filter_state = AsyncMock(side_effect=RuntimeError("network"))
+        with pytest.raises(RuntimeError):
+            _run(c.set_feature_state("filter", "off"))
+        assert c._pending_changes == {}, (
+            f"armed a wait for a command that was never sent: {c._pending_changes}")
