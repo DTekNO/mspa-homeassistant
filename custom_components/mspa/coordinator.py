@@ -1541,7 +1541,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
     async def set_feature_state(self, feature: str, state: str) -> None:
         """Set a feature state using the API map."""
-        _LOGGER.debug(f"Setting MSpa feature {feature} to {state}")
+        # INFO, not DEBUG: these are rare, consequential, and externally triggered.
+        # On 2026-08-12 a `filter: off` landed 2.5 min before a scheduled heat start
+        # and the only evidence was the *retry* warning 15 s later — the command
+        # itself was invisible, so there was nothing to correlate against.
+        _LOGGER.info("Command: set %s → %s (currently %s)",
+                     feature, state, self._last_data.get(feature))
         try:
             if state.lower() not in ["on", "off"]:
                 raise ValueError("State must be 'on' or 'off'")

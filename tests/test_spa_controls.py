@@ -437,3 +437,45 @@ class TestStartSequenceIsConfirmed:
         c._last_data["heater"] = "on"
         _run(c.set_feature_state("heater", "off"))
         assert c.spa["heater_state"] == 0
+
+
+class TestSwitchCallerTracing:
+    """A consequential command must record where it came from.
+
+    Added after a `filter: off` arrived 2.5 min before a scheduled heat start on
+    2026-08-12 with nothing in the log to attribute it: the command itself was logged
+    at DEBUG, so the only evidence was the retry warning 15 s later.
+    """
+
+    def _switch(self, feature="filter", context=None, states=()):
+        from custom_components.mspa.switch import MSpaFeatureSwitch
+        sw = MSpaFeatureSwitch.__new__(MSpaFeatureSwitch)
+        sw.feature = feature
+        sw._context = context
+        sw.hass = MagicMock()
+        sw.hass.states.async_all = MagicMock(return_value=list(states))
+        return sw
+
+    def test_reports_the_user_for_a_ui_action(self):
+        sw = self._switch(context=MagicMock(user_id="abc123", parent_id=None))
+        assert "abc123" in sw._describe_caller()
+
+    def test_resolves_a_parent_context_to_an_entity(self):
+        st = MagicMock(entity_id="automation.spa_off")
+        st.context.id = "p1"
+        sw = self._switch(context=MagicMock(user_id=None, parent_id="p1"), states=[st])
+        assert "automation.spa_off" in sw._describe_caller()
+
+    def test_reports_the_raw_parent_when_nothing_matches(self):
+        """Still useful: the id can be matched against a trace by hand."""
+        sw = self._switch(context=MagicMock(user_id=None, parent_id="p9"), states=[])
+        assert "p9" in sw._describe_caller()
+
+    def test_no_context_is_reported_as_internal(self):
+        assert "internal" in self._switch(context=None)._describe_caller()
+
+    def test_a_broken_state_machine_does_not_break_the_command(self):
+        """Tracing is diagnostics; it must never be the reason a command fails."""
+        sw = self._switch(context=MagicMock(user_id=None, parent_id="p1"))
+        sw.hass.states.async_all = MagicMock(side_effect=RuntimeError("boom"))
+        assert "p1" in sw._describe_caller()
