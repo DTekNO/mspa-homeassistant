@@ -1696,8 +1696,23 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
     # Generic service handler for features
     async def handle_feature_service(self, service: ServiceCall) -> None:
+        """Handle mspa.set_<feature>, and record who called it.
+
+        This is the attribution hole the 2026-08-12 investigation fell into. A caller
+        using `mspa.set_filter` references neither the switch entity nor the climate
+        entity, so searching automations and scripts for those entities finds nothing —
+        and the switch-level caller tracing never fires either, because no switch is
+        involved. The ServiceCall carries the context directly, which is better
+        evidence than the entity's copy of it.
+        """
         feature = service.service.replace("set_", "")
         state = service.data.get(ATTR_STATE)
+        ctx = getattr(service, "context", None)
+        _LOGGER.info(
+            "Service mspa.%s called: %s → %s (user_id=%s, parent_id=%s)",
+            service.service, feature, state,
+            getattr(ctx, "user_id", None), getattr(ctx, "parent_id", None),
+        )
         await self.set_feature_state(feature, state)
 
     # Register these as service handlers in __init__.py:
