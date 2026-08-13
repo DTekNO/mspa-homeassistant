@@ -1165,3 +1165,51 @@ class TestStartTimeRampsInsteadOfLumping:
         starts = [self._start_minutes(m) for m in range(0, 84, 20)]
         steps = [abs(b - a) for a, b in zip(starts, starts[1:])]
         assert max(steps) < 20, f"still lumpy: {steps}"
+
+
+class TestWarmingWithTheHeaterOff:
+    """Solar gain must not be extrapolated at the heater's rate.
+
+    Raised 2026-08-13: the spa occasionally warms from sun or conducted heat with the
+    heater off. `rising` is then True from an observed crossing, but the only upward
+    rate available is the heater's — two to five times the real gain — so the clamp
+    saturated early and pinned the estimate a quarter-band above the reading. That is
+    ~19 min of optimism in the direction that starts a session late, and it reversed
+    sign at a band boundary.
+    """
+
+    def _coord(self, *, rising, heating):
+        c = MockCoordinator(
+            water_temp=30.0, target_temp=39.5, cool_rate=0.30,
+            anchor_offset_minutes=-45.0,
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=9),
+            schedule_target_temp=39.5,
+        )
+        c.temp_anchor_temp = 30.25 if rising else 29.75
+        c.temp_anchor_rising = rising
+        c.circulating_since = c.temp_anchor_time - timedelta(hours=2)
+        c.heating_since = (c.temp_anchor_time - timedelta(hours=1)) if heating else None
+        return c
+
+    def test_warming_with_the_heater_off_falls_back_to_the_reading(self):
+        c = self._coord(rising=True, heating=False)
+        assert c.scheduling_temp() == pytest.approx(30.0)
+
+    def test_warming_while_heating_still_extrapolates(self):
+        """The heater's rate is the right model when the heater is what is doing it."""
+        c = self._coord(rising=True, heating=True)
+        est = c.scheduling_temp()
+        assert est > 30.25, "should have climbed above the anchor"
+
+    def test_cooling_with_the_heater_off_still_extrapolates(self):
+        """The ordinary case, and the one the feature exists for."""
+        c = self._coord(rising=False, heating=False)
+        est = c.scheduling_temp()
+        assert est < 29.75, "should have drifted below the anchor"
+
+    def test_no_optimism_beyond_the_reading_when_warming_unheated(self):
+        """The estimate must never claim the water is warmer than reported."""
+        for minutes in (5, 30, 120, 600):
+            c = self._coord(rising=True, heating=False)
+            c.temp_anchor_time = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+            assert c.scheduling_temp() <= 30.0 + 1e-9, f"optimistic after {minutes} min"

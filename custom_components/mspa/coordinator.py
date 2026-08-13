@@ -992,6 +992,26 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if self.heating_since is not None and self.heating_since > anc_t:
             return reading
 
+        # Warming with the heater off has no rate model, so do not invent one.
+        #
+        # The rise is real — sun on the tub, or heat conducted into it — but its rate
+        # is nothing like the heater's. Extrapolating at bucket_rate (0.79-1.10 °C/h)
+        # against a solar gain of perhaps 0.2-0.5 °C/h saturates the clamp two to five
+        # times too early and then sits pinned a quarter-band above the reading. That
+        # is ~19 min of false optimism at 0.8 °C/h, and it starts the session *late*,
+        # which is the unsafe direction.
+        #
+        # It also flips sign at a band boundary: alternating crossings would swing the
+        # estimate ±0.25 °C on mismatched slopes — up at the heater's rate, down at the
+        # cooling rate. Bounded by the clamp, so never a runaway, but erratic.
+        #
+        # Cool-rate *learning* is already safe here (it only samples a falling reading),
+        # so nothing else needs guarding. Falling back to the reported reading is the
+        # pre-extrapolation behaviour, and conservative: it under-states the water.
+
+        if rising and self.heating_since is None:
+            return reading
+
         rate = (self._predictor().bucket_rate(anc_temp) if rising
                 else self.computed_cool_rate)
         elapsed_h = (datetime.now(timezone.utc) - anc_t).total_seconds() / 3600.0
