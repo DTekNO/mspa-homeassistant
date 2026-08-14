@@ -81,10 +81,8 @@ class Session:
 def load_crossings() -> list[tuple[datetime, float]]:
     """Distinct reported temperatures from the recorder exports, in time order."""
     rows = set()
-    for name in ("history.csv", "history (1).csv", "history-full-heat-period.csv"):
-        path = ROOT / name
-        if not path.exists():
-            continue
+    # Every history export in the repo — they overlap, and duplicates collapse below.
+    for path in sorted(ROOT.glob("history*.csv")):
         for row in csv.DictReader(path.open()):
             try:
                 value = float(row["state"])
@@ -163,8 +161,8 @@ def score(s: Session, series):
 
 # ─────────────────────────────────── report ──────────────────────────────────
 
-# What the integration actually displayed on session B, read from the log.
-SHIPPED_B = (21.4, 43.8)
+# What the integration actually displayed on session C, read from the log.
+SHIPPED_C = (21.4, 43.8)
 
 
 def main() -> None:
@@ -178,7 +176,9 @@ def main() -> None:
     sessions = [
         Session("A  06 Aug  22.0 → 39.5", (1.11, 1.03, 1.01), 13.7, 14.011,
                 22.0, 39.5, 992.1, 994.4, "2026-08-06T19:26:24+00:00"),
-        Session("B  12 Aug  31.0 → 39.5", (1.11, 0.93, 0.77), 17.5, 13.114,
+        Session("B  10 Aug  29.0 → 39.5", (1.03, 0.99, 0.75), 14.1, 14.398,
+                29.0, 39.5, 690.5, 688.4, "2026-08-10T13:03:21+00:00"),
+        Session("C  12 Aug  31.0 → 39.5", (1.11, 0.93, 0.77), 17.5, 13.114,
                 31.0, 39.5, 512.2, 511.9, "2026-08-12T14:57:18+00:00"),
     ]
     for sess, run in zip(sessions, runs):
@@ -209,11 +209,26 @@ def main() -> None:
         for label, ser in rows:
             mean, worst = score(sess, ser)
             print(f"   {label:<34}{mean:>10.1f} m{worst:>8.1f} m")
-        if sess.name.startswith("B"):
+        if sess.name.startswith("C"):
             print(f"   {'what shipped (measured)':<34}"
-                  f"{SHIPPED_B[0]:>10.1f} m{SHIPPED_B[1]:>8.1f} m")
+                  f"{SHIPPED_C[0]:>10.1f} m{SHIPPED_C[1]:>8.1f} m")
         print()
 
+    print("=" * 78)
+    print("ACROSS ALL COMPLETE SESSIONS")
+    print("=" * 78)
+    labels = ["hold the opening estimate", "ratio, settle 90 min AND 1.5 °C",
+              "ratio, settle 60 min AND 1.0 °C", "ratio, no settle at all"]
+    makers = [lambda x: strategy_hold(x),
+              lambda x: strategy_ratio(x, 90, 1.5),
+              lambda x: strategy_ratio(x, 60, 1.0),
+              lambda x: strategy_ratio(x, 0, 0)]
+    print(f"{'strategy':<34}{'mean of means':>15}{'worst anywhere':>16}")
+    for label, make in zip(labels, makers):
+        sc = [score(x, make(x)) for x in sessions]
+        print(f"{label:<34}{sum(m for m, _ in sc)/len(sc):>13.1f} m"
+              f"{max(w for _, w in sc):>14.1f} m")
+    print()
     print("Scored at every crossing, against the moment the target was first reached.")
     print("A strategy that never revises has one error repeated, so its mean and worst")
     print("coincide — that is not a bug in the scoring, it is what 'never revises' means.")
