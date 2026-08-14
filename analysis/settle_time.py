@@ -152,6 +152,85 @@ def strategy_ratio(s: Session, guard_minutes=0.0, guard_degrees=0.0):
     return out
 
 
+def strategy_replan(s: Session, every_minutes=0.0):
+    """Re-run the *frozen* plan from wherever the water actually is.
+
+    eta = time of the latest crossing + the plan's remaining time from that
+    temperature.  Rates stay as they were at session start, so this is not the shipped
+    behaviour — that mutates the rates as it goes.  It is anchored on a crossing rather
+    than on "now" because between crossings the temperature is unchanged, so recomputing
+    from now would push the estimate out at one minute per minute.
+
+    `every_minutes` throttles it: a replan only lands if that long has passed since the
+    last one, which is the "replan hourly" idea.  It changes how often the estimate
+    moves, not how wrong it is — the error depends on where you recompute from, not how
+    often.
+    """
+    out, last_at, held = [], None, s.start_time + timedelta(minutes=s.logged_raw)
+    for t, temp in s.crossings:
+        due = last_at is None or (t - last_at).total_seconds() / 60.0 >= every_minutes
+        if due and temp > s.start_temp:
+            held = t + timedelta(minutes=s.plan_minutes(temp, s.target))
+            last_at = t
+        out.append((t, held))
+    return out
+
+
+def fitted_plan(s: Session):
+    """Least-squares Newton curve through this session's own crossings.
+
+    rate = a + b·T, which is what dT/dt = (T∞ − T)/τ reduces to.  Fitted *in sample*,
+    so this is the ceiling rather than a usable predictor — the question it answers is
+    whether a correct rate curve would make replanning viable at all, or whether even a
+    perfect curve leaves the residual too large.
+    """
+    # Reject physically impossible rates, the same bound the integration's own rate
+    # learning applies.  Without this the opening interval enters the fit at 11.5 °C/h
+    # — band position, not heating — and one outlier at the cold end tips the slope so
+    # far that the extrapolated rate approaches zero near the target and the integral
+    # explodes to thousands of minutes.  Third time the opening minutes have had to be
+    # excluded explicitly; they are not a special case, they are the norm.
+    MAX_PLAUSIBLE = 2.0
+    pts = []
+    for (t0, v0), (t1, v1) in zip(s.crossings, s.crossings[1:]):
+        hours = (t1 - t0).total_seconds() / 3600.0
+        if hours <= 0 or v1 <= v0:
+            continue
+        rate = (v1 - v0) / hours
+        if rate <= MAX_PLAUSIBLE:
+            pts.append(((v0 + v1) / 2.0, rate))
+    n = len(pts)
+    sx = sum(x for x, _ in pts); sy = sum(y for _, y in pts)
+    sxx = sum(x * x for x, _ in pts); sxy = sum(x * y for x, y in pts)
+    den = n * sxx - sx * sx
+    b = (n * sxy - sx * sy) / den
+    a = (sy - b * sx) / n
+
+    def minutes(frm, to, steps=200):
+        """Integrate dt = dT / rate(T) over the span."""
+        total, dT = 0.0, (to - frm) / steps
+        for i in range(steps):
+            T = frm + dT * (i + 0.5)
+            r = max(a + b * T, 0.05)
+            total += dT / r * 60.0
+        return total
+    return minutes
+
+
+def strategy_replan_fitted(s: Session, every_minutes=60.0):
+    """Your replan idea, but on a fitted curve instead of the buckets."""
+    plan = fitted_plan(s)
+    out, last_at = [], None
+    held = s.start_time + timedelta(minutes=plan(s.start_temp, s.target))
+    for t, temp in s.crossings:
+        due = last_at is None or (t - last_at).total_seconds() / 60.0 >= every_minutes
+        if due and temp > s.start_temp:
+            held = t + timedelta(minutes=plan(temp, s.target))
+            last_at = t
+        out.append((t, held))
+    return out
+
+
 def score(s: Session, series):
     """Mean and worst |error| against the true finish, in minutes."""
     fin = s.finish_time
@@ -196,6 +275,12 @@ def main() -> None:
         print(f"   actual {actual:.0f} min over {len(sess.crossings)} crossings\n")
 
         rows = [("hold the opening estimate", strategy_hold(sess))]
+        rows.append(("replan every crossing, frozen rates",
+                     strategy_replan(sess, 0)))
+        rows.append(("replan hourly, frozen rates", strategy_replan(sess, 60)))
+        rows.append(("replan every 90 min, frozen rates", strategy_replan(sess, 90)))
+        rows.append(("replan hourly, FITTED curve (ceiling)",
+                     strategy_replan_fitted(sess, 60)))
         for gm, gd, label in ((60, 0, "ratio, settle 60 min"),
                               (90, 0, "ratio, settle 90 min"),
                               (0, 1.0, "ratio, settle 1.0 °C"),
@@ -217,11 +302,15 @@ def main() -> None:
     print("=" * 78)
     print("ACROSS ALL COMPLETE SESSIONS")
     print("=" * 78)
-    labels = ["hold the opening estimate", "ratio, settle 90 min AND 1.5 °C",
-              "ratio, settle 60 min AND 1.0 °C", "ratio, no settle at all"]
+    labels = ["hold the opening estimate", "replan hourly, frozen rates",
+              "replan every crossing, frozen rates",
+              "replan hourly, FITTED curve (ceiling)", "ratio, settle 90 min AND 1.5 °C",
+              "ratio, no settle at all"]
     makers = [lambda x: strategy_hold(x),
+              lambda x: strategy_replan(x, 60),
+              lambda x: strategy_replan(x, 0),
+              lambda x: strategy_replan_fitted(x, 60),
               lambda x: strategy_ratio(x, 90, 1.5),
-              lambda x: strategy_ratio(x, 60, 1.0),
               lambda x: strategy_ratio(x, 0, 0)]
     print(f"{'strategy':<34}{'mean of means':>15}{'worst anywhere':>16}")
     for label, make in zip(labels, makers):
