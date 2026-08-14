@@ -579,3 +579,50 @@ class TestConfirmationWaitIsSatisfiable:
             _run(c.set_feature_state("filter", "off"))
         assert c._pending_changes == {}, (
             f"armed a wait for a command that was never sent: {c._pending_changes}")
+
+
+class TestScheduleTargetTempControl:
+    """The schedule target is a box, and a change to it is logged.
+
+    20-40 °C in 0.5 steps is 41 slider positions in a narrow control. A mis-drag is
+    silent and expensive: on 2026-08-13 an accidental 39.5 → 38.0 moved the planned
+    start 98 minutes later, corrected 29 s afterwards, and the only evidence was
+    `sched=38.0°C` buried inside an unrelated sensor line.
+    """
+
+    def test_it_is_a_box_not_a_slider(self):
+        from homeassistant.components.number import NumberMode
+        from custom_components.mspa.number import MSpaScheduleTargetTemp
+        assert MSpaScheduleTargetTemp._attr_mode is NumberMode.BOX
+
+    def test_bubble_level_is_left_alone(self):
+        """Three positions, and a wrong one is harmless — a slider suits it."""
+        from custom_components.mspa.number import MspaBubbleLevelNumber
+        assert "_attr_mode" not in vars(MspaBubbleLevelNumber)
+
+    def test_a_change_is_logged_with_both_values(self):
+        from custom_components.mspa import number as number_mod
+        from custom_components.mspa.number import MSpaScheduleTargetTemp
+        ent = MSpaScheduleTargetTemp.__new__(MSpaScheduleTargetTemp)
+        ent.coordinator = MagicMock()
+        ent.coordinator.schedule_target_temp = 39.5
+        ent.async_write_ha_state = MagicMock()
+        seen = []
+        with patch.object(number_mod._LOGGER, "info",
+                          side_effect=lambda m, *a: seen.append(m % a)):
+            _run(MSpaScheduleTargetTemp.async_set_native_value(ent, 38.0))
+        assert seen and "39.5" in seen[0] and "38.0" in seen[0], seen
+        assert ent.coordinator.schedule_target_temp == 38.0
+
+    def test_setting_the_same_value_is_not_logged(self):
+        from custom_components.mspa import number as number_mod
+        from custom_components.mspa.number import MSpaScheduleTargetTemp
+        ent = MSpaScheduleTargetTemp.__new__(MSpaScheduleTargetTemp)
+        ent.coordinator = MagicMock()
+        ent.coordinator.schedule_target_temp = 39.5
+        ent.async_write_ha_state = MagicMock()
+        seen = []
+        with patch.object(number_mod._LOGGER, "info",
+                          side_effect=lambda m, *a: seen.append(m % a)):
+            _run(MSpaScheduleTargetTemp.async_set_native_value(ent, 39.5))
+        assert seen == []

@@ -1,5 +1,6 @@
 import logging
 
+from homeassistant.components.number import NumberMode
 from homeassistant.const import EntityCategory
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -52,6 +53,11 @@ class MSpaScheduleTargetTemp(MSpaNumberEntity, RestoreEntity):
     name = "Schedule target temperature"
     _attr_icon = "mdi:thermometer-auto"
     _attr_entity_category = EntityCategory.CONFIG
+    # A box, not a slider.  20-40 in 0.5 steps is 41 slider positions in a narrow
+    # control, and a mis-drag is silent and consequential: on 2026-08-13 an accidental
+    # 39.5 -> 38.0 moved the planned start 98 minutes later, and back 29 s after.
+    # Typing a temperature cannot be off by a degree and a half.
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 20.0
     _attr_native_max_value = 40.0
     _attr_native_step = 0.5
@@ -66,6 +72,12 @@ class MSpaScheduleTargetTemp(MSpaNumberEntity, RestoreEntity):
         return self.coordinator.schedule_target_temp
 
     async def async_set_native_value(self, value: float) -> None:
+        # Logged because it silently moves the planned start by tens of minutes, and
+        # previously left no trace at all: the 2026-08-13 mis-set was only identifiable
+        # from `sched=38.0°C` appearing inside an unrelated sensor line.
+        previous = self.coordinator.schedule_target_temp
+        if value != previous:
+            _LOGGER.info("Schedule target temperature: %s → %.1f °C", previous, value)
         self.coordinator.schedule_target_temp = value
         self.async_write_ha_state()
 
