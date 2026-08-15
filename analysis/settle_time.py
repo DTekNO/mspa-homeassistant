@@ -231,6 +231,26 @@ def strategy_replan_fitted(s: Session, every_minutes=60.0):
     return out
 
 
+def strategy_replan_buckets(s: Session):
+    """Replan only when the water crosses a bucket boundary (30 or 37 °C).
+
+    The owner's proposal, and it has a real rationale: within a bucket the plan uses
+    one constant rate, so a partial-bucket span is where the model is wrong. At a
+    boundary the remaining journey is a whole number of buckets, which is the shape
+    the model is actually good at — so ask it only there, and hold in between.
+    """
+    out, held = [], s.start_time + timedelta(minutes=s.logged_raw)
+    seen = set()
+    for t, temp in s.crossings:
+        for edge in (T1, T2):
+            if edge in seen or temp < edge - 1e-9 or temp <= s.start_temp:
+                continue
+            seen.add(edge)
+            held = t + timedelta(minutes=s.plan_minutes(temp, s.target))
+        out.append((t, held))
+    return out
+
+
 def score(s: Session, series):
     """Mean and worst |error| against the true finish, in minutes."""
     fin = s.finish_time
@@ -259,6 +279,8 @@ def main() -> None:
                 29.0, 39.5, 690.5, 688.4, "2026-08-10T13:03:21+00:00"),
         Session("C  12 Aug  31.0 → 39.5", (1.11, 0.93, 0.77), 17.5, 13.114,
                 31.0, 39.5, 512.2, 511.9, "2026-08-12T14:57:18+00:00"),
+        Session("D  14 Aug  33.0 → 39.5", (1.10, 0.99, 0.79), 15.2, 14.793,
+                33.0, 39.5, 425.7, 391.1, "2026-08-14T03:46:08+00:00"),
     ]
     for sess, run in zip(sessions, runs):
         later = [(t, v) for t, v in run
@@ -279,6 +301,8 @@ def main() -> None:
                      strategy_replan(sess, 0)))
         rows.append(("replan hourly, frozen rates", strategy_replan(sess, 60)))
         rows.append(("replan every 90 min, frozen rates", strategy_replan(sess, 90)))
+        rows.append(("replan at bucket boundaries only",
+                     strategy_replan_buckets(sess)))
         rows.append(("replan hourly, FITTED curve (ceiling)",
                      strategy_replan_fitted(sess, 60)))
         for gm, gd, label in ((60, 0, "ratio, settle 60 min"),
@@ -303,11 +327,13 @@ def main() -> None:
     print("ACROSS ALL COMPLETE SESSIONS")
     print("=" * 78)
     labels = ["hold the opening estimate", "replan hourly, frozen rates",
+              "replan at bucket boundaries only",
               "replan every crossing, frozen rates",
               "replan hourly, FITTED curve (ceiling)", "ratio, settle 90 min AND 1.5 °C",
               "ratio, no settle at all"]
     makers = [lambda x: strategy_hold(x),
               lambda x: strategy_replan(x, 60),
+              lambda x: strategy_replan_buckets(x),
               lambda x: strategy_replan(x, 0),
               lambda x: strategy_replan_fitted(x, 60),
               lambda x: strategy_ratio(x, 90, 1.5),

@@ -592,73 +592,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                               self._prediction.get("target_temp", 0), new_target)
                 self._prediction = None
 
-            # Update shared near-target hysteresis flag.
-            _NEAR_TARGET_DEACTIVATE = 0.25
-            _NEAR_TARGET_ACTIVATE   = 0.5
-            if new_temp is not None and new_target is not None:
-                delta = abs(new_target - new_temp)
-                if delta < _NEAR_TARGET_DEACTIVATE:
-                    if not self.near_target:   # latch only on the False→True transition
-                        self.ready_latched = True
-                        # Remember how warm the water was when it latched, so the
-                        # cool-off release below can tell how much heat has since
-                        # been given up.
-                        self.ready_latched_temp = new_temp
-                        _LOGGER.debug("ready_latched set (near_target True, delta=%.2f°C)", delta)
-                    self.near_target = True
-                elif delta >= _NEAR_TARGET_ACTIVATE:
-                    self.near_target = False
-
-                # Track the warmest water seen while latched.  Thermostat cycling
-                # nudges the temperature either side of the setpoint — including
-                # into the hysteresis dead band, where neither branch above runs —
-                # so the cool-off must measure from the peak reached, not from
-                # whatever the reading happened to be at the moment it latched.
-                if (self.ready_latched
-                        and (self.ready_latched_temp is None
-                             or new_temp > self.ready_latched_temp)):
-                    self.ready_latched_temp = new_temp
-
-                # Cool-off release: withdraw "Ready" once the water has given up
-                # _LATCH_COOL_OFF degrees from where it latched.  Without this the
-                # latch outlives the warmth it advertises — drop the thermostat to
-                # 20 °C with the water at 40 °C and, two days later, the water is
-                # 24 °C, still "above target", and the sensor would happily claim
-                # the tub is ready for a dip.  Checked regardless of direction,
-                # because with a lowered thermostat the spa is technically cooling
-                # yet still above setpoint.
-                if (self.ready_latched
-                        and self.ready_latched_temp is not None
-                        and (self.ready_latched_temp - new_temp) >= _LATCH_COOL_OFF):
-                    self.ready_latched = False
-                    _LOGGER.info(
-                        "ready_latched released (water cooled %.1f°C from %.1f°C "
-                        "to %.1f°C — no longer warm enough to call ready)",
-                        self.ready_latched_temp - new_temp,
-                        self.ready_latched_temp, new_temp,
-                    )
-                    self.ready_latched_temp = None
-                    # Release the readiness latch once a genuine heating gap
-                    # opens.  The latch exists to hold "Ready" steady once the
-                    # spa has arrived, but raising the setpoint means there is
-                    # real heating to do and the sensor must follow the
-                    # thermostat again — otherwise it stays pinned on "Ready"
-                    # with degrees to go.
-                    #
-                    # Heating direction only: water ABOVE the setpoint (the
-                    # thermostat was lowered while the spa is warm) is still
-                    # legitimately "Ready".  Using the new-session threshold
-                    # rather than the hysteresis one means thermostat cycling
-                    # cannot flicker the latch off and on.
-                    if (self.ready_latched
-                            and (new_target - new_temp) > _NEW_SESSION_DELTA):
-                        self.ready_latched = False
-                        self.ready_latched_temp = None
-                        _LOGGER.debug(
-                            "ready_latched released (setpoint %.1f°C is %.1f°C "
-                            "above water %.1f°C — new heating session)",
-                            new_target, new_target - new_temp, new_temp,
-                        )
+            self._update_near_target(new_temp, new_target)
             # else: no temp data — leave flags unchanged
 
             # Load persisted rates on the very first poll after startup/reload.
@@ -886,6 +820,96 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # than HA reports, which is occasionally useful when tracing.
             _LOGGER.debug("Update failed: %s", err, exc_info=True)
             raise UpdateFailed(f"Update failed: {err}") from err
+
+    def _update_near_target(self, new_temp, new_target) -> None:
+        """Maintain the near-target flag and the ready latch.
+
+        Extracted from `_async_update_data`, where it was inline and mirrored by hand
+        in the tests. The copies drifted: when the 2026-08-14 overshoot bug was fixed
+        in the coordinator, the test helper went on applying the old rule and three
+        tests failed against a correct fix. A block this consequential should have one
+        definition, and be reachable from a test directly.
+
+        Two independent routes to "Ready", deliberately:
+
+        * `near_target` — where the water sits relative to the setpoint right now,
+          with hysteresis so thermostat cycling cannot flicker it.
+        * `ready_latched` — set once the spa first arrives, so a session that has
+          finished stays finished. Released by cooling off, by the setpoint being
+          raised, or by the schedule being cleared.
+        """
+        _NEAR_TARGET_DEACTIVATE = 0.25
+        _NEAR_TARGET_ACTIVATE = 0.5
+        if new_temp is None or new_target is None:
+            return                      # no reading — leave both flags as they were
+
+        # The *shortfall*, signed, not the absolute gap.  Water above target is ready
+        # and then some, but `abs()` treated overshoot exactly like undershoot: on
+        # 2026-08-14 the spa reached 40.0 against a 39.5 target — ordinary thermostat
+        # overshoot — which read as a 0.5 °C gap and cleared near_target.  The schedule
+        # expired in the same window and released the latch, so both routes to "Ready"
+        # went at once and the sensor fell to unknown with the spa at temperature.
+        #
+        # Only falling short un-readies the spa.  The hysteresis still works in that
+        # direction, and near_target self-releases as the water cools.
+        delta = new_target - new_temp
+
+        if delta < _NEAR_TARGET_DEACTIVATE:
+            if not self.near_target:        # latch on the False→True transition only
+                self.ready_latched = True
+                # Remember how warm the water was when it latched, so the cool-off
+                # release below can tell how much heat has since been given up.
+                self.ready_latched_temp = new_temp
+                _LOGGER.debug(
+                    "ready_latched set (near_target True, shortfall=%.2f°C)", delta)
+            self.near_target = True
+        elif delta >= _NEAR_TARGET_ACTIVATE:
+            self.near_target = False
+
+        # Track the warmest water seen while latched.  Thermostat cycling nudges the
+        # temperature either side of the setpoint — including into the hysteresis dead
+        # band, where neither branch above runs — so the cool-off must measure from the
+        # peak reached, not from whatever the reading happened to be when it latched.
+        if (self.ready_latched
+                and (self.ready_latched_temp is None
+                     or new_temp > self.ready_latched_temp)):
+            self.ready_latched_temp = new_temp
+
+        # Cool-off release: withdraw "Ready" once the water has given up
+        # _LATCH_COOL_OFF degrees from where it latched.  Without this the latch
+        # outlives the warmth it advertises — drop the thermostat to 20 °C with the
+        # water at 40 °C and, two days later, the water is 24 °C, still "above target",
+        # and the sensor would happily claim the tub is ready for a dip.  Checked
+        # regardless of direction, because with a lowered thermostat the spa is
+        # technically cooling yet still above setpoint.
+        if (self.ready_latched
+                and self.ready_latched_temp is not None
+                and (self.ready_latched_temp - new_temp) >= _LATCH_COOL_OFF):
+            self.ready_latched = False
+            _LOGGER.info(
+                "ready_latched released (water cooled %.1f°C from %.1f°C to %.1f°C — "
+                "no longer warm enough to call ready)",
+                self.ready_latched_temp - new_temp, self.ready_latched_temp, new_temp,
+            )
+            self.ready_latched_temp = None
+
+        # Release the latch once a genuine heating gap opens.  The latch holds "Ready"
+        # steady after the spa arrives, but raising the setpoint means there is real
+        # heating to do and the sensor must follow the thermostat again — otherwise it
+        # stays pinned on "Ready" with degrees to go.
+        #
+        # Heating direction only: water above the setpoint (the thermostat was lowered
+        # while the spa is warm) is still legitimately "Ready".  Using the new-session
+        # threshold rather than the hysteresis one means thermostat cycling cannot
+        # flicker the latch off and on.
+        if self.ready_latched and (new_target - new_temp) > _NEW_SESSION_DELTA:
+            self.ready_latched = False
+            self.ready_latched_temp = None
+            _LOGGER.debug(
+                "ready_latched released (setpoint %.1f°C is %.1f°C above water "
+                "%.1f°C — new heating session)",
+                new_target, new_target - new_temp, new_temp,
+            )
 
     def _update_temp_anchor(self, new_temp, new_target) -> None:
         """Re-anchor when the reading or target changes, at the band centre.

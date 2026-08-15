@@ -140,18 +140,18 @@ def _heat_schedule_attrs(c, entry=None) -> dict:
 
 
 def _apply_temp_update(c, new_temp: float, new_target: float) -> None:
-    """Replicate coordinator._async_update_data near_target / latch block."""
+    """Apply a temperature reading through the coordinator's own near-target logic.
+
+    Borrowed, not reimplemented. This helper used to be a hand-written copy of the
+    block, and it silently diverged: when the 2026-08-14 overshoot bug was fixed in the
+    coordinator, the copy here still used abs() and three tests failed against correct
+    code.
+    """
     c.temp_anchor_temp = new_temp
     c.temp_anchor_target = new_target
     c._last_data["water_temperature"] = str(new_temp)
     c._last_data["target_temperature"] = str(new_target)
-    delta = abs(new_target - new_temp)
-    if delta < _NEAR_TARGET_DEACTIVATE:
-        if not c.near_target:
-            c.ready_latched = True
-        c.near_target = True
-    elif delta >= _NEAR_TARGET_ACTIVATE:
-        c.near_target = False
+    MSpaUpdateCoordinator._update_near_target(c, new_temp, new_target)
 
 
 # ── dt_util fixture (required by Heat Schedule sensor internals) ──────────────
@@ -246,11 +246,18 @@ class TestReadyAtPatterns:
         assert _ready_at(c) == "Ready"
 
     def test_d_thermostat_lowered_while_latched_keeps_ready(self):
-        """D: Thermostat lowered while spa is at temp — Ready must persist."""
+        """D: Thermostat lowered while spa is at temp — Ready must persist.
+
+        `near_target` now stays True here, where it used to go False. That is the
+        overshoot fix: the test of readiness is the *shortfall*, and water at 40.0
+        against a 38.0 setpoint is not short of anything. The assertion that it went
+        False was describing the old absolute-gap mechanism rather than the
+        requirement, which is the last line and is unchanged.
+        """
         c = MockCoordinator(ready_latched=True, near_target=True,
                             water_temp=40.0, target_temp=40.0)
-        _apply_temp_update(c, new_temp=40.0, new_target=38.0)   # exits near_target (2°C gap)
-        assert c.near_target is False
+        _apply_temp_update(c, new_temp=40.0, new_target=38.0)
+        assert c.near_target is True, "water above setpoint is not short of target"
         assert c.ready_latched is True
         assert _ready_at(c) == "Ready"
 
@@ -1213,3 +1220,45 @@ class TestWarmingWithTheHeaterOff:
             c = self._coord(rising=True, heating=False)
             c.temp_anchor_time = datetime.now(timezone.utc) - timedelta(minutes=minutes)
             assert c.scheduling_temp() <= 30.0 + 1e-9, f"optimistic after {minutes} min"
+
+
+class TestOvershootIsStillReady:
+    """Water above target is ready, not un-ready.
+
+    Reported 2026-08-14: the spa reached 40.0 against a 39.5 target — ordinary
+    thermostat overshoot — and Ready at fell to unknown. The near-target test used
+    the absolute gap, so 0.5 °C *above* target read the same as 0.5 °C short. The
+    schedule expired in the same window and released the latch, so both routes to
+    "Ready" went at once.
+    """
+
+    def _apply(self, water, target, near_before=True, latched=False):
+        c = MockCoordinator(water_temp=water, target_temp=target,
+                            near_target=near_before, ready_latched=latched)
+        _apply_temp_update(c, new_temp=water, new_target=target)
+        return c
+
+    def test_overshoot_stays_near_target(self):
+        assert self._apply(40.0, 39.5).near_target is True
+
+    def test_large_overshoot_stays_near_target(self):
+        """Nothing about being warmer than asked makes the spa less ready."""
+        assert self._apply(41.0, 39.5).near_target is True
+
+    def test_falling_short_still_clears_it(self):
+        """The hysteresis must still work in the direction that means 'not ready'."""
+        assert self._apply(39.0, 39.5).near_target is False
+
+    def test_inside_the_dead_band_is_unchanged(self):
+        assert self._apply(39.2, 39.5, near_before=True).near_target is True
+
+    def test_reaching_target_still_latches(self):
+        c = MockCoordinator(water_temp=39.0, target_temp=39.5, near_target=False)
+        _apply_temp_update(c, new_temp=39.5, new_target=39.5)
+        assert c.ready_latched is True
+
+    def test_overshoot_arriving_from_below_latches_too(self):
+        """Crossing straight past the target must not skip the latch."""
+        c = MockCoordinator(water_temp=39.0, target_temp=39.5, near_target=False)
+        _apply_temp_update(c, new_temp=40.0, new_target=39.5)
+        assert c.near_target is True and c.ready_latched is True
