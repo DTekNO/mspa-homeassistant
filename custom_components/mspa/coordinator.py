@@ -1015,6 +1015,37 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         except (KeyError, TypeError, ValueError):
             return None
 
+    def session_progress_deviation(self, at_temp, now=None):
+        """Minutes behind (positive) or ahead (negative) of the opening plan.
+
+        Measured, not predicted: elapsed time against what the frozen plan allowed to
+        reach the temperature now reached.  Separating this from the ETA is the point —
+        a session can be running 20 minutes behind while the finish estimate stays
+        stable, and conflating the two is what made the shipped ETA chase its own tail.
+
+        None until the session settles.  The opening crossings measure position within
+        the 0.5 °C band rather than heating — on 2026-08-12 the first degree "took"
+        7.6 minutes, an implied 7.9 °C/h that no heater here can produce — so a
+        deviation computed then reads tens of minutes ahead and means nothing.  The
+        same contamination is why the ETA holds through the settle period.
+        """
+        plan = self.session_plan()
+        pred = self._prediction
+        if plan is None or not pred or at_temp is None:
+            return None
+        if not self.session_settled(at_temp, now):
+            return None
+        try:
+            started = datetime.fromisoformat(pred["start_time"])
+            start_temp = float(pred["start_temp"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        allowed = plan.heating_minutes(start_temp, at_temp)
+        if allowed is None:
+            return None
+        elapsed = ((now or datetime.now(timezone.utc)) - started).total_seconds() / 60.0
+        return round(elapsed - allowed, 1)
+
     @property
     def fault_code(self) -> str | None:
         """The spa's fault code, or None when healthy.

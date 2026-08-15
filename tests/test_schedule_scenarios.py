@@ -101,6 +101,7 @@ class MockCoordinator:
     session_plan = MSpaUpdateCoordinator.session_plan
     session_settled = MSpaUpdateCoordinator.session_settled
     session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
+    session_progress_deviation = MSpaUpdateCoordinator.session_progress_deviation
 
     def _predictor(self):
         return HeatPredictor(
@@ -1368,3 +1369,70 @@ class TestFrozenSessionPlan:
         c._prediction["start_time"] = "not a timestamp"
         assert c.session_settled(37.0) is False
         assert c.session_opening_eta() is None
+
+
+class TestProgressDeviation:
+    """How the session is running against its own opening plan, in minutes.
+
+    Deliberately a separate attribute rather than folded into the ETA: the estimate
+    answers "when", this answers "how is it going", and conflating them is what made
+    the shipped ETA chase every sample.
+    """
+
+    def _coord(self, *, water, elapsed_min, start_temp=33.0):
+        c = MockCoordinator(water_temp=water, target_temp=39.5, heat_rate=1.0,
+                            anchor_offset_minutes=0.0)
+        c.temp_anchor_temp = water
+        c._prediction = {
+            "start_time": (datetime.now(timezone.utc)
+                           - timedelta(minutes=elapsed_min)).isoformat(),
+            "start_temp": start_temp,
+            "target_temp": 39.5,
+            "estimated_minutes": 426.0,
+            "estimated_minutes_biased": 426.0,
+            "plan_rates": [1.10, 1.00, 0.80],   # mid 1.0 °C/h → 1 °C per 60 min
+        }
+        return c
+
+    def test_none_outside_a_session(self):
+        c = MockCoordinator(water_temp=35.0, target_temp=39.5)
+        assert c.session_progress_deviation(35.0) is None
+
+    def test_none_before_the_settle_point(self):
+        """The opening crossings measure band position, so a deviation then is noise."""
+        c = self._coord(water=34.0, elapsed_min=45)
+        assert c.session_progress_deviation(34.0) is None
+
+    def test_behind_schedule_is_positive(self):
+        """2.0 °C at 1.0 °C/h is allowed 120 min; taking 150 is 30 behind."""
+        c = self._coord(water=35.0, elapsed_min=150)
+        assert c.session_progress_deviation(35.0) == pytest.approx(30.0, abs=0.5)
+
+    def test_ahead_of_schedule_is_negative(self):
+        c = self._coord(water=35.0, elapsed_min=100)
+        assert c.session_progress_deviation(35.0) == pytest.approx(-20.0, abs=0.5)
+
+    def test_on_plan_is_about_zero(self):
+        c = self._coord(water=35.0, elapsed_min=120)
+        assert abs(c.session_progress_deviation(35.0)) < 0.5
+
+    def test_it_does_not_move_the_eta(self):
+        """The whole point of a separate attribute."""
+        behind = self._coord(water=35.0, elapsed_min=150)
+        on_plan = self._coord(water=35.0, elapsed_min=120)
+        now = datetime.now(timezone.utc)
+        a = _anchor_eta_utc(behind, 39.5, now) - behind.temp_anchor_time
+        b = _anchor_eta_utc(on_plan, 39.5, now) - on_plan.temp_anchor_time
+        assert a == b, "the remaining estimate must not depend on the deviation"
+
+    def test_a_corrupt_record_does_not_raise(self):
+        c = self._coord(water=35.0, elapsed_min=150)
+        c._prediction["start_temp"] = "nonsense"
+        assert c.session_progress_deviation(35.0) is None
+
+    def test_exposed_on_the_ready_at_sensor(self):
+        c = self._coord(water=35.0, elapsed_min=150)
+        attrs = MSpaReadinessSensor.extra_state_attributes.fget(
+            _readiness_sensor(c))
+        assert attrs["progress_deviation"] == pytest.approx(30.0, abs=0.5)
+        assert attrs["plan_settled"] is True

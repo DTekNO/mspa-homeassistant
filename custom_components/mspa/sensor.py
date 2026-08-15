@@ -1038,10 +1038,22 @@ class MSpaReadinessSensor(MSpaSensorEntity):
 
         circulating, temperature_basis = _temperature_basis(self.coordinator)
 
+        # How the session is running against its own opening plan, in minutes: positive
+        # is behind, negative ahead.  Deliberately separate from the ETA rather than
+        # folded into it — the estimate answers "when", this answers "how is it going",
+        # and mixing them is what made the old ETA chase every sample.
+        anchor = getattr(self.coordinator, "temp_anchor_temp", None)
+        deviation = self.coordinator.session_progress_deviation(anchor)
+        settled = self.coordinator.session_settled(anchor)
+
         return {
             "direction": direction,
             "minutes_remaining": rounded,
             "color": color,
+            # Null until the session settles: the opening crossings measure band
+            # position rather than heating, so a deviation computed then is meaningless.
+            "progress_deviation": deviation,
+            "plan_settled": settled,
             # Whether the temperature this estimate is built on is the tub's at all.
             # False means the probe is sitting in stagnant water in the pump
             # housing, which reads at or below tub temperature — so the estimate
