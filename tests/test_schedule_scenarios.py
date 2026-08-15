@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 from custom_components.mspa.sensor import (
     _compute_ready_at_value,
+    _anchor_eta_utc,
+    _segmented_heating_minutes,
     MSpaReadinessSensor,
     MSpaHeatScheduleSensor,
 )
@@ -65,6 +67,10 @@ class MockCoordinator:
         self.last_update_success = last_update_success
         self.scheduled_ready_at = scheduled_ready_at
         self.schedule_target_temp = schedule_target_temp
+        # No session in flight by default, so the ETA falls through to the live rates
+        # exactly as the existing scenarios were written against.  TestFrozenSessionPlan
+        # populates this to exercise the frozen plan.
+        self._prediction = None
 
         self.temp_anchor_time = datetime.now(timezone.utc) + timedelta(minutes=anchor_offset_minutes)
         self.temp_anchor_temp = water_temp
@@ -92,6 +98,9 @@ class MockCoordinator:
     # only that the mock agrees with itself.
     circulating = MSpaUpdateCoordinator.circulating
     scheduling_temp = MSpaUpdateCoordinator.scheduling_temp
+    session_plan = MSpaUpdateCoordinator.session_plan
+    session_settled = MSpaUpdateCoordinator.session_settled
+    session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
 
     def _predictor(self):
         return HeatPredictor(
@@ -883,6 +892,7 @@ class TestScheduleStartSlew:
         """Only what _plan_key reads, so the real key function is exercised."""
 
         def __init__(self, water):
+            self._prediction = None
             self.scheduled_ready_at = datetime(2026, 8, 12, 21, 0, tzinfo=timezone.utc)
             self.schedule_target_temp = 39.5
             self._last_data = {"water_temperature": str(water)}
@@ -1262,3 +1272,99 @@ class TestOvershootIsStillReady:
         c = MockCoordinator(water_temp=39.0, target_temp=39.5, near_target=False)
         _apply_temp_update(c, new_temp=40.0, new_target=39.5)
         assert c.near_target is True and c.ready_latched is True
+
+
+class TestFrozenSessionPlan:
+    """Within a session the ETA integrates rates frozen at its start, after a settle.
+
+    Measured over four recorded heat-ups in analysis/settle_time.py. Replanning at
+    each 0.5 °C crossing converges to 0 min at the finish, where holding the opening
+    estimate carries its error all the way in — 35 min on the worst session, still
+    35 min wrong at the moment the spa was ready. Before the settle point the
+    opposite holds, so each is used where it wins.
+    """
+
+    _START = datetime(2026, 8, 14, 3, 46, tzinfo=timezone.utc)
+
+    def _coord(self, *, water, elapsed_min, start_temp=33.0):
+        c = MockCoordinator(water_temp=water, target_temp=39.5, heat_rate=1.0,
+                            anchor_offset_minutes=0.0)
+        c.temp_anchor_temp = water
+        c.temp_anchor_time = datetime.now(timezone.utc)
+        c.heat_rate_buckets = [2.0, 2.0, 2.0]      # live rates, deliberately different
+        c._prediction = {
+            "start_time": (datetime.now(timezone.utc)
+                           - timedelta(minutes=elapsed_min)).isoformat(),
+            "start_temp": start_temp,
+            "target_temp": 39.5,
+            "estimated_minutes": 426.0,
+            "estimated_minutes_biased": 426.0,
+            "plan_rates": [1.10, 1.00, 0.80],
+        }
+        return c
+
+    def test_the_plan_uses_frozen_rates_not_live_ones(self):
+        """Live buckets are 2.0; the plan's are 1.0/0.8. The plan must win."""
+        c = self._coord(water=37.0, elapsed_min=200)
+        plan = c.session_plan()
+        assert plan is not None
+        frozen = plan.heating_minutes(37.0, 39.5)
+        live = _segmented_heating_minutes(37.0, 39.5, c)
+        assert frozen > live * 1.5, f"frozen {frozen} looks like the live {live}"
+
+    def test_the_eta_itself_uses_the_frozen_rates(self):
+        """Through the sensor, not just the plan object.
+
+        Live buckets are 2.0 °C/h and the frozen hot rate is 0.80, so 37.0 → 39.5 is
+        75 min live against 187 frozen. An ETA near the live figure would mean the
+        freeze is not reaching the sensor — which an earlier version of this suite
+        failed to catch, because it only exercised the plan directly.
+        """
+        c = self._coord(water=37.0, elapsed_min=300)
+        now = datetime.now(timezone.utc)
+        eta = _anchor_eta_utc(c, 39.5, now)
+        minutes = (eta - c.temp_anchor_time).total_seconds() / 60.0
+        assert minutes > 150, f"{minutes:.0f} min looks like the live rate, not frozen"
+
+    def test_no_session_means_no_plan(self):
+        c = MockCoordinator(water_temp=35.0, target_temp=39.5)
+        assert c.session_plan() is None
+
+    def test_not_settled_before_ninety_minutes(self):
+        c = self._coord(water=35.0, elapsed_min=60)      # 2.0 °C but only 60 min
+        assert c.session_settled(35.0) is False
+
+    def test_not_settled_before_one_and_a_half_degrees(self):
+        c = self._coord(water=34.0, elapsed_min=200)     # 200 min but only 1.0 °C
+        assert c.session_settled(34.0) is False
+
+    def test_settled_once_both_are_met(self):
+        c = self._coord(water=34.5, elapsed_min=95)
+        assert c.session_settled(34.5) is True
+
+    def test_before_settling_the_eta_is_the_opening_estimate(self):
+        c = self._coord(water=34.0, elapsed_min=60)
+        eta = _anchor_eta_utc(c, 39.5, datetime.now(timezone.utc))
+        opening = c.session_opening_eta()
+        assert eta == opening
+
+    def test_after_settling_the_eta_follows_the_water(self):
+        """Two temperatures, same session: the later one must finish sooner."""
+        warm = _anchor_eta_utc(self._coord(water=38.0, elapsed_min=300), 39.5,
+                               datetime.now(timezone.utc))
+        cool = _anchor_eta_utc(self._coord(water=35.0, elapsed_min=300), 39.5,
+                               datetime.now(timezone.utc))
+        assert warm < cool
+
+    def test_a_plan_with_no_rates_falls_back_to_live(self):
+        """A session started before this shipped, restored from storage."""
+        c = self._coord(water=37.0, elapsed_min=200)
+        c._prediction.pop("plan_rates")
+        assert c.session_plan() is None
+        assert _anchor_eta_utc(c, 39.5, datetime.now(timezone.utc)) is not None
+
+    def test_a_corrupt_start_time_does_not_raise(self):
+        c = self._coord(water=37.0, elapsed_min=200)
+        c._prediction["start_time"] = "not a timestamp"
+        assert c.session_settled(37.0) is False
+        assert c.session_opening_eta() is None

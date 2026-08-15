@@ -315,7 +315,29 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
                       anc_time, anc_temp, target_temp or 0)
         return None
 
-    mins = _segmented_heating_minutes(anc_temp, target_temp, coordinator)
+    # Within a session, integrate the rate curve frozen at its start and hold the
+    # opening estimate until the settle guard passes.
+    #
+    # Both halves are measured (analysis/settle_time.py, four recorded sessions).
+    # Replanning at each 0.5 °C crossing converges to 0 min at the finish, where
+    # holding carries its opening error all the way in — 35 min on the worst session,
+    # still 35 min wrong at the moment the spa was ready. Before the settle point the
+    # opposite holds: a recompute from a partial span is badly wrong, because the plan
+    # is only accurate over a full span and the opening crossings measure position
+    # within the 0.5 °C band rather than heating.
+    #
+    # Freezing the rates matters as much as the settle: recomputing with rates that
+    # move as they are learned was the shipped behaviour, and it was worse than either
+    # (21 min mean against 10 for holding).
+    plan = coordinator.session_plan()
+    if plan is not None and not coordinator.session_settled(anc_temp, now_utc):
+        opening = coordinator.session_opening_eta()
+        if opening is not None:
+            return opening
+    if plan is not None:
+        mins = plan.heating_minutes(anc_temp, target_temp)
+    else:
+        mins = _segmented_heating_minutes(anc_temp, target_temp, coordinator)
     if mins is None:
         _LOGGER.debug("ready_at anchor: no rate for %.1f→%.1f → None", anc_temp, target_temp)
         return None

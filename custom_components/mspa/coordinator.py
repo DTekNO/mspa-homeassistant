@@ -96,6 +96,16 @@ _BUCKET_SPAN_FULL_C = 4.0
 # release the readiness latch when the user raises the setpoint.
 _NEW_SESSION_DELTA = 2.0          # °C
 
+# The live ETA holds the opening estimate until BOTH of these are met, then replans
+# at every 0.5 °C crossing against rates frozen at session start.  Simulated over the
+# four recorded sessions in analysis/settle_time.py: replanning converges to 0 min at
+# the finish where holding carries its opening error all the way in (10 min mean, 35
+# on the worst session).  Before the settle point the opposite is true — a recompute
+# from a partial span is badly wrong, and the opening crossings measure band position
+# rather than heating — so each is used where it wins.
+_PLAN_SETTLE_MINUTES = 90.0
+_PLAN_SETTLE_DEGREES = 1.5
+
 # How far the water may cool below the temperature at which it latched before
 # "Ready" is withdrawn.  The latch advertises "still warm enough to use
 # without waiting"; once the water has given up this much heat that claim is
@@ -523,6 +533,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         "ambient_factor_hot": round(
                             ambient_rate_factor(2, self.ambient_temp, self.ambient_baseline), 3
                         ),
+                        # The rate curve as it stood when the session opened, with the
+                        # ambient correction already folded in.  The live ETA integrates
+                        # *this* for the duration, so mid-session learning cannot move
+                        # an estimate that is already committed: rates learned today
+                        # take effect on the next session, not this one.
+                        "plan_rates": [
+                            (b * ambient_rate_factor(i, self.ambient_temp,
+                                                     self.ambient_baseline))
+                            if b else None
+                            for i, b in enumerate(self.heat_rate_buckets)
+                        ],
                     }
                     buckets_str = "/".join(
                         f"{b:.2f}" if b is not None else "-"
@@ -956,6 +977,43 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.temp_anchor_target   = new_target
         self.temp_anchor_rising   = rising
         self._anchor_prev_reading = new_temp
+
+    def session_plan(self) -> "HeatPredictor | None":
+        """The rate curve frozen at session start, or None outside a session.
+
+        Bias and scalar are deliberately 1.0: the frozen rates already carry the
+        ambient correction, and the bias was applied once to the opening estimate.
+        Re-applying either here would compound a correction the plan already contains.
+        """
+        rates = (self._prediction or {}).get("plan_rates")
+        if not rates or not any(rates):
+            return None
+        return HeatPredictor(buckets=tuple(rates), prediction_bias=1.0)
+
+    def session_settled(self, at_temp, now=None) -> bool:
+        """Whether the session has run long and far enough to trust a replan."""
+        pred = self._prediction
+        if not pred or at_temp is None:
+            return False
+        try:
+            started = datetime.fromisoformat(pred["start_time"])
+            start_temp = float(pred["start_temp"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        elapsed = ((now or datetime.now(timezone.utc)) - started).total_seconds() / 60.0
+        return (elapsed >= _PLAN_SETTLE_MINUTES
+                and (at_temp - start_temp) >= _PLAN_SETTLE_DEGREES)
+
+    def session_opening_eta(self):
+        """Finish time implied by the opening estimate, or None outside a session."""
+        pred = self._prediction
+        if not pred:
+            return None
+        try:
+            started = datetime.fromisoformat(pred["start_time"])
+            return started + timedelta(minutes=float(pred["estimated_minutes_biased"]))
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @property
     def fault_code(self) -> str | None:

@@ -26,6 +26,14 @@ from custom_components.mspa.sensor import _anchor_eta_utc, _segmented_heating_mi
 # ── Minimal coordinator stub for anchor tests ─────────────────────────────────
 
 class _Coord:
+    # No session in flight, so the ETA falls through to the live rates — which is
+    # what these anchor tests were written against.  Borrowed from the real
+    # coordinator rather than restated.
+    _prediction = None
+    session_plan = MSpaUpdateCoordinator.session_plan
+    session_settled = MSpaUpdateCoordinator.session_settled
+    session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
+
     def __init__(
         self,
         *,
