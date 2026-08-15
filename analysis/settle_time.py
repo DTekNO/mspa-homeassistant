@@ -251,11 +251,51 @@ def strategy_replan_buckets(s: Session):
     return out
 
 
+def strategy_settle_then_replan(s: Session, guard_minutes=90.0, guard_degrees=1.5):
+    """Hold through the settle period, then replan at every 0.5 °C crossing.
+
+    The synthesis of the two halves that each work in a different part of the session.
+    Holding is good early, where the plan is usually right and a partial-span recompute
+    is badly wrong; replanning is good late, where the remaining span — and therefore
+    the error it can carry — shrinks toward zero. Switching between them at the settle
+    point takes each where it wins.
+    """
+    out, settled = [], False
+    held = s.start_time + timedelta(minutes=s.logged_raw)
+    for t, temp in s.crossings:
+        elapsed = (t - s.start_time).total_seconds() / 60.0
+        if not settled and elapsed >= guard_minutes                 and (temp - s.start_temp) >= guard_degrees:
+            settled = True
+        if settled:
+            held = t + timedelta(minutes=s.plan_minutes(temp, s.target))
+        out.append((t, held))
+    return out
+
+
 def score(s: Session, series):
     """Mean and worst |error| against the true finish, in minutes."""
     fin = s.finish_time
     errs = [abs((eta - fin).total_seconds() / 60.0) for _, eta in series]
     return sum(errs) / len(errs), max(errs)
+
+
+def score_endgame(s: Session, series, within_minutes=90.0):
+    """Mean |error| over the closing stretch, and the error at the final reading.
+
+    The whole-session mean treats a wrong answer six hours out as equally bad as a
+    wrong answer twenty minutes out. They are not equally bad: what a user acts on is
+    the estimate as the session nears its end. Replanning must converge there — the
+    remaining span shrinks toward zero, so the error it can carry shrinks with it —
+    while holding keeps whatever error it started with all the way to the finish.
+    """
+    fin = s.finish_time
+    tail = [(t, eta) for t, eta in series
+            if (fin - t).total_seconds() / 60.0 <= within_minutes]
+    if not tail:
+        tail = series[-1:]
+    errs = [abs((eta - fin).total_seconds() / 60.0) for _, eta in tail]
+    last = abs((series[-1][1] - fin).total_seconds() / 60.0)
+    return sum(errs) / len(errs), last
 
 
 # ─────────────────────────────────── report ──────────────────────────────────
@@ -301,6 +341,10 @@ def main() -> None:
                      strategy_replan(sess, 0)))
         rows.append(("replan hourly, frozen rates", strategy_replan(sess, 60)))
         rows.append(("replan every 90 min, frozen rates", strategy_replan(sess, 90)))
+        rows.append(("settle 90/1.5 then replan each crossing",
+                     strategy_settle_then_replan(sess, 90, 1.5)))
+        rows.append(("settle 60/1.0 then replan each crossing",
+                     strategy_settle_then_replan(sess, 60, 1.0)))
         rows.append(("replan at bucket boundaries only",
                      strategy_replan_buckets(sess)))
         rows.append(("replan hourly, FITTED curve (ceiling)",
@@ -326,23 +370,31 @@ def main() -> None:
     print("=" * 78)
     print("ACROSS ALL COMPLETE SESSIONS")
     print("=" * 78)
-    labels = ["hold the opening estimate", "replan hourly, frozen rates",
+    labels = ["hold the opening estimate",
+              "settle 90/1.5 then replan each crossing",
+              "settle 60/1.0 then replan each crossing",
+              "replan hourly, frozen rates",
               "replan at bucket boundaries only",
               "replan every crossing, frozen rates",
               "replan hourly, FITTED curve (ceiling)", "ratio, settle 90 min AND 1.5 °C",
               "ratio, no settle at all"]
     makers = [lambda x: strategy_hold(x),
+              lambda x: strategy_settle_then_replan(x, 90, 1.5),
+              lambda x: strategy_settle_then_replan(x, 60, 1.0),
               lambda x: strategy_replan(x, 60),
               lambda x: strategy_replan_buckets(x),
               lambda x: strategy_replan(x, 0),
               lambda x: strategy_replan_fitted(x, 60),
               lambda x: strategy_ratio(x, 90, 1.5),
               lambda x: strategy_ratio(x, 0, 0)]
-    print(f"{'strategy':<34}{'mean of means':>15}{'worst anywhere':>16}")
+    print(f"{'strategy':<34}{'whole session':>15}{'last 90 min':>13}"
+          f"{'at the finish':>15}")
     for label, make in zip(labels, makers):
         sc = [score(x, make(x)) for x in sessions]
+        eg = [score_endgame(x, make(x)) for x in sessions]
         print(f"{label:<34}{sum(m for m, _ in sc)/len(sc):>13.1f} m"
-              f"{max(w for _, w in sc):>14.1f} m")
+              f"{sum(m for m, _ in eg)/len(eg):>11.1f} m"
+              f"{sum(l for _, l in eg)/len(eg):>13.1f} m")
     print()
     print("Scored at every crossing, against the moment the target was first reached.")
     print("A strategy that never revises has one error repeated, so its mean and worst")
