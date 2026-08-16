@@ -274,3 +274,45 @@ if __name__ == "__main__":
 # 30% wrong.  That is not a bug in the harness: once the shadow has recalibrated near
 # the target, the estimate no longer depends on what the stored rates were.  It is the
 # property the design exists for.
+
+
+# ── Detecting a wrong shadow rate early: six approaches, none of them work ───
+#
+# The question was whether we can tell the shadow curve is off before the water is
+# close enough to the target for a measurement to be proportionate. On a 20 °C start
+# the gated version does not recalibrate until 38 °C — minute 907 of 994 on session A.
+#
+# Scored at a quarter / half / three-quarters through, minutes wrong, averaged over
+# the four recorded sessions and over the same sessions replayed against stored rates
+# scaled by 1.3 (a stand-in for summer rates meeting a winter spa):
+#
+#                                        summer            winter
+#   flat buckets, gate 4 (shipped)       10 / 10 /  4     142 / 142 / 99
+#   recalibrate early, undamped         142 / 113 / 36    142 / 113 / 36
+#   recalibrate early, damped            55 /  47 / 22    155 / 123 / 77
+#   2 °C bands, flat, no gate            66 /  42 / 12     66 /  42 / 12
+#   2 °C bands, tilted, no gate          55 /  42 /  6     55 /  38 /  7
+#   bypass the gate when |f-1| >= 0.25   77 /  77 /  4    176 / 127 / 51
+#
+# Every early correction buys winter and sells summer. The bypass was the most
+# promising — act only on deviations too large to be positional — and it fails on the
+# discriminator itself: session C's opening measurement reads a factor of 1.52, an
+# artefact of the reading dithering across a band edge as the heater engaged, and that
+# is larger than the seasonal offset it is meant to distinguish. Magnitude cannot
+# separate "the spa is genuinely slower today" from "we measured across a band edge".
+#
+# Tilting the bands does help — 2 °C tilted beats 2 °C flat everywhere — because a
+# short measurement in a narrow band with a sloped expectation is comparable to what
+# the model predicts *there*, rather than to a bucket average it sits at one end of.
+# It is not enough on its own.
+#
+# The one real choice is between:
+#
+#   gate 4          best when the stored rates are right, which is most of the time,
+#                   and badly wrong on the first session after conditions change
+#   2 °C tilted     consistently mediocre — about 55 / 40 / 6 either way
+#
+# Shipped: gate 4. The winter figures are synthetic, the buckets learn from a bad
+# session so the exposure is one session per change of season, and progress_deviation
+# reports the discrepancy even where the estimate cannot correct it. Revisit with a
+# real cold-weather session rather than with this scaling.
