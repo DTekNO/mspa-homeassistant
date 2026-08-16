@@ -345,4 +345,29 @@ if __name__ == "__main__":
 # And a floor on the settle above 1 °C hurts everywhere; the floor is only there to stop
 # the last band asking for less than a single crossing.
 #
+#
+# ── The dead zone, and why boundaries stopped interrupting a measurement ─────
+#
+# Sizing the measurement collided with re-anchoring at band boundaries. A 24 °C start
+# anchors at 26 and needs 4.5 °C, but the 30 °C boundary arrives after 3.5: the whole
+# cold run was thrown away and the first correction waited until 33.5 °C. Every start
+# from 23 to 28 fell in the hole, and session A at 22.0 cleared it by 0.3 °C — which is
+# why four recorded sessions never showed it.
+#
+# The re-anchoring existed only because the observed rate was compared against a single
+# band's rate. Compare it against what the curve predicted for the measured span instead
+# and a run may cross as many boundaries as it likes. Over the four sessions plus A
+# restarted from 23, 24 and 25:
+#
+#                                ¼ in    half    ¾ in    end   revisions
+#   re-anchor at boundaries       180     116      18      2       3.1
+#   boundary-free                 180      33      22      1       5.7
+#     ...and identical under +30% and -25% stored rates, which the other is not
+#
+# The dead-zone sessions carry that difference: 243 minutes wrong at halfway becomes 37.
+# Four variants of the measurement window were tried — re-anchor after each revision,
+# keep a cumulative window from the warm-up anchor, and each of those stopping once
+# under 2 °C from target. They land within a minute or two of each other, so the
+# simplest wins: re-anchor, and keep going to the end.
+#
 # The winter and slow figures are synthetic. Revisit with a real cold-weather session.

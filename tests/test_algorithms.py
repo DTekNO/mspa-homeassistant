@@ -490,24 +490,39 @@ class TestShadowPlan:
         self._feed(p, [(240, 36.5)])                # 1.5 °C measured — now it qualifies
         assert p.revisions == 1
 
-    def test_a_band_recalibrates_only_once(self):
-        """The anchor stays put, so without this the span keeps growing past the settle
-        and every later crossing in the band would revise the curve again."""
+    def test_each_revision_must_earn_its_own_measurement(self):
+        """Revising moves the anchor. Without that the span keeps growing past the
+        settle and every later crossing would revise the curve again."""
         p = self._plan(start=30.0)
         self._feed(p, [(30, 30.5), (60, 31.5), (90, 32.0)])     # warm-up, then anchored
         self._feed(p, [(150, 33.0), (210, 34.5)])               # 2.5 °C measured — fires
         assert p.revisions == 1
-        self._feed(p, [(270, 35.0), (330, 35.5), (390, 36.0)])  # same band, must not
+        # Re-anchored at 34.5 with 5.0 °C left, so the next revision needs 1.67 °C.
+        self._feed(p, [(270, 35.0), (330, 35.5), (390, 36.0)])
+        assert p.revisions == 1
+        self._feed(p, [(450, 36.5)])
+        assert p.revisions == 2
+
+    def test_a_measurement_may_cross_a_band_boundary(self):
+        """A 24 °C start needs 4.5 °C before it may commit, and the 30 °C boundary
+        arrives after 3.5. Re-anchoring there threw the cold run away and left the first
+        correction until 33.5 — every start from 23 to 28 fell in that hole."""
+        p = self._plan(start=24.0, opening_min=780)
+        self._feed(p, [(60, 25.0), (120, 26.0)])                # warm-up ends at 26.0
+        self._feed(p, [(240, 28.0), (360, 30.0)])               # boundary, must not reset
+        assert p.revisions == 0                                 # 4.0 °C — not yet 4.5
+        self._feed(p, [(420, 30.5)])
         assert p.revisions == 1
 
-    def test_a_boundary_re_anchors_without_a_warm_up(self):
-        """A band edge is an exact position, so it needs no allowance — unlike a start,
-        where the water sits somewhere unknown inside its 0.5 °C band."""
-        p = self._plan()
-        self._feed(p, [(0, 33.5), (60, 35.0), (120, 36.5)])     # recalibrates in 30-37
-        before = p.revisions
-        self._feed(p, [(180, 37.0), (240, 38.0)])               # 37.0 anchors at once
-        assert p.revisions == before + 1
+    def test_a_run_is_judged_against_the_whole_curve_it_spanned(self):
+        """Two bands at different rates, measured in one go: the comparison has to be
+        against what the curve predicted for that exact span, not one band's rate."""
+        p = self._plan(start=24.0, opening_min=780)
+        self._feed(p, [(60, 26.0)])
+        planned = p.minutes(26.0, 30.5)                         # crosses 30.0
+        self._feed(p, [(60 + planned, 30.5)])                   # exactly to plan
+        assert p.revisions == 1
+        assert p.rates == pytest.approx([1.10, 0.99, 0.79], rel=1e-3)
 
     def test_a_faster_spa_pulls_the_estimate_earlier(self):
         p = self._plan()
