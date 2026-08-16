@@ -276,7 +276,7 @@ if __name__ == "__main__":
 # property the design exists for.
 
 
-# ── Detecting a wrong shadow rate early: six approaches, none of them work ───
+# ── Detecting a wrong shadow rate early: six approaches that do not work ─────
 #
 # The question was whether we can tell the shadow curve is off before the water is
 # close enough to the target for a measurement to be proportionate. On a 20 °C start
@@ -306,13 +306,43 @@ if __name__ == "__main__":
 # the model predicts *there*, rather than to a bucket average it sits at one end of.
 # It is not enough on its own.
 #
-# The one real choice is between:
+# ── What did work: size the measurement, don't gate it ──────────────────────
 #
-#   gate 4          best when the stored rates are right, which is most of the time,
-#                   and badly wrong on the first session after conditions change
-#   2 °C tilted     consistently mediocre — about 55 / 40 / 6 either way
+# All six above keep a fixed one-degree settle and argue about when to trust it. The
+# answer was to stop fixing it. Measure a third of whatever distance is left:
 #
-# Shipped: gate 4. The winter figures are synthetic, the buckets learn from a bad
-# session so the exposure is one session per change of season, and progress_deviation
-# reports the discrepancy even where the estimate cannot correct it. Revisit with a
-# real cold-weather session rather than with this scaling.
+#     settle = max(1.0, (target - anchor) / 3)
+#
+# and the gate becomes unnecessary, because what remains after the measurement is
+# always exactly twice what was measured, from any starting temperature. A 22 °C start
+# measures 5.5 °C before it commits; a 38 °C top-up measures one crossing. Same rule,
+# and it is the one the amplification gate was groping towards — proportionate evidence
+# — expressed as a length instead of a veto.
+#
+# With a 2 °C session-start warm-up (the opening crossings time band position and the
+# heater coming up, not heating — 2026-08-12 implied 7.9 °C/h over its first degree and
+# still finished within a minute of plan):
+#
+#                                ¼ in    half    ¾ in    end   first revision
+#   flat 1.0 + gate 4              10      10       4      2       82% in
+#   remaining/3, warm-up 2 °C      10      30      14      2       43% in
+#     ...stored rates +30%        142      30      14      2       43% in
+#     ...stored rates -25%        227      30      14      2       43% in
+#
+# Read the second column down: 30, 30, 30. Not similar — identical, per session, to the
+# minute. Once the first measurement lands, whatever the stored buckets got wrong has
+# been measured away, so a curve learned in July no longer drags a January heat-up. The
+# gated version leaks that error to the display for the whole session: 142 and 227.
+#
+# The cost is 20 minutes at the halfway mark in the case where the stored rates were
+# already right, bought with 112 and 197 in the cases where they were not. The quarter
+# column is unchanged because nothing has been measured yet — the display is simply the
+# opening plan, which is the honest thing to show before there is evidence.
+#
+# Two things that did not survive the change: extra band boundaries (34, and 26) now
+# make it worse rather than being inert — 30 minutes at halfway becomes 61 and 112 —
+# because every boundary re-anchors and shortens the run this design exists to lengthen.
+# And a floor on the settle above 1 °C hurts everywhere; the floor is only there to stop
+# the last band asking for less than a single crossing.
+#
+# The winter and slow figures are synthetic. Revisit with a real cold-weather session.

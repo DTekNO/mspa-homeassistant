@@ -241,20 +241,30 @@ class HeatPredictor:
 
 
 # ── Shadow plan ──────────────────────────────────────────────────────────────
-# The stored buckets' own boundaries. An extra one at 34 was tried and makes no
-# difference: only a band within `max_amplification x settle` of the target ever
-# recalibrates, and 34-37 is not, so the split is inert. It appeared to help while an
-# earlier version of the rule let bands recalibrate late on a grown span, which was a
-# bug rather than a feature.
+# The stored buckets' own boundaries. Extra ones at 34 and at 26 were both tried and
+# both make things worse — 30 minutes wrong at the halfway mark becomes 61 and 112.
+# Every boundary re-anchors the measurement, so more of them means shorter runs, and a
+# short run is exactly what this design exists to avoid.
 SHADOW_BOUNDS = (30.0, 37.0)
 
-# How much of the remaining journey one measurement may speak for. A rate measured
-# over one degree and applied to sixteen multiplies its own error sixteenfold:
-# recalibrating that early made every recorded session worse, by 150, 102 and 267
-# minutes. Requiring the remaining span to be no more than four times the measured one
-# keeps the correction proportionate to its evidence.
-SHADOW_MAX_AMPLIFICATION = 4.0
-SHADOW_SETTLE_C = 1.0
+# How much of the remaining journey one measurement may speak for. A rate measured over
+# one degree and applied to sixteen multiplies its own error sixteenfold: recalibrating
+# that early made every recorded session worse, by 150, 102 and 267 minutes. So the
+# measurement is sized to the journey rather than fixed — measure a third of what is
+# left, and what remains is then worth only twice what was measured, whatever the
+# starting temperature. A cold start from 22 °C measures 5.5 °C before it commits; a
+# top-up from 38 °C measures a single crossing.
+SHADOW_SETTLE_DIVISOR = 3.0
+SHADOW_SETTLE_MIN_C = 1.0
+
+# How far a session must heat before its first measurement begins. The opening
+# crossings time the water's unknown position inside its 0.5 °C band and the heater's
+# engagement rather than any steady heating — 2026-08-12 implied 7.9 °C/h over its first
+# degree, which no heater here can produce, and that session went on to finish within a
+# minute of its plan. Two degrees is what it took to stop that transient reaching the
+# display: it halves the error at the halfway mark, 61 minutes to 30 in the worst
+# recorded session. Band boundaries need no such allowance; they are exact positions.
+SHADOW_WARMUP_C = 2.0
 
 # How far the shadow may stray from the rates it started with. Applied to the
 # cumulative deviation, not to each step: a single large factor is legitimate when it
@@ -270,32 +280,49 @@ class ShadowPlan:
     from and are learned slowly across sessions; this exists only to make the
     *displayed* ready time right, and is discarded when the session ends.
 
-    Measured over four recorded heat-ups, minutes wrong on average:
-
-                                  ¼ in   half   ¾ in   end   revisions
-        this                        10     10      4     2       2
-        replanning every crossing   38     26     14     0      18
-
     The rule for *when* to recalibrate is the whole trick, and it is neither a fixed
-    temperature nor a fixed delay: it fires once the span actually measured is worth a
-    quarter of the span still to come. On a cold start from 22 °C that lands near
-    26 °C, early; on a top-up from 37 °C it lands near the target. The measurement is
-    always proportionate to the journey it is asked to predict.
+    temperature nor a fixed delay: the span measured is always a third of the span still
+    to come. Far from the target that is a long run — 5.5 °C from a 22 °C start — and
+    close to it a single crossing. The measurement is therefore always proportionate to
+    the journey it is asked to predict, which is what lets it be trusted whole.
+
+    Measured over four recorded heat-ups, minutes wrong on average, against a copy of
+    those sessions with the stored rates offset 30% as a season change would offset
+    them:
+
+                                   ¼ in   half   ¾ in   end   first revision
+        stored rates right           10     30     14     2      43% in
+        stored rates 30% out        142     30     14     2      43% in
+        replanning every crossing    38     26     14     0      every sample
+
+    The middle row is the point. After the first recalibration the two scenarios agree
+    exactly: whatever the stored buckets got wrong has been measured away, so a curve
+    learned in July no longer drags a January heat-up. Before it, the display is simply
+    the opening plan — being wrong quietly for the first third beats being wrong loudly
+    throughout, which is what a fixed one-degree settle did (142 minutes out at the
+    halfway mark, 227 when the stored rates were slow rather than fast).
     """
 
     def __init__(self, base_rates, start_temp, target, opening_eta,
-                 bounds=SHADOW_BOUNDS, settle=SHADOW_SETTLE_C,
-                 max_amplification=SHADOW_MAX_AMPLIFICATION):
+                 bounds=SHADOW_BOUNDS, divisor=SHADOW_SETTLE_DIVISOR,
+                 settle_min=SHADOW_SETTLE_MIN_C, warmup=SHADOW_WARMUP_C):
         self.bounds = tuple(bounds)
         self.target = target
-        self.settle = settle
-        self.max_amplification = max_amplification
+        self.divisor = divisor
+        self.settle_min = settle_min
+        self.warmup = warmup
         self.eta = opening_eta
         self.revisions = 0
+        self._start_temp = start_temp
         self._base = self._seed(base_rates)
         self.rates = list(self._base)
         self._anchor = None          # (temp, when) — always a crossing, never the start
         self._done = set()
+
+    def settle_for(self, anchor_temp):
+        """Degrees to measure from `anchor_temp` before the curve may be revised."""
+        return max(self.settle_min,
+                   (self.target - anchor_temp) / self.divisor)
 
     def _seed(self, base_rates):
         """Seed each shadow band from the stored bucket covering its midpoint."""
@@ -328,33 +355,34 @@ class ShadowPlan:
     def crossing(self, temp, when):
         """Feed one reported-temperature change. True when the estimate was revised.
 
-        The first call of a session is never used as a measurement: at that moment the
-        water sits somewhere unknown inside its 0.5 °C band, so the interval leading to
-        it times that position rather than any heating — session C implied 7.9 °C/h,
-        which no heater here can produce. From the first crossing onward every position
-        is exact, and a band boundary is exact by definition, so nothing further is set
-        aside.
+        Measurement does not begin at the session start. The water sits somewhere
+        unknown inside its 0.5 °C band and the heater has yet to settle, so the opening
+        crossings time that rather than any heating; nothing is measured until the spa
+        has climbed `warmup` degrees. A band boundary needs no such allowance — it is an
+        exact position — so a crossing into a new band anchors immediately.
         """
         band = self.band(temp)
-        if self._anchor is None or self.band(self._anchor[0]) != band:
+        anchored = self._anchor is not None
+        if not anchored:
+            if temp - self._start_temp >= self.warmup - 1e-9:
+                self._anchor = (temp, when)
+        elif self.band(self._anchor[0]) != band:
             self._anchor = (temp, when)
-            return False
+            anchored = False
 
         revised = False
-        if band not in self._done:
+        # A top-up that starts within `warmup` of its target never measures anything, so
+        # the last-half-degree look below has to stay reachable without an anchor.
+        if anchored and band not in self._done:
             span = temp - self._anchor[0]
             hours = (when - self._anchor[1]).total_seconds() / 3600.0
-            if span >= self.settle and hours > 0:
-                # A band gets exactly one chance, at the moment it has been measured
-                # for `settle` degrees — and it is taken only if what remains is worth
-                # no more than `max_amplification` times that.  Marking the band done
-                # either way is deliberate: letting it keep waiting lets the span grow
-                # until the test passes on arithmetic alone, which fires the
-                # recalibration hundreds of minutes too early.  Doing exactly that put
-                # the estimate 81 minutes out at the quarter mark against 10 for this.
-                if self.target - temp <= self.max_amplification * self.settle:
-                    revised = self._recalibrate(
-                        span / hours, self._anchor[0], temp, when)
+            # One recalibration per band, at the moment it has been measured for its
+            # share of the remaining journey.  The anchor stays put afterwards, so
+            # without this the span would keep growing past the settle and the curve
+            # would be revised at every subsequent crossing — the churn this replaced.
+            if span >= self.settle_for(self._anchor[0]) - 1e-9 and hours > 0:
+                revised = self._recalibrate(
+                    span / hours, self._anchor[0], temp, when)
                 self._done.add(band)
 
         # One last look with half a degree to go, using whatever the curve has become.

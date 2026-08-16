@@ -422,10 +422,10 @@ class TestTempAnchorOnlyMovesOnRealChange:
 class TestShadowPlan:
     """The private rate curve that owns the displayed ready time during a session.
 
-    Replayed over the four recorded heat-ups it is within about 10 minutes from a
-    quarter of the way in, 4 by three-quarters, 2 at the end, and it revises the
-    estimate twice — against 38 / 26 / 14 / 0 and eighteen revisions for replanning at
-    every crossing. See analysis/shadow_recalibrate.py.
+    Replayed over the four recorded heat-ups it is within 30 minutes at the halfway
+    mark, 14 by three-quarters and 2 at the end — and it reaches those same figures
+    when the stored rates it started from are offset 30% either way, which is the
+    property the design exists for. See analysis/shadow_recalibrate.py.
     """
 
     _T0 = datetime(2026, 8, 14, 4, 0, tzinfo=timezone.utc)
@@ -450,33 +450,64 @@ class TestShadowPlan:
         assert p.eta == self._T0 + timedelta(minutes=426)
         assert p.revisions == 0
 
-    def test_the_first_crossing_is_never_a_measurement(self):
-        """The interval to it times where the water sat in its band, not heating."""
-        p = self._plan(start=38.0, target=39.5, opening_min=120)
-        p.crossing(38.5, self._T0 + timedelta(minutes=2))   # absurd rate, must be ignored
-        assert p.revisions == 0 and p.eta == self._T0 + timedelta(minutes=120)
+    def test_nothing_is_measured_until_the_warm_up_is_over(self):
+        """The opening crossings time where the water sat in its band and the heater
+        coming up, not steady heating — 2026-08-12 implied 7.9 °C/h over its first."""
+        p = self._plan(start=37.0, target=39.5, opening_min=190)
+        # 0.5 °C in 2 minutes is 15 °C/h; nothing here may reach the curve.
+        self._feed(p, [(2, 37.5), (30, 38.0), (60, 38.5)])
+        assert p.eta == self._T0 + timedelta(minutes=190)
+        assert p.revisions == 0
 
-    def test_it_recalibrates_once_close_enough_to_target(self):
-        """37.0 → 38.0 leaves 1.5 °C, comfortably inside 4 x settle."""
+    def test_a_top_up_shorter_than_the_warm_up_still_gets_its_last_look(self):
+        """38.0 → 39.5 never climbs the 2 °C that starts a measurement, so the final
+        half-degree is the only correction it will ever get. It has to stay reachable."""
+        p = self._plan(start=38.0, target=39.5, opening_min=120)
+        self._feed(p, [(40, 38.5)])
+        assert p.revisions == 0
+        self._feed(p, [(80, 39.0)])
+        assert p.revisions == 1
+
+    def test_the_settle_shrinks_as_the_target_nears(self):
+        p = self._plan()
+        assert p.settle_for(22.0) == pytest.approx(17.5 / 3.0)   # a long cold-start run
+        assert p.settle_for(35.0) == pytest.approx(1.5)
+        assert p.settle_for(39.0) == pytest.approx(1.0)          # floored, not 0.17
+
+    def test_it_recalibrates_once_it_has_measured_its_share(self):
+        """37.0 → 38.0 measures 1.0 °C with 2.5 °C left, so the settle is the floor."""
         p = self._plan()
         self._feed(p, [(200, 37.0), (260, 38.0)])
         assert p.revisions == 1
         # 1.0 °C in 60 min is 1.0 °C/h against a shadow of 0.79, so the curve speeds up
         assert p.rates[2] > 0.79
 
-    def test_it_declines_when_too_much_still_remains(self):
-        """34.0 → 35.0 leaves 4.5 °C — more than the measurement can speak for."""
+    def test_it_holds_while_the_measurement_is_short_for_what_remains(self):
+        """Anchored at 35.0 with 4.5 °C to go, one degree is not yet a third of it."""
         p = self._plan()
         self._feed(p, [(0, 33.5), (60, 34.0), (120, 35.0), (180, 36.0)])
         assert p.revisions == 0
+        self._feed(p, [(240, 36.5)])                # 1.5 °C measured — now it qualifies
+        assert p.revisions == 1
 
-    def test_a_band_gets_exactly_one_chance(self):
-        """Letting it wait until the growing span passes the test fires it far too
-        early — 81 min out at the quarter mark against 10."""
+    def test_a_band_recalibrates_only_once(self):
+        """The anchor stays put, so without this the span keeps growing past the settle
+        and every later crossing in the band would revise the curve again."""
+        p = self._plan(start=30.0)
+        self._feed(p, [(30, 30.5), (60, 31.5), (90, 32.0)])     # warm-up, then anchored
+        self._feed(p, [(150, 33.0), (210, 34.5)])               # 2.5 °C measured — fires
+        assert p.revisions == 1
+        self._feed(p, [(270, 35.0), (330, 35.5), (390, 36.0)])  # same band, must not
+        assert p.revisions == 1
+
+    def test_a_boundary_re_anchors_without_a_warm_up(self):
+        """A band edge is an exact position, so it needs no allowance — unlike a start,
+        where the water sits somewhere unknown inside its 0.5 °C band."""
         p = self._plan()
-        self._feed(p, [(0, 33.5), (60, 34.5)])      # 5.0 °C left, declined
-        self._feed(p, [(200, 36.5)])                # same band, must not fire now
-        assert p.revisions == 0
+        self._feed(p, [(0, 33.5), (60, 35.0), (120, 36.5)])     # recalibrates in 30-37
+        before = p.revisions
+        self._feed(p, [(180, 37.0), (240, 38.0)])               # 37.0 anchors at once
+        assert p.revisions == before + 1
 
     def test_a_faster_spa_pulls_the_estimate_earlier(self):
         p = self._plan()

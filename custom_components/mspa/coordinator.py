@@ -1008,8 +1008,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     def shadow_eta(self):
         """Ready time from the shadow curve, or None outside a session.
 
-        Revised twice in a typical session rather than eighteen times, and within about
-        ten minutes from a quarter of the way in — see predictor.ShadowPlan.
+        Revised three times in a typical session rather than at every sample, and from
+        the first revision — a little under halfway — it is within half an hour whether
+        or not the stored rates it started from were right. See predictor.ShadowPlan.
         """
         shadow = getattr(self, "_shadow", None)
         return shadow.eta if shadow is not None else None
