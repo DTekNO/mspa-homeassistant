@@ -28,8 +28,12 @@ _spec.loader.exec_module(st)
 
 T1, T2 = st.T1, st.T2
 
-# A factor outside this range is not a spa heating differently, it is a measurement
-# that means something else — see the opening-crossing problem in the report below.
+# How far the shadow curve may stray from the rates that were learned. Applied to the
+# *cumulative* deviation, not to each step: a single large factor is legitimate when it
+# is bringing the shadow back toward the learned rates after an earlier over-correction,
+# and clamping steps individually blocks exactly that recovery. Session C needed 0.41 to
+# undo a bad opening measurement and a per-step clamp held it at 0.5, leaving it 10 min
+# out for the rest of the run.
 FACTOR_MIN, FACTOR_MAX = 0.5, 2.0
 
 
@@ -47,47 +51,56 @@ def _minutes(rates, frm: float, to: float) -> float:
     return total
 
 
-def strategy_shadow(session, settle_degrees=1.0, final_replan=False, clamp=True,
-                    skip_start_bucket=False):
-    """Recalibrate the shadow curve once per bucket, after `settle_degrees` of heating.
+def strategy_shadow(session, settle_degrees=1.0, final_replan=False, clamp=True):
+    """Recalibrate the shadow curve once per bucket, measuring from a known position.
 
-    `skip_start_bucket` declines to recalibrate in the bucket the session opens in.
-    Not because that measurement is unwanted, but because the opening interval is not a
-    measurement of the heating rate: the water sits somewhere unknown inside its 0.5 °C
-    band when the heater engages, so the first crossings time that position rather than
-    any heating. `_track_heating_rate` already classifies them the same way — logged as
-    "phase-uncertain — anchored, not learned" — and they still reach the stored rates
-    through the growing window once it has re-anchored on a boundary.
+    The measurement window is anchored on a *crossing*, never on the session start.
+
+    At the start the water sits somewhere unknown inside its 0.5 °C band, so the
+    interval from there to the first crossing times that position rather than any
+    heating — on session C it implied 7.9 °C/h. Only that interval is set aside; the
+    first crossing then becomes an exact position and everything from it is measured.
+
+    At a bucket boundary nothing is set aside at all, because the crossing that enters
+    the bucket is itself an exact position. So a cold start measures from 22.5 rather
+    than 22.0, and from 30.0 and 37.0 exactly.
+
+    The shadow curve is entirely separate from the stored bucket learning, which
+    continues untouched: this exists to make the ready time right over the closing
+    hour, while the stored rates are what the scheduler plans from.
     """
     shadow = list(session.rates)
-    start_bucket = _bucket(session.start_temp)
     eta = session.start_time + timedelta(minutes=session.logged_raw)
-    out, entry, done = [], None, set()
-    events = []
+    out, anchor, done, events = [], None, set(), []
 
-    for t, temp in session.crossings:
+    for i, (t, temp) in enumerate(session.crossings):
         b = _bucket(temp)
-        if entry is None or _bucket(entry[1]) != b:
-            entry = (t, temp)                      # first reading in this bucket
+        if anchor is None:
+            if i > 0:                       # first crossing after the start
+                anchor = (t, temp)
+        elif _bucket(anchor[1]) != b:       # a boundary crossing, exact by definition
+            anchor = (t, temp)
 
-        if skip_start_bucket and b == start_bucket:
-            done.add(b)
-        if b not in done and entry is not None:
-            span = temp - entry[1]
-            hours = (t - entry[0]).total_seconds() / 3600.0
+        if anchor is not None and b not in done:
+            span = temp - anchor[1]
+            hours = (t - anchor[0]).total_seconds() / 3600.0
             if span >= settle_degrees and hours > 0:
                 observed = span / hours
-                base = shadow[_bucket(entry[1])]
+                base = shadow[_bucket(anchor[1])]
                 if base:
                     factor = observed / base
                     if clamp:
-                        factor = max(FACTOR_MIN, min(FACTOR_MAX, factor))
+                        cumulative = (shadow[0] / session.rates[0]) * factor
+                        if cumulative > FACTOR_MAX:
+                            factor *= FACTOR_MAX / cumulative
+                        elif cumulative < FACTOR_MIN:
+                            factor *= FACTOR_MIN / cumulative
                     shadow = [r * factor if r else r for r in shadow]
                     done.add(b)
                     eta = t + timedelta(minutes=_minutes(shadow, temp, session.target))
-                    events.append((t, temp, observed, base, factor))
+                    events.append((t, temp, anchor[1], observed, base, factor))
 
-        if final_replan and temp >= session.target - 0.5 - 1e-9 and temp < session.target:
+        if final_replan and session.target - 0.5 - 1e-9 <= temp < session.target:
             eta = t + timedelta(minutes=_minutes(shadow, temp, session.target))
 
         out.append((t, eta))
@@ -127,11 +140,11 @@ def main() -> None:
         print(f"  {s.name}")
         if not ev:
             print("     never recalibrated")
-        for t, temp, obs, base, f in ev:
+        for t, temp, frm, obs, base, f in ev:
             mins = (t - s.start_time).total_seconds() / 60.0
             flag = "   <-- implausible" if not (FACTOR_MIN <= f <= FACTOR_MAX) else ""
-            print(f"     at {mins:5.0f} min, {temp:4.1f} °C: measured {obs:5.2f} °C/h "
-                  f"against {base:4.2f} -> factor {f:5.2f}{flag}")
+            print(f"     at {mins:5.0f} min, {frm:4.1f}→{temp:4.1f} °C: measured "
+                  f"{obs:5.2f} °C/h against {base:4.2f} -> factor {f:5.2f}{flag}")
         print()
 
     variants = [
@@ -140,12 +153,7 @@ def main() -> None:
         ("shadow, settle 1.5 °C", lambda x: strategy_shadow(x, 1.5, False, True)[0]),
         ("shadow, 1.0 °C + final 0.5 replan", lambda x: strategy_shadow(x, 1.0, True, True)[0]),
         ("shadow, 1.5 °C + final 0.5 replan", lambda x: strategy_shadow(x, 1.5, True, True)[0]),
-        ("shadow at boundaries only, 1.0 °C",
-         lambda x: strategy_shadow(x, 1.0, False, True, True)[0]),
-        ("shadow at boundaries only, 1.0 + final",
-         lambda x: strategy_shadow(x, 1.0, True, True, True)[0]),
-        ("shadow at boundaries only, 1.5 + final",
-         lambda x: strategy_shadow(x, 1.5, True, True, True)[0]),
+        ("shadow, 2.0 °C + final 0.5 replan", lambda x: strategy_shadow(x, 2.0, True, True)[0]),
         ("hold the opening estimate", st.strategy_hold),
         ("settle 90/1.5 then replan each crossing",
          lambda x: st.strategy_settle_then_replan(x, 90, 1.5)),
@@ -172,9 +180,9 @@ def main() -> None:
               f"{sum(fin)/4:>6.1f} m{sum(moves)/4:>7.1f}")
 
     print("\nPer session, the best variant against the two already on the table:\n")
-    print(f"{'session':<26}{'shadow bnd 1.0+fin':>19}{'hold':>8}{'replan/crossing':>18}")
+    print(f"{'session':<26}{'shadow 1.0+final':>18}{'hold':>8}{'replan/crossing':>18}")
     for s in sessions:
-        a, _ = st.score_endgame(s, strategy_shadow(s, 1.0, True, True, True)[0])
+        a, _ = st.score_endgame(s, strategy_shadow(s, 1.0, True, True)[0])
         b, _ = st.score_endgame(s, st.strategy_hold(s))
         c, _ = st.score_endgame(s, st.strategy_settle_then_replan(s, 90, 1.5))
         print(f"{s.name:<26}{a:>16.1f} m{b:>6.1f} m{c:>16.1f} m")
