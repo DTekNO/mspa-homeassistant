@@ -102,6 +102,7 @@ class MockCoordinator:
     session_settled = MSpaUpdateCoordinator.session_settled
     session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
     session_progress_deviation = MSpaUpdateCoordinator.session_progress_deviation
+    shadow_eta = MSpaUpdateCoordinator.shadow_eta
 
     def _predictor(self):
         return HeatPredictor(

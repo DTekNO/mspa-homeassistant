@@ -329,6 +329,13 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
     # Freezing the rates matters as much as the settle: recomputing with rates that
     # move as they are learned was the shipped behaviour, and it was worse than either
     # (21 min mean against 10 for holding).
+    # The shadow curve owns the displayed estimate whenever a session is running: it
+    # is held between revisions rather than recomputed, so this returns a timestamp
+    # rather than a span from the anchor.
+    shadow = coordinator.shadow_eta()
+    if shadow is not None:
+        return shadow
+
     plan = coordinator.session_plan()
     if plan is not None and not coordinator.session_settled(anc_temp, now_utc):
         opening = coordinator.session_opening_eta()

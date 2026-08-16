@@ -4,6 +4,7 @@ from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
 from .predictor import (
     HeatPredictor,
+    ShadowPlan,
     ambient_rate_factor,
     bucket_index,
     extrapolate_within_band,
@@ -327,6 +328,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # readings with readings: temp_anchor_temp is a band *midpoint*, so comparing a
         # reading against it never matches and the anchor would re-fire every poll.
         self._anchor_prev_reading: float | None = None
+        # Private rate curve for the displayed ready time, recalibrated against today's
+        # actual heating and discarded when the session ends.  Never feeds the stored
+        # buckets, which the scheduler plans from.
+        self._shadow: ShadowPlan | None = None
         self.temp_anchor_target: float | None = None     # target_temp at that moment
 
         # Shared hysteresis flag for the time-to-target sensors.
@@ -545,6 +550,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             for i, b in enumerate(self.heat_rate_buckets)
                         ],
                     }
+                    self._shadow = ShadowPlan(
+                        base_rates=self._prediction["plan_rates"],
+                        start_temp=new_temp,
+                        target=new_target,
+                        opening_eta=(datetime.now(timezone.utc)
+                                     + timedelta(minutes=est_minutes)),
+                    )
                     buckets_str = "/".join(
                         f"{b:.2f}" if b is not None else "-"
                         for b in self.heat_rate_buckets
@@ -593,6 +605,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self._prediction_history.append(result)
                 self._prediction_history = self._prediction_history[-10:]  # keep last 10
                 self._prediction = None
+                self._shadow = None
                 ratio = self._bias_ratio(result)
                 if ratio is not None:
                     self._apply_bias_sample(
@@ -612,6 +625,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Prediction cancelled — target changed from %.1f to %.1f",
                               self._prediction.get("target_temp", 0), new_target)
                 self._prediction = None
+                self._shadow = None
 
             self._update_near_target(new_temp, new_target)
             # else: no temp data — leave flags unchanged
@@ -972,11 +986,33 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 and new_temp != prev):
             anchored = (new_temp + prev) / 2.0
             rising = new_temp > prev
-        self.temp_anchor_time     = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        shadow = getattr(self, "_shadow", None)
+        if (shadow is not None and prev is not None and new_temp is not None
+                and new_temp != prev):
+            # A reported-temperature change is a crossing: an exact position, which is
+            # the only thing the shadow will measure between.
+            if shadow.crossing(new_temp, now):
+                _LOGGER.info(
+                    "Ready at: plan revised at %.1f °C — rates now %s, ready %s",
+                    new_temp,
+                    "/".join(f"{r:.2f}" for r in shadow.rates),
+                    shadow.eta.isoformat(timespec="minutes"),
+                )
+        self.temp_anchor_time     = now
         self.temp_anchor_temp     = anchored
         self.temp_anchor_target   = new_target
         self.temp_anchor_rising   = rising
         self._anchor_prev_reading = new_temp
+
+    def shadow_eta(self):
+        """Ready time from the shadow curve, or None outside a session.
+
+        Revised twice in a typical session rather than eighteen times, and within about
+        ten minutes from a quarter of the way in — see predictor.ShadowPlan.
+        """
+        shadow = getattr(self, "_shadow", None)
+        return shadow.eta if shadow is not None else None
 
     def session_plan(self) -> "HeatPredictor | None":
         """The rate curve frozen at session start, or None outside a session.

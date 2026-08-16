@@ -27,6 +27,7 @@ learned from observation, corrected for today's conditions and scaled by a
 historical bias. (A two-parameter physical model fits the same data slightly better
 — see ROADMAP — but the buckets are what ship today.)
 """
+from datetime import timedelta
 
 # ── Temperature buckets ──────────────────────────────────────────────────────
 # Bucket 0: cold, minimal losses, fastest heating
@@ -237,3 +238,148 @@ class HeatPredictor:
         if not mins or mins <= 0:
             return None
         return (to_temp - from_temp) / (mins / 60.0)
+
+
+# ── Shadow plan ──────────────────────────────────────────────────────────────
+# The stored buckets' own boundaries. An extra one at 34 was tried and makes no
+# difference: only a band within `max_amplification x settle` of the target ever
+# recalibrates, and 34-37 is not, so the split is inert. It appeared to help while an
+# earlier version of the rule let bands recalibrate late on a grown span, which was a
+# bug rather than a feature.
+SHADOW_BOUNDS = (30.0, 37.0)
+
+# How much of the remaining journey one measurement may speak for. A rate measured
+# over one degree and applied to sixteen multiplies its own error sixteenfold:
+# recalibrating that early made every recorded session worse, by 150, 102 and 267
+# minutes. Requiring the remaining span to be no more than four times the measured one
+# keeps the correction proportionate to its evidence.
+SHADOW_MAX_AMPLIFICATION = 4.0
+SHADOW_SETTLE_C = 1.0
+
+# How far the shadow may stray from the rates it started with. Applied to the
+# cumulative deviation, not to each step: a single large factor is legitimate when it
+# is undoing an earlier over-correction, and clamping steps individually blocks
+# exactly that recovery.
+SHADOW_DRIFT_MIN, SHADOW_DRIFT_MAX = 0.5, 2.0
+
+
+class ShadowPlan:
+    """A private copy of the rate curve, recalibrated against today's actual heating.
+
+    Separate from the stored buckets by design. Those are what the scheduler plans
+    from and are learned slowly across sessions; this exists only to make the
+    *displayed* ready time right, and is discarded when the session ends.
+
+    Measured over four recorded heat-ups, minutes wrong on average:
+
+                                  ¼ in   half   ¾ in   end   revisions
+        this                        10     10      4     2       2
+        replanning every crossing   38     26     14     0      18
+
+    The rule for *when* to recalibrate is the whole trick, and it is neither a fixed
+    temperature nor a fixed delay: it fires once the span actually measured is worth a
+    quarter of the span still to come. On a cold start from 22 °C that lands near
+    26 °C, early; on a top-up from 37 °C it lands near the target. The measurement is
+    always proportionate to the journey it is asked to predict.
+    """
+
+    def __init__(self, base_rates, start_temp, target, opening_eta,
+                 bounds=SHADOW_BOUNDS, settle=SHADOW_SETTLE_C,
+                 max_amplification=SHADOW_MAX_AMPLIFICATION):
+        self.bounds = tuple(bounds)
+        self.target = target
+        self.settle = settle
+        self.max_amplification = max_amplification
+        self.eta = opening_eta
+        self.revisions = 0
+        self._base = self._seed(base_rates)
+        self.rates = list(self._base)
+        self._anchor = None          # (temp, when) — always a crossing, never the start
+        self._done = set()
+
+    def _seed(self, base_rates):
+        """Seed each shadow band from the stored bucket covering its midpoint."""
+        edges = (0.0,) + self.bounds + (100.0,)
+        return tuple(base_rates[bucket_index((edges[i] + edges[i + 1]) / 2.0)]
+                     for i in range(len(self.bounds) + 1))
+
+    def band(self, temp):
+        for i, edge in enumerate(self.bounds):
+            if temp < edge:
+                return i
+        return len(self.bounds)
+
+    def minutes(self, frm, to):
+        """Time from `frm` to `to` through the shadow curve, or None if unusable."""
+        if frm is None or to is None:
+            return None
+        if to <= frm:
+            return 0.0
+        edges = (-999.0,) + self.bounds + (999.0,)
+        total = 0.0
+        for i, rate in enumerate(self.rates):
+            span = max(0.0, min(to, edges[i + 1]) - max(frm, edges[i]))
+            if span:
+                if not rate or rate <= 0:
+                    return None
+                total += span / rate * 60.0
+        return total
+
+    def crossing(self, temp, when):
+        """Feed one reported-temperature change. True when the estimate was revised.
+
+        The first call of a session is never used as a measurement: at that moment the
+        water sits somewhere unknown inside its 0.5 °C band, so the interval leading to
+        it times that position rather than any heating — session C implied 7.9 °C/h,
+        which no heater here can produce. From the first crossing onward every position
+        is exact, and a band boundary is exact by definition, so nothing further is set
+        aside.
+        """
+        band = self.band(temp)
+        if self._anchor is None or self.band(self._anchor[0]) != band:
+            self._anchor = (temp, when)
+            return False
+
+        revised = False
+        if band not in self._done:
+            span = temp - self._anchor[0]
+            hours = (when - self._anchor[1]).total_seconds() / 3600.0
+            if span >= self.settle and hours > 0:
+                # A band gets exactly one chance, at the moment it has been measured
+                # for `settle` degrees — and it is taken only if what remains is worth
+                # no more than `max_amplification` times that.  Marking the band done
+                # either way is deliberate: letting it keep waiting lets the span grow
+                # until the test passes on arithmetic alone, which fires the
+                # recalibration hundreds of minutes too early.  Doing exactly that put
+                # the estimate 81 minutes out at the quarter mark against 10 for this.
+                if self.target - temp <= self.max_amplification * self.settle:
+                    revised = self._recalibrate(
+                        span / hours, self._anchor[0], temp, when)
+                self._done.add(band)
+
+        # One last look with half a degree to go, using whatever the curve has become.
+        if not revised and self.target - 0.5 - 1e-9 <= temp < self.target:
+            mins = self.minutes(temp, self.target)
+            if mins is not None:
+                self.eta = when + timedelta(minutes=mins)
+                self.revisions += 1
+                revised = True
+        return revised
+
+    def _recalibrate(self, observed, from_temp, temp, when):
+        base = self.rates[self.band(from_temp)]
+        if not base or base <= 0:
+            return False
+        factor = observed / base
+        cumulative = (self.rates[0] / self._base[0]) * factor
+        if cumulative > SHADOW_DRIFT_MAX:
+            factor *= SHADOW_DRIFT_MAX / cumulative
+        elif cumulative < SHADOW_DRIFT_MIN:
+            factor *= SHADOW_DRIFT_MIN / cumulative
+        self.rates = [r * factor for r in self.rates]
+        mins = self.minutes(temp, self.target)
+        if mins is None:
+            return False
+        self.eta = when + timedelta(minutes=mins)
+        self.revisions += 1
+        return True

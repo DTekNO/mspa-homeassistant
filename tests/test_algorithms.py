@@ -33,6 +33,7 @@ class _Coord:
     session_plan = MSpaUpdateCoordinator.session_plan
     session_settled = MSpaUpdateCoordinator.session_settled
     session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
+    shadow_eta = MSpaUpdateCoordinator.shadow_eta
 
     def __init__(
         self,
@@ -416,3 +417,85 @@ class TestTempAnchorOnlyMovesOnRealChange:
                 c.temp_anchor_temp, hours, 0.36, cooling=not c.temp_anchor_rising)
             assert reading - 0.25 - 1e-9 <= est <= reading + 0.25 + 1e-9, (
                 f"estimate {est} left the band of reading {reading} after {hours} h")
+
+
+class TestShadowPlan:
+    """The private rate curve that owns the displayed ready time during a session.
+
+    Replayed over the four recorded heat-ups it is within about 10 minutes from a
+    quarter of the way in, 4 by three-quarters, 2 at the end, and it revises the
+    estimate twice — against 38 / 26 / 14 / 0 and eighteen revisions for replanning at
+    every crossing. See analysis/shadow_recalibrate.py.
+    """
+
+    _T0 = datetime(2026, 8, 14, 4, 0, tzinfo=timezone.utc)
+
+    def _plan(self, start=33.0, target=39.5, opening_min=426):
+        from custom_components.mspa.predictor import ShadowPlan
+        return ShadowPlan((1.10, 0.99, 0.79), start, target,
+                          self._T0 + timedelta(minutes=opening_min))
+
+    def _feed(self, plan, steps):
+        """steps: (minutes since start, temperature)."""
+        for mins, temp in steps:
+            plan.crossing(temp, self._T0 + timedelta(minutes=mins))
+        return plan
+
+    def test_bands_are_seeded_from_the_stored_buckets(self):
+        p = self._plan()
+        assert p.rates == [1.10, 0.99, 0.79]
+
+    def test_the_opening_estimate_stands_until_something_qualifies(self):
+        p = self._feed(self._plan(), [(30, 33.5), (60, 34.0), (90, 34.5)])
+        assert p.eta == self._T0 + timedelta(minutes=426)
+        assert p.revisions == 0
+
+    def test_the_first_crossing_is_never_a_measurement(self):
+        """The interval to it times where the water sat in its band, not heating."""
+        p = self._plan(start=38.0, target=39.5, opening_min=120)
+        p.crossing(38.5, self._T0 + timedelta(minutes=2))   # absurd rate, must be ignored
+        assert p.revisions == 0 and p.eta == self._T0 + timedelta(minutes=120)
+
+    def test_it_recalibrates_once_close_enough_to_target(self):
+        """37.0 → 38.0 leaves 1.5 °C, comfortably inside 4 x settle."""
+        p = self._plan()
+        self._feed(p, [(200, 37.0), (260, 38.0)])
+        assert p.revisions == 1
+        # 1.0 °C in 60 min is 1.0 °C/h against a shadow of 0.79, so the curve speeds up
+        assert p.rates[2] > 0.79
+
+    def test_it_declines_when_too_much_still_remains(self):
+        """34.0 → 35.0 leaves 4.5 °C — more than the measurement can speak for."""
+        p = self._plan()
+        self._feed(p, [(0, 33.5), (60, 34.0), (120, 35.0), (180, 36.0)])
+        assert p.revisions == 0
+
+    def test_a_band_gets_exactly_one_chance(self):
+        """Letting it wait until the growing span passes the test fires it far too
+        early — 81 min out at the quarter mark against 10."""
+        p = self._plan()
+        self._feed(p, [(0, 33.5), (60, 34.5)])      # 5.0 °C left, declined
+        self._feed(p, [(200, 36.5)])                # same band, must not fire now
+        assert p.revisions == 0
+
+    def test_a_faster_spa_pulls_the_estimate_earlier(self):
+        p = self._plan()
+        self._feed(p, [(200, 37.0), (230, 38.0)])   # 1.0 °C in 30 min = 2.0 °C/h
+        assert p.eta < self._T0 + timedelta(minutes=426)
+
+    def test_drift_is_capped_relative_to_where_it_started(self):
+        p = self._plan()
+        self._feed(p, [(200, 37.0), (205, 38.0)])   # 12 °C/h, physically impossible
+        assert max(p.rates) <= 1.10 * 2.0 + 1e-9
+
+    def test_the_final_half_degree_gets_a_look(self):
+        p = self._plan()
+        self._feed(p, [(200, 37.0), (260, 38.0)])
+        before = p.revisions
+        self._feed(p, [(320, 39.0)])
+        assert p.revisions == before + 1
+
+    def test_a_zero_rate_never_produces_an_estimate(self):
+        from custom_components.mspa.predictor import ShadowPlan
+        p = ShadowPlan((1.10, 0.0, 0.79), 33.0, 39.5, self._T0)
+        assert p.minutes(33.0, 39.5) is None
