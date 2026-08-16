@@ -247,3 +247,30 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── Extra shadow boundaries ──────────────────────────────────────────────────
+#
+# The owner asked whether the shadow needs a boundary the stored buckets do not have.
+# It does, and one is the right number.  Mean |error| over the whole session:
+#
+#                            rates correct         rates 30% too fast
+#                          A    B    C    D       A    B    C    D
+#   3 buckets (30, 37)    23   45   77   30      73   88  110   38
+#   + half bucket at 34   21   32   43   25      72   74   75   35
+#   + halves at 26, 34    14   32   43   25     103   74   75   35
+#
+# One extra boundary improves every session in both scenarios, and the closing
+# accuracy is unchanged (1.5 / 1.6 / 1.1 / 5.7), so it is a gain in the middle of the
+# session for nothing.  Two makes the cold start markedly worse when the stored rates
+# are wrong: the 26 °C band is measured too early and over too narrow a span, and the
+# resulting factor scales a journey that still has fifteen degrees to run.
+#
+# The winter column is a synthetic test — the recorded crossings replayed against
+# stored rates scaled by 1.3, standing in for summer rates meeting a January spa.
+# There is no cold-weather data yet; when there is, re-run this before trusting it.
+#
+# Note the closing-90 figures come out identical whether the stored rates are right or
+# 30% wrong.  That is not a bug in the harness: once the shadow has recalibrated near
+# the target, the estimate no longer depends on what the stored rates were.  It is the
+# property the design exists for.
