@@ -107,6 +107,61 @@ def strategy_shadow(session, settle_degrees=1.0, final_replan=False, clamp=True)
     return out, events
 
 
+# A measurement over one degree, applied to sixteen degrees of remaining journey,
+# multiplies its own error sixteenfold.  Recalibrating early therefore made things
+# worse in every recorded session — 150, 102 and 267 minutes worse — while the same
+# arithmetic near the target, where two or three degrees remain, lands within a few
+# minutes.  So recalibrate only where the remaining span is comparable to the span
+# actually measured.
+MAX_AMPLIFICATION = 4.0
+
+
+def strategy_late_only(session, settle_degrees=1.0, final_replan=True):
+    """Recalibrate once, on entering the last bucket, then replan for the final 0.5 °C.
+
+    Same closing accuracy as recalibrating at every boundary, without the mid-session
+    excursion, and with two changes to the displayed estimate rather than three or
+    seventeen.  Before the recalibration the opening estimate stands.
+    """
+    shadow = list(session.rates)
+    eta = session.start_time + timedelta(minutes=session.logged_raw)
+    out, anchor, done, events = [], None, set(), []
+
+    for i, (t, temp) in enumerate(session.crossings):
+        b = _bucket(temp)
+        if anchor is None:
+            if i > 0:
+                anchor = (t, temp)
+        elif _bucket(anchor[1]) != b:
+            anchor = (t, temp)
+
+        if anchor is not None and b not in done:
+            span = temp - anchor[1]
+            hours = (t - anchor[0]).total_seconds() / 3600.0
+            if span >= settle_degrees and hours > 0:
+                if (session.target - temp) / span <= MAX_AMPLIFICATION:
+                    observed = span / hours
+                    base = shadow[_bucket(anchor[1])]
+                    if base:
+                        factor = observed / base
+                        cumulative = (shadow[0] / session.rates[0]) * factor
+                        if cumulative > FACTOR_MAX:
+                            factor *= FACTOR_MAX / cumulative
+                        elif cumulative < FACTOR_MIN:
+                            factor *= FACTOR_MIN / cumulative
+                        shadow = [r * factor if r else r for r in shadow]
+                        eta = t + timedelta(
+                            minutes=_minutes(shadow, temp, session.target))
+                        events.append((t, temp, anchor[1], observed, base, factor))
+                done.add(b)
+
+        if final_replan and session.target - 0.5 - 1e-9 <= temp < session.target:
+            eta = t + timedelta(minutes=_minutes(shadow, temp, session.target))
+
+        out.append((t, eta))
+    return out, events
+
+
 def _sessions():
     runs = st.rising_runs(st.load_crossings())
     defs = [
@@ -154,6 +209,7 @@ def main() -> None:
         ("shadow, 1.0 °C + final 0.5 replan", lambda x: strategy_shadow(x, 1.0, True, True)[0]),
         ("shadow, 1.5 °C + final 0.5 replan", lambda x: strategy_shadow(x, 1.5, True, True)[0]),
         ("shadow, 2.0 °C + final 0.5 replan", lambda x: strategy_shadow(x, 2.0, True, True)[0]),
+        ("LATE ONLY: last bucket + final 0.5", lambda x: strategy_late_only(x)[0]),
         ("hold the opening estimate", st.strategy_hold),
         ("settle 90/1.5 then replan each crossing",
          lambda x: st.strategy_settle_then_replan(x, 90, 1.5)),
