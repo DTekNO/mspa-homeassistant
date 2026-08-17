@@ -7,6 +7,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.loader import async_get_integration
 
 from .const import DOMAIN
 from .coordinator import MSpaUpdateCoordinator
@@ -143,7 +144,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     entry.add_update_listener(async_options_updated)
 
     _register_services(hass, coordinator)
-    _LOGGER.info("MSpa integration %s setup complete", DOMAIN)
+    # Log the manifest version, read from the files actually on disk.  A hot deploy
+    # copies source over a running install without touching HACS's record of what it
+    # installed, so the update entity keeps reporting the last released version and
+    # there is otherwise no way to tell which code is running.  This is the only line
+    # that answers "did my deploy land?" from the log alone.
+    version = "unknown"
+    try:
+        version = (await async_get_integration(hass, DOMAIN)).version or "unknown"
+    except Exception:  # noqa: BLE001 - never let a diagnostic break setup
+        _LOGGER.debug("Could not read the integration version", exc_info=True)
+    _LOGGER.info("MSpa integration %s %s setup complete", DOMAIN, version)
     return True
 
 
