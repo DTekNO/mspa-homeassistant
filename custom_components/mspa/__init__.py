@@ -139,22 +139,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data[DOMAIN][entry.entry_id] = coordinator
     _LOGGER.debug("MSpa integration %s setup %s %s", DOMAIN, entry.title, entry.entry_id)
 
+    # The manifest version of the code actually on disk, which a hot deploy stamps with
+    # the commit it came from ("2026.8.2-beta+hot.f6c1d54").  HACS's update entity
+    # reports what HACS installed and is blind to a hot deploy, so without this there is
+    # no way to tell which build is running.  Read before the platforms are set up, so
+    # the Ready at sensor carries it from its very first state rather than after a poll.
+    # str() matters: the loader hands back an AwesomeVersion, which is not serialisable
+    # as a state attribute.
+    coordinator.integration_version = "unknown"
+    try:
+        coordinator.integration_version = str(
+            (await async_get_integration(hass, DOMAIN)).version or "unknown")
+    except Exception:  # noqa: BLE001 - a diagnostic must never break setup
+        _LOGGER.debug("Could not read the integration version", exc_info=True)
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # Ensure options changes cause an immediate refresh
     entry.add_update_listener(async_options_updated)
 
     _register_services(hass, coordinator)
-    # Log the manifest version, read from the files actually on disk.  A hot deploy
-    # copies source over a running install without touching HACS's record of what it
-    # installed, so the update entity keeps reporting the last released version and
-    # there is otherwise no way to tell which code is running.  This is the only line
-    # that answers "did my deploy land?" from the log alone.
-    version = "unknown"
-    try:
-        version = (await async_get_integration(hass, DOMAIN)).version or "unknown"
-    except Exception:  # noqa: BLE001 - never let a diagnostic break setup
-        _LOGGER.debug("Could not read the integration version", exc_info=True)
-    _LOGGER.info("MSpa integration %s %s setup complete", DOMAIN, version)
+    _LOGGER.info("MSpa integration %s %s setup complete",
+                 DOMAIN, coordinator.integration_version)
     return True
 
 

@@ -165,7 +165,7 @@ class MSpaApiClient:
         self.mac_address = None
         self._last_status = None
         
-        _LOGGER.info("DIAGNOSTIC: MSpa API initialized for region: %s, endpoint: %s", 
+        _LOGGER.debug("DIAGNOSTIC: MSpa API initialized for region: %s, endpoint: %s", 
                      self.region, self.base_url)
     
     @property
@@ -216,9 +216,9 @@ class MSpaApiClient:
             _LOGGER.info("DEMO MODE: initialised demo device '%s'", self.device_alias)
             return
 
-        _LOGGER.info("DIAGNOSTIC: Starting MSpaApiClient initialization")
+        _LOGGER.debug("DIAGNOSTIC: Starting MSpaApiClient initialization")
         device_list = await self.get_device_list()
-        _LOGGER.info("DIAGNOSTIC: device_list result: %s", device_list)
+        _LOGGER.debug("DIAGNOSTIC: device_list result: %s", device_list)
 
         if not device_list:
             _LOGGER.error("DIAGNOSTIC: device_list is None or empty!")
@@ -252,11 +252,11 @@ class MSpaApiClient:
                 )
                 device = devices[0]
             else:
-                _LOGGER.info("DIAGNOSTIC: Found target device_id '%s' in device list", self._target_device_id)
+                _LOGGER.debug("DIAGNOSTIC: Found target device_id '%s' in device list", self._target_device_id)
         else:
             device = devices[0]
 
-        _LOGGER.info("DIAGNOSTIC: Found %d device(s). Selected device: %s", len(devices), device)
+        _LOGGER.debug("DIAGNOSTIC: Found %d device(s). Selected device: %s", len(devices), device)
         self.product_id = device.get("product_id")
         self.device_id = device.get("device_id")
         self.series = device.get("product_series")
@@ -356,7 +356,7 @@ class MSpaApiClient:
             # If another coordinator authenticated while we were waiting for the lock,
             # reuse their fresh token instead of logging in again (which would invalidate it).
             if auth_state.get("token") and auth_state["token"] != token_before_wait:
-                _LOGGER.info(
+                _LOGGER.debug(
                     "DIAGNOSTIC: Token refreshed by another coordinator while waiting — reusing it"
                 )
                 return auth_state["token"]
@@ -378,27 +378,27 @@ class MSpaApiClient:
         token_request_url = f"{self.base_url}/api/enduser/get_token/"
 
         await self._throttle.acquire()
-        _LOGGER.info("DIAGNOSTIC: Attempting authentication to %s", token_request_url)
+        _LOGGER.debug("DIAGNOSTIC: Attempting authentication to %s", token_request_url)
         obfuscated_email = self._obfuscate_email()
-        _LOGGER.info("DIAGNOSTIC: Account email: %s", obfuscated_email)
-        _LOGGER.info("DIAGNOSTIC: Password hash length: %d, first 6 chars: %s", len(self.password), self.password[:6] if self.password else "None")
+        _LOGGER.debug("DIAGNOSTIC: Account email: %s", obfuscated_email)
+        _LOGGER.debug("DIAGNOSTIC: Password hash length: %d, first 6 chars: %s", len(self.password), self.password[:6] if self.password else "None")
 
         try:
             response = await self.hass.async_add_executor_job(
                 functools.partial(requests.post, token_request_url, headers=headers, json=payload, timeout=30)
             )
-            _LOGGER.info("DIAGNOSTIC: Authentication HTTP status code: %s", response.status_code)
+            _LOGGER.debug("DIAGNOSTIC: Authentication HTTP status code: %s", response.status_code)
 
             response_json = response.json()
 
             # Obfuscate sensitive data in response for logging
             safe_response = self._obfuscate_response(response_json)
-            _LOGGER.info("DIAGNOSTIC: Authentication raw response: %s", response.text.replace(self.account_email, obfuscated_email) if self.account_email in response.text else response.text)
-            _LOGGER.info("DIAGNOSTIC: Authentication parsed response: %s", safe_response)
+            _LOGGER.debug("DIAGNOSTIC: Authentication raw response: %s", response.text.replace(self.account_email, obfuscated_email) if self.account_email in response.text else response.text)
+            _LOGGER.debug("DIAGNOSTIC: Authentication parsed response: %s", safe_response)
 
             token = response_json.get("data", {}).get("token")
             if token is not None:
-                _LOGGER.info("DIAGNOSTIC: Token successfully received (length: %d)", len(token))
+                _LOGGER.debug("DIAGNOSTIC: Token successfully received (length: %d)", len(token))
                 self.set_token_in_hass(token)
                 return token
             else:
@@ -580,19 +580,19 @@ class MSpaApiClient:
         headers = self._build_headers(self.get_former_token())
         url = f"{self.base_url}/api/enduser/devices/"
 
-        _LOGGER.info("DIAGNOSTIC: Attempting to get device list from %s (retry=%s)", url, retry)
-        _LOGGER.info("DIAGNOSTIC: Using token (first 20 chars): %s...", self.get_former_token()[:20] if self.get_former_token() else "None")
+        _LOGGER.debug("DIAGNOSTIC: Attempting to get device list from %s (retry=%s)", url, retry)
+        _LOGGER.debug("DIAGNOSTIC: Using token (first 20 chars): %s...", self.get_former_token()[:20] if self.get_former_token() else "None")
 
         try:
             await self._throttle.acquire()
             response = await self.hass.async_add_executor_job(
                 functools.partial(requests.get, url, headers=headers, timeout=30)
             )
-            _LOGGER.info("DIAGNOSTIC: Device list HTTP status code: %s", response.status_code)
-            _LOGGER.info("DIAGNOSTIC: Device list raw response: %s", response.text)
+            _LOGGER.debug("DIAGNOSTIC: Device list HTTP status code: %s", response.status_code)
+            _LOGGER.debug("DIAGNOSTIC: Device list raw response: %s", response.text)
 
             response_json = response.json()
-            _LOGGER.info("DIAGNOSTIC: Device list parsed response: %s", response_json)
+            _LOGGER.debug("DIAGNOSTIC: Device list parsed response: %s", response_json)
 
             code = response_json.get("code")
             data = response_json.get("data", {})
@@ -616,12 +616,12 @@ class MSpaApiClient:
                 return data
 
             device_count = len(data["list"])
-            _LOGGER.info("DIAGNOSTIC: Device list returned successfully. Number of devices: %d", device_count)
+            _LOGGER.debug("DIAGNOSTIC: Device list returned successfully. Number of devices: %d", device_count)
 
             if device_count == 0:
                 _LOGGER.error("DIAGNOSTIC: Device list is empty! Full data structure: %s", data)
             else:
-                _LOGGER.info("DIAGNOSTIC: First device info: %s", data.get("list", [])[0] if data.get("list") else "No list key")
+                _LOGGER.debug("DIAGNOSTIC: First device info: %s", data.get("list", [])[0] if data.get("list") else "No list key")
 
             return data
         except requests.exceptions.Timeout:

@@ -1437,3 +1437,35 @@ class TestProgressDeviation:
             _readiness_sensor(c))
         assert attrs["progress_deviation"] == pytest.approx(30.0, abs=0.5)
         assert attrs["plan_settled"] is True
+
+
+class TestIntegrationVersionAttribute:
+    """Which build is actually running, readable without trawling the log.
+
+    A hot deploy copies source over a live install and stamps the manifest with the
+    commit it came from, but HACS's update entity keeps reporting whatever HACS itself
+    installed — on 2026-08-17 that was v2026.8.1 against a running 2026.8.2-beta+hot.
+    The setup log line answers it too, until it scrolls out of the retained window.
+    """
+
+    def _attrs(self, c):
+        e = _readiness_sensor(c)
+        return MSpaReadinessSensor.extra_state_attributes.fget(e)
+
+    def test_the_running_build_is_exposed(self):
+        c = MockCoordinator(water_temp=29.5, target_temp=39.5)
+        c.integration_version = "2026.8.2-beta+hot.f6c1d54"
+        assert self._attrs(c)["integration_version"] == "2026.8.2-beta+hot.f6c1d54"
+
+    def test_a_coordinator_without_one_reports_none_rather_than_raising(self):
+        """Older coordinators, and any path that set up before the version was read."""
+        c = MockCoordinator(water_temp=29.5, target_temp=39.5)
+        assert self._attrs(c)["integration_version"] is None
+
+    def test_the_value_survives_json_serialisation(self):
+        """The loader hands back an AwesomeVersion; unconverted it breaks the state
+        machine, so __init__ str()s it. Guard the shape the attribute must have."""
+        import json
+        c = MockCoordinator(water_temp=29.5, target_temp=39.5)
+        c.integration_version = "2026.8.2-beta+hot.f6c1d54"
+        json.dumps(self._attrs(c)["integration_version"])

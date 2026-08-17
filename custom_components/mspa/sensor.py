@@ -1088,6 +1088,12 @@ class MSpaReadinessSensor(MSpaSensorEntity):
             "device_rate_deg_per_hour": device_rate,
             "current_temperature": water_temp,
             "target_temperature": target_temp,
+            # The manifest version of the code actually running, which a hot deploy
+            # stamps with the commit it came from ("2026.8.2-beta+hot.f6c1d54").  HACS's
+            # update entity reports what HACS installed and is blind to a hot deploy, and
+            # the setup log line scrolls out of the retained window, so this is the one
+            # answer to "which build is this?" that is always one read away.
+            "integration_version": getattr(self.coordinator, "integration_version", None),
         }
 
 
