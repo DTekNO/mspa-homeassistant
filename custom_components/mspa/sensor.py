@@ -874,17 +874,30 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     def _replan_key(self):
         """Identity of the plan being estimated.
 
-        A change here means the user moved something — the schedule time, the
-        schedule target, or the thermostat — and the ETA should jump to the new
-        answer rather than crawl to it.  Everything else, however large, is the
-        model revising its own estimate and gets slewed.
+        A change here means the ETA should jump to the new answer rather than crawl to
+        it.  Two causes qualify.
+
+        The user moved something — the schedule time, the schedule target, or the
+        thermostat.  The old estimate is answering a different question.
+
+        Or the shadow curve revised itself.  This was originally excluded as "the model
+        revising its own estimate", which is right for an estimate that twitches at
+        every sample and wrong for this one: ShadowPlan revises about six times in a
+        session, having measured a third of the remaining climb before it will commit.
+        Slewing that at a minute per minute meant a correct three-hour correction took
+        three hours to appear, and the next revision always overtook it — observed on
+        2026-08-19, where the display sat 122 minutes behind a plan that had already
+        been right for an hour.  The churn the slew exists to suppress is exactly what
+        ShadowPlan has already suppressed by construction, so it should not be paying
+        for it twice.
         """
         c = self.coordinator
         try:
             setpoint = float(c._last_data.get("target_temperature"))
         except (TypeError, ValueError):
             setpoint = None
-        return (c.scheduled_ready_at, c.schedule_target_temp, setpoint)
+        return (c.scheduled_ready_at, c.schedule_target_temp, setpoint,
+                c.shadow_revisions())
 
     def _slew_eta(self, raw_eta, now_utc=None):
         """Move the displayed ETA toward raw_eta, smoothly and coarsely.

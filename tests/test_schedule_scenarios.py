@@ -52,6 +52,7 @@ class MockCoordinator:
         scheduled_ready_at: "datetime | None" = None,
         schedule_target_temp: float = 40.0,
         schedule_triggered: bool = False,
+        shadow_revisions: "int | None" = None,
     ):
         self.near_target = near_target
         self.ready_latched = ready_latched
@@ -67,6 +68,8 @@ class MockCoordinator:
         self.last_update_success = last_update_success
         self.scheduled_ready_at = scheduled_ready_at
         self.schedule_target_temp = schedule_target_temp
+        # None means no session, matching the real coordinator outside one.
+        self._shadow_revisions = shadow_revisions
         # No session in flight by default, so the ETA falls through to the live rates
         # exactly as the existing scenarios were written against.  TestFrozenSessionPlan
         # populates this to exercise the frozen plan.
@@ -92,6 +95,10 @@ class MockCoordinator:
             "is_online": is_online,
             "heater": _heater,
         }
+
+    def shadow_revisions(self):
+        """Matches the real coordinator: revision count, or None outside a session."""
+        return self._shadow_revisions
 
 
     # Borrowed, not reimplemented: a mock that restates the logic under test proves
@@ -494,6 +501,40 @@ class TestEtaSlew:
     """
 
     _BASE = datetime(2026, 7, 31, 10, 0, tzinfo=timezone.utc)
+
+    def test_shadow_revision_snaps_rather_than_ramps(self):
+        """A plan revision is adopted at once, not crawled toward.
+
+        ShadowPlan revises about six times in a session, after measuring a third of the
+        remaining climb. Slewing that at a minute per minute meant a three-hour
+        correction took three hours to show, and the next revision always overtook it:
+        on 2026-08-19 the display sat 122 minutes behind a plan that had been right for
+        an hour. The churn the cap exists to suppress is already suppressed here.
+        """
+        c = MockCoordinator(shadow_revisions=1)
+        e = _readiness_sensor(c)
+        eta = self._BASE + timedelta(hours=12)
+        e._slew_eta(eta, now_utc=self._BASE)
+
+        revised = eta - timedelta(minutes=180)
+        c._shadow_revisions = 2
+        shown = e._slew_eta(revised, now_utc=self._BASE + timedelta(minutes=1))
+        assert e._eta_display == revised, "a revision should be adopted, not ramped"
+        assert shown == revised
+
+    def test_drift_without_a_revision_still_ramps(self):
+        """The cap still applies to everything that is not a revision."""
+        c = MockCoordinator(shadow_revisions=1)
+        e = _readiness_sensor(c)
+        eta = self._BASE + timedelta(hours=12)
+        e._slew_eta(eta, now_utc=self._BASE)
+
+        drift = eta - timedelta(minutes=180)
+        shown = e._slew_eta(drift, now_utc=self._BASE + timedelta(minutes=1))
+        assert e._eta_display == eta - timedelta(minutes=1), (
+            "without a revision the gap must close at the capped rate"
+        )
+        assert shown != drift
 
     def test_first_eta_is_taken_verbatim(self):
         e = _readiness_sensor(MockCoordinator())

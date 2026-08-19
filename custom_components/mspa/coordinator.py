@@ -1015,6 +1015,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         shadow = getattr(self, "_shadow", None)
         return shadow.eta if shadow is not None else None
 
+    def shadow_revisions(self):
+        """How many times the shadow curve has revised itself this session.
+
+        Part of the displayed ETA's replan identity: a revision is a deliberate,
+        infrequent correction and the display should adopt it rather than crawl toward
+        it.  None outside a session, which keeps the identity stable when there is no
+        shadow at all.
+        """
+        shadow = getattr(self, "_shadow", None)
+        return shadow.revisions if shadow is not None else None
+
     def session_plan(self) -> "HeatPredictor | None":
         """The rate curve frozen at session start, or None outside a session.
 
