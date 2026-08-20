@@ -404,6 +404,28 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.device_detail: dict = {}
 
     @staticmethod
+    def _plan_abandoned(prediction: dict | None, new_target) -> bool:
+        """True when the setpoint has left the target this plan was made for.
+
+        Extracted so a test can ask the question directly. `_update_near_target` was
+        pulled out of `_async_update_data` for the same reason and it was the right
+        call: the hand-written copy in the tests drifted from the real block and three
+        tests went on passing against a rule the coordinator no longer applied.
+
+        Unknowns answer "not abandoned", so a missing reading can never discard a
+        session's measurement — the timing guard on the caller still applies.
+        """
+        if prediction is None:
+            return False
+        planned = prediction.get("target_temp")
+        if planned is None or new_target is None:
+            return False
+        try:
+            return abs(float(new_target) - float(planned)) >= _TEMP_BAND_C
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _bias_ratio(record: dict) -> float | None:
         """actual/estimated for one session, or None if unusable for the bias.
 
@@ -596,7 +618,36 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # error -5910280273.8%).  A real session cannot complete inside the
             # minimum sample window, so require at least that much elapsed
             # before a completion is believed.
+            # A session that was abandoned did not finish, and must not be recorded
+            # as though it had.
+            #
+            # near_target is measured against whatever the setpoint is *now*, so
+            # stopping a heat-up by dropping the thermostat onto the water satisfies it
+            # without a degree of progress. Observed 2026-08-20: a run aborted at 30.0 °C
+            # by moving the setpoint from 39.5 to 20 was recorded as complete, giving
+            # "estimated 669 min, actual 42 min | error -1505.3%" — a plan for a span the
+            # spa covered less than a seventh of.
+            #
+            # The settle timer already cancels a plan whose target has moved, but it waits
+            # a minute to survive a dial sweep, and the completion check runs first: the
+            # abort is recorded a second after it happens and the cancellation arrives
+            # fifty-nine seconds too late. So completion asks its own question, which is
+            # not "is the water near the setpoint" but "is this still the setpoint the
+            # plan was made for".
+            #
+            # The bias itself was never at risk — _bias_ratio rejects a ratio of 0.06
+            # against BIAS_RATIO_MIN — but the record reaches _prediction_history and the
+            # diagnostics dump, and a -1505% line in the log is an invitation to diagnose
+            # a model that is working.
+            abandoned = self._plan_abandoned(self._prediction, new_target)
+            if self.near_target and abandoned:
+                _LOGGER.debug(
+                    "Prediction not recorded: planned for %s°C, setpoint is now %s°C "
+                    "— the session was abandoned, not completed",
+                    (self._prediction or {}).get("target_temp"), new_target,
+                )
             if (self.near_target and self._prediction is not None
+                    and not abandoned
                     and (datetime.now(timezone.utc)
                          - datetime.fromisoformat(self._prediction["start_time"])
                          ).total_seconds() / 3600 >= _MIN_RATE_SAMPLE_HOURS):

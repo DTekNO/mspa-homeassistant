@@ -1517,6 +1517,59 @@ class TestIntegrationVersionAttribute:
         json.dumps(self._attrs(c)["integration_version"])
 
 
+class TestAbandonedSessionIsNotRecorded:
+    """Stopping a heat-up must not be recorded as having finished it.
+
+    Observed 2026-08-20: a run from 28.5 °C toward 39.5 was aborted at 30.0 °C by
+    moving the setpoint to 20. near_target is measured against whatever the setpoint
+    is now, so that satisfied the completion check without a degree of progress, and
+    the log reported "estimated 669 min, actual 42 min | error -1505.3%".
+
+    The settle timer does cancel a plan whose target has moved, but it waits a minute
+    so a dial sweep cannot destroy the session, and the completion check runs first.
+    Completion therefore asks its own question: is this still the setpoint the plan
+    was made for.
+    """
+
+    @staticmethod
+    def _plan(target=39.5):
+        return {"target_temp": target, "start_temp": 28.5, "estimated_minutes": 669.0}
+
+    def test_the_reported_abort(self):
+        """39.5 planned, setpoint dropped to 20."""
+        assert MSpaUpdateCoordinator._plan_abandoned(self._plan(), 20.0) is True
+
+    def test_reaching_the_planned_target_is_not_abandonment(self):
+        assert MSpaUpdateCoordinator._plan_abandoned(self._plan(), 39.5) is False
+
+    def test_a_setpoint_nudged_within_the_quantisation_band_still_counts(self):
+        """Readings are quantised to 0.5 °C, so less than that is not a real move."""
+        assert MSpaUpdateCoordinator._plan_abandoned(self._plan(), 39.3) is False
+
+    def test_raising_the_target_also_abandons_the_plan(self):
+        """The plan was for 39.5; 41 is a different session, not this one finishing."""
+        assert MSpaUpdateCoordinator._plan_abandoned(self._plan(), 41.0) is True
+
+    def test_no_plan_is_not_abandonment(self):
+        assert MSpaUpdateCoordinator._plan_abandoned(None, 20.0) is False
+
+    def test_unknowns_never_discard_a_measurement(self):
+        """A missing reading must not be read as an abort."""
+        assert MSpaUpdateCoordinator._plan_abandoned(self._plan(), None) is False
+        assert MSpaUpdateCoordinator._plan_abandoned({"target_temp": None}, 20.0) is False
+        assert MSpaUpdateCoordinator._plan_abandoned(self._plan(), "nonsense") is False
+
+    def test_the_bias_was_never_the_exposure(self):
+        """Belt and braces: the ratio from the reported abort is rejected anyway.
+
+        Recorded so that if the guard above is ever relaxed, the second line of
+        defence is known to be there rather than assumed.
+        """
+        record = {"target_temp": 39.5, "start_temp": 28.5,
+                  "estimated_minutes": 669.0, "actual_minutes": 42.0}
+        assert MSpaUpdateCoordinator._bias_ratio(record) is None
+
+
 class TestRestartDoesNotInventAnArrival:
     """A restart must not latch Ready just because the water is above the setpoint.
 

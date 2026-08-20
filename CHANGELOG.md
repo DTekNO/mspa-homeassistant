@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stopping a heat-up part way is no longer recorded as having finished it.** A session
+  ends when the water reaches the setpoint, and dropping the thermostat onto the water
+  satisfies that without a degree of progress — so aborting a run at 30 °C on its way to
+  39.5 was logged as a completed prediction, reporting an error of −1505%. Completion now
+  requires the setpoint to still be the one the plan was made for. The learned rate bias
+  was never affected, which rejects a ratio that far out, but the bogus session reached
+  the stored history and made the log read as though the model had failed.
+
 - **Ready at said "Ready" the moment Home Assistant restarted**, on a spa that was
   nowhere near its target. The readiness latch is set when the water first reaches the
   setpoint, and the checks that stop a lowered thermostat from earning it — the water
