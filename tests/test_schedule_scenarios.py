@@ -1517,6 +1517,66 @@ class TestIntegrationVersionAttribute:
         json.dumps(self._attrs(c)["integration_version"])
 
 
+class TestRestartDoesNotInventAnArrival:
+    """A restart must not latch Ready just because the water is above the setpoint.
+
+    Reported 2026-08-20: Ready at said "Ready" the moment Home Assistant came back,
+    with the session still climbing. The latch is set on the False→True edge of
+    near_target, and on a fresh coordinator both guards on that edge are vacuously
+    satisfied — near_target starts False, and _latch_target is None so nothing looks
+    like a setpoint that moved. The first poll of a warm tub sitting above a parked
+    setpoint therefore took the "heated there, not dialled there" branch.
+
+    The first sample is now judged on the only evidence it has: how far above the
+    setpoint the water sits.
+    """
+
+    def test_restart_with_water_far_above_a_parked_setpoint_does_not_latch(self):
+        """The reported case: 28.5 °C in the tub, thermostat left at 20."""
+        c = MockCoordinator(water_temp=28.5, target_temp=20.0, near_target=False)
+        assert c._latch_target is None, "a restart starts with no remembered setpoint"
+        _apply_temp_update(c, new_temp=28.5, new_target=20.0)
+        assert c.ready_latched is False, "a restart must not invent an arrival"
+
+    def test_and_ready_at_does_not_claim_ready(self):
+        """End to end — the latch was the only thing making this read Ready."""
+        c = MockCoordinator(water_temp=28.5, target_temp=20.0, near_target=False)
+        _apply_temp_update(c, new_temp=28.5, new_target=20.0)
+        assert _ready_at(c) != "Ready"
+
+    def test_restart_at_the_setpoint_still_latches(self):
+        """The after-a-soak latch is meant to survive a restart, and does."""
+        c = MockCoordinator(water_temp=39.6, target_temp=39.5, near_target=False)
+        assert c._latch_target is None
+        _apply_temp_update(c, new_temp=39.6, new_target=39.5)
+        assert c.ready_latched is True, "ordinary overshoot is the spa having got there"
+        assert _ready_at(c) == "Ready"
+
+    def test_the_boundary_is_the_new_session_delta(self):
+        """Two degrees over is the last reading that still reads as overshoot."""
+        at_edge = MockCoordinator(water_temp=41.5, target_temp=39.5, near_target=False)
+        _apply_temp_update(at_edge, new_temp=41.5, new_target=39.5)
+        assert at_edge.ready_latched is True
+
+        past_edge = MockCoordinator(water_temp=41.6, target_temp=39.5, near_target=False)
+        _apply_temp_update(past_edge, new_temp=41.6, new_target=39.5)
+        assert past_edge.ready_latched is False
+
+    def test_a_restart_mid_heat_is_untouched(self):
+        """Water below the setpoint never went near this branch, and still does not."""
+        c = MockCoordinator(water_temp=28.5, target_temp=39.5, near_target=False)
+        _apply_temp_update(c, new_temp=28.5, new_target=39.5)
+        assert c.ready_latched is False
+        assert c.near_target is False
+
+    def test_the_second_poll_can_still_latch_normally(self):
+        """Withholding applies to the first sample only, not to the session after it."""
+        c = MockCoordinator(water_temp=28.5, target_temp=39.5, near_target=False)
+        _apply_temp_update(c, new_temp=28.5, new_target=39.5)   # first sample, heating
+        _apply_temp_update(c, new_temp=39.5, new_target=39.5)   # arrives for real
+        assert c.ready_latched is True
+
+
 class TestLoweredThermostatIsNotReady:
     """Turning the setpoint below the water is not the spa becoming ready.
 

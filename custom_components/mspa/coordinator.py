@@ -928,16 +928,42 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # to 20 while the water sits at 32 closes the gap without a watt of heating, and
         # latched Ready on a tub that had never reached the target it was set to.
         target_moved = self._latch_target is not None and new_target != self._latch_target
+
+        # The first reading after a restart is an observation, not an arrival.
+        #
+        # The latch is set on the False→True edge of near_target, and both guards on that
+        # edge are vacuously true on a fresh coordinator: near_target starts False and
+        # there is no previous setpoint for target_moved to compare against. So a restart
+        # with the water anywhere at or above the setpoint latched Ready on the very first
+        # poll — including the case the guards exist to reject, a thermostat turned down
+        # onto warm water. Restarting mid-heat with the tub at 28.5 °C and the setpoint
+        # parked at 20 read as Ready with ten degrees still to go.
+        #
+        # It cannot be answered by refusing to latch at all, because the after-a-soak
+        # latch is meant to survive: water at the setpoint after a restart should still
+        # say Ready. So the first sample is decided on the evidence in front of it, which
+        # is how far above the setpoint the water sits — the same test the sensor applies.
+        # Within ordinary overshoot the spa plausibly heated there and the latch stands;
+        # several degrees above and the setpoint was plainly moved, so it does not.
+        first_sample = self._latch_target is None
         self._latch_target = new_target
 
         if delta < _NEAR_TARGET_DEACTIVATE:
-            if not self.near_target and not target_moved:  # heated there, not dialled there
+            plausible = not first_sample or -delta <= _NEW_SESSION_DELTA
+            if not self.near_target and not target_moved and plausible:
                 self.ready_latched = True
                 # Remember how warm the water was when it latched, so the cool-off
                 # release below can tell how much heat has since been given up.
                 self.ready_latched_temp = new_temp
                 _LOGGER.debug(
-                    "ready_latched set (near_target True, shortfall=%.2f°C)", delta)
+                    "ready_latched set (near_target True, shortfall=%.2f°C%s)",
+                    delta, ", first sample after restart" if first_sample else "")
+            elif first_sample and not plausible:
+                _LOGGER.debug(
+                    "ready_latched withheld on first sample: water %.1f°C is %.1f°C above "
+                    "setpoint %.1f°C, so the spa did not heat there",
+                    new_temp, -delta, new_target,
+                )
             self.near_target = True
         elif delta >= _NEAR_TARGET_ACTIVATE:
             self.near_target = False

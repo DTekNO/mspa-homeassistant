@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ready at said "Ready" the moment Home Assistant restarted**, on a spa that was
+  nowhere near its target. The readiness latch is set when the water first reaches the
+  setpoint, and the checks that stop a lowered thermostat from earning it — the water
+  was not already at target, the setpoint did not just move — are both trivially true on
+  the first poll after a restart, when there is no earlier reading to compare against.
+  A warm tub sitting above a parked setpoint was read as an arrival. The first reading
+  after a restart is now judged on how far above the setpoint the water actually sits:
+  ordinary overshoot is the spa having got there and still latches, several degrees is a
+  setpoint that was moved and does not.
+
 - **The Ready at time no longer wobbles.** It used to change frequently. It also reads in 5-minute steps,
   since minute precision on an estimate hours away was never real.
 
