@@ -1556,3 +1556,43 @@ class TestLoweredThermostatIsNotReady:
         assert c._latch_target is None
         _apply_temp_update(c, new_temp=39.5, new_target=39.5)
         assert c.ready_latched is True
+
+
+class TestLoweredSetpointIsNotReady:
+    """Stopping a session by turning the thermostat down must not read as Ready.
+
+    Observed 2026-08-20: a session was stopped by dropping the target from 39.5 to 20
+    with the water at 28.5, and Ready at said "Ready". The spa never reached the target
+    it had been asked for — the target was moved onto water that happened to be warm.
+
+    near_target alone cannot tell the two apart: it says only that the water is at or
+    above the setpoint, which is true either way. How far above separates them, since
+    thermostat overshoot is a fraction of a degree. The latch would also separate them,
+    but it does not survive a restart, so it cannot be relied on alone — that is what
+    made the 2026-08-14 overshoot bug possible.
+    """
+
+    def test_target_dropped_far_below_the_water_is_not_ready(self):
+        c = MockCoordinator(water_temp=28.5, target_temp=20.0, near_target=True)
+        assert _ready_at(c) != "Ready"
+
+    def test_ordinary_overshoot_is_still_ready(self):
+        """Half a degree past the setpoint is the spa having arrived, not a moved dial."""
+        c = MockCoordinator(water_temp=40.0, target_temp=39.5, near_target=True)
+        assert _ready_at(c) == "Ready"
+
+    def test_overshoot_is_ready_even_without_the_latch(self):
+        """The latch is lost on restart; overshoot must still read Ready without it."""
+        c = MockCoordinator(water_temp=40.0, target_temp=39.5,
+                            near_target=True, ready_latched=False)
+        assert _ready_at(c) == "Ready"
+
+    def test_exactly_at_target_is_ready(self):
+        c = MockCoordinator(water_temp=39.5, target_temp=39.5, near_target=True)
+        assert _ready_at(c) == "Ready"
+
+    def test_a_latched_spa_stays_ready_however_far_the_dial_moved(self):
+        """Having earned it, the latch governs — its own cool-off releases it later."""
+        c = MockCoordinator(water_temp=28.5, target_temp=20.0,
+                            near_target=True, ready_latched=True)
+        assert _ready_at(c) == "Ready"

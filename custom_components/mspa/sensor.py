@@ -449,6 +449,27 @@ def _spa_direction(coordinator) -> str | None:
     return "at_target"
 
 
+# How far above the setpoint the water may sit and still count as "the spa got there".
+#
+# Thermostat overshoot is a fraction of a degree, so anything within this is the spa
+# having heated to its target and drifted past it. More than this means the setpoint was
+# moved down onto water that was already warm — the spa never reached the target it was
+# asked for, and calling that Ready claims something that did not happen.
+#
+# The same 2 °C separates cycling from a real session in the coordinator, for the mirror
+# case of a setpoint raised above the water.
+_READY_OVERSHOOT_MAX = 2.0        # °C
+
+
+def _overshoot(coordinator) -> "float | None":
+    """How far the water sits above the setpoint, or None if either is unknown."""
+    data = coordinator._last_data
+    try:
+        return float(data.get("water_temperature")) - float(data.get("target_temperature"))
+    except (TypeError, ValueError):
+        return None
+
+
 # Sentinel: distinguishes "state never yet reported" from None (no data).
 _UNSET = object()
 
@@ -528,7 +549,7 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
         - Anchor-based ETA to sched_temp (real-time, ignores original plan)
 
       FREE context (no schedule, not triggered):
-        - near_target OR latched OR at_target  → ready
+        - latched OR at_target OR (near_target within 2 °C) → ready
         - direction=cooling                    → none (no ETA for cooling)
         - direction=heating AND heater on      → anchor ETA to thermostat
         - otherwise                            → none
@@ -617,8 +638,18 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
     #     which is what stops "Ready" outliving the heat it advertises,
     #   * a schedule expires, a schedule triggers, or a new schedule is set.
 
-    # READY: coordinator confirms near target or spa is exactly at target
-    if latched or near or direction == "at_target":
+    # READY: the spa is at its target, or got there and is still warm.
+    #
+    # `near` alone is not enough. It says only that the water is at or above the
+    # setpoint, which is equally true of a thermostat turned down onto a warm tub —
+    # stopping a session by dropping the target to 20 with the water at 28.5 read as
+    # Ready, on a spa that never reached the 39.5 it had been asked for. Ordinary
+    # overshoot must still count, and the latch does not survive a restart, so the test
+    # is how far above: a fraction of a degree is overshoot, several degrees is a
+    # setpoint that moved.
+    over = _overshoot(coordinator)
+    modest = over is None or over <= _READY_OVERSHOOT_MAX
+    if latched or direction == "at_target" or (near and modest):
         reason = "latched" if latched else ("near_target" if near else "at_target")
         _LOGGER.debug("ready_at → Ready (free ctx: %s)", reason)
         return ("ready", None)
