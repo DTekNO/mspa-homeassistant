@@ -70,6 +70,11 @@ class MockCoordinator:
         self.schedule_target_temp = schedule_target_temp
         # None means no session, matching the real coordinator outside one.
         self._shadow_revisions = shadow_revisions
+        # Target as the readiness latch last saw it. None on the first poll, which is
+        # why a spa that simply reaches its setpoint still latches.
+        self._latch_target = None
+        self._settled_target = None
+        self._pending_target = None
         # No session in flight by default, so the ETA falls through to the live rates
         # exactly as the existing scenarios were written against.  TestFrozenSessionPlan
         # populates this to exercise the frozen plan.
@@ -1510,3 +1515,44 @@ class TestIntegrationVersionAttribute:
         c = MockCoordinator(water_temp=29.5, target_temp=39.5)
         c.integration_version = "2026.8.2-beta+hot.f6c1d54"
         json.dumps(self._attrs(c)["integration_version"])
+
+
+class TestLoweredThermostatIsNotReady:
+    """Turning the setpoint below the water is not the spa becoming ready.
+
+    Observed 2026-08-20: a session was stopped by dropping the target from 39.5 to 20
+    with the water at 32. That closes the gap without a watt of heating, and the spa
+    latched Ready — on a tub that had never reached the target it was set to. The latch
+    then held, because it only releases once the water falls _LATCH_COOL_OFF from the
+    warmest point seen while latched.
+
+    The latch means "it heated to target and is still dip-warm". Only heating earns it.
+    """
+
+    def test_lowering_the_setpoint_onto_the_water_does_not_latch(self):
+        c = MockCoordinator(water_temp=32.0, target_temp=39.5, near_target=False)
+        # The latch has seen the old target at least once, as it would in a live session.
+        c._latch_target = 39.5
+        _apply_temp_update(c, new_temp=32.0, new_target=20.0)
+        assert c.ready_latched is False, "a lowered thermostat must not latch Ready"
+
+    def test_it_is_still_near_target_though(self):
+        """Warmer than asked is still warmer than asked — only the latch is withheld."""
+        c = MockCoordinator(water_temp=32.0, target_temp=39.5, near_target=False)
+        c._latch_target = 39.5
+        _apply_temp_update(c, new_temp=32.0, new_target=20.0)
+        assert c.near_target is True
+
+    def test_heating_to_the_target_still_latches(self):
+        """The case the latch exists for, with the target steady throughout."""
+        c = MockCoordinator(water_temp=39.0, target_temp=39.5, near_target=False)
+        c._latch_target = 39.5
+        _apply_temp_update(c, new_temp=39.5, new_target=39.5)
+        assert c.ready_latched is True
+
+    def test_first_ever_poll_still_latches(self):
+        """No previous target recorded must not be mistaken for one that moved."""
+        c = MockCoordinator(water_temp=39.0, target_temp=39.5, near_target=False)
+        assert c._latch_target is None
+        _apply_temp_update(c, new_temp=39.5, new_target=39.5)
+        assert c.ready_latched is True

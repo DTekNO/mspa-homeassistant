@@ -115,6 +115,13 @@ _PLAN_SETTLE_DEGREES = 1.5
 # doesn't withdraw Ready prematurely.
 _LATCH_COOL_OFF = 3.0             # °C
 
+# How long the thermostat must hold a new value before the plan is rebuilt for it.
+# The spa is polled once a second after a user action, so a dial turned from 38 to 39.5
+# reports every value in between; acting on each would discard the session measurement
+# over and over. A minute covers turning a dial, and is short enough that a deliberate
+# change still appears while you are looking at the card.
+_TARGET_SETTLE_S = 60
+
 # Full-heat mode: the device reports heat_state 3 while actually heating
 # (0 = off, 2 = preheat).  Rate sampling and prediction tracking both key off
 # this so they start and stop on the same signal.
@@ -337,6 +344,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Shared hysteresis flag for the time-to-target sensors.
         # Deactivates when within _NEAR_TARGET_DEACTIVATE of target;
         # reactivates only when _NEAR_TARGET_ACTIVATE away, preventing flicker.
+        # Setpoint the plan is built for, and the one waiting to become it.  See the
+        # settle in _async_update_data: the dial reports every value it passes through.
+        self._settled_target: float | None = None
+        self._pending_target: float | None = None
+        self._pending_target_at = datetime.now(timezone.utc)
+        # Target as seen by the readiness latch last poll, to tell a spa that heated to
+        # its setpoint from a setpoint lowered onto the spa.
+        self._latch_target: float | None = None
+
         self.near_target: bool = False
         # Latched True on the False→True transition of near_target (spa first reaches
         # temperature).  Cleared ONLY when the user sets a new scheduled_ready_at.
@@ -618,14 +634,30 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     result["start_temp"], result["target_temp"],
                     est, actual_minutes, error_minutes, error_pct, self.prediction_bias,
                 )
-            # Clear prediction if target changed mid-session.
-            if (self._prediction is not None
-                    and new_target is not None
-                    and new_target != self._prediction.get("target_temp")):
-                _LOGGER.debug("Prediction cancelled — target changed from %.1f to %.1f",
-                              self._prediction.get("target_temp", 0), new_target)
-                self._prediction = None
-                self._shadow = None
+            # Clear prediction if target changed mid-session — but only once the new
+            # target has stopped moving.
+            #
+            # Cancelling throws away the ShadowPlan with everything it has measured so
+            # far, and the spa is polled once a second after a user action, so turning
+            # the dial from 38 to 39.5 reports every value on the way. Each one would
+            # discard the session's accumulated measurement and start again. Waiting for
+            # the setpoint to settle costs a minute of ETA and saves the measurement.
+            if new_target is not None and new_target != self._settled_target:
+                if new_target != self._pending_target:
+                    self._pending_target = new_target
+                    self._pending_target_at = datetime.now(timezone.utc)
+                elif (datetime.now(timezone.utc) - self._pending_target_at).total_seconds() \
+                        >= _TARGET_SETTLE_S:
+                    _LOGGER.debug("Target settled at %.1f", new_target)
+                    self._settled_target = new_target
+                    self._pending_target = None
+                    if (self._prediction is not None
+                            and new_target != self._prediction.get("target_temp")):
+                        _LOGGER.debug(
+                            "Prediction cancelled — target changed from %.1f to %.1f",
+                            self._prediction.get("target_temp", 0), new_target)
+                        self._prediction = None
+                        self._shadow = None
 
             self._update_near_target(new_temp, new_target)
             # else: no temp data — leave flags unchanged
@@ -889,8 +921,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # direction, and near_target self-releases as the water cools.
         delta = new_target - new_temp
 
+        # A setpoint moved below the water is not the spa becoming ready.
+        #
+        # The latch records "it heated to target and is still dip-warm", and holds until
+        # the water gives up _LATCH_COOL_OFF from its peak. Turning the thermostat down
+        # to 20 while the water sits at 32 closes the gap without a watt of heating, and
+        # latched Ready on a tub that had never reached the target it was set to.
+        target_moved = self._latch_target is not None and new_target != self._latch_target
+        self._latch_target = new_target
+
         if delta < _NEAR_TARGET_DEACTIVATE:
-            if not self.near_target:        # latch on the False→True transition only
+            if not self.near_target and not target_moved:  # heated there, not dialled there
                 self.ready_latched = True
                 # Remember how warm the water was when it latched, so the cool-off
                 # release below can tell how much heat has since been given up.
