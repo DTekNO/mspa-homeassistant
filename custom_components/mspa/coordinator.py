@@ -3,8 +3,11 @@ import logging
 from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
 from .predictor import (
+    HEAT_BUCKET_LEARN_MAX,
+    HEAT_BUCKET_LEARN_MIN,
     HeatPredictor,
     ShadowPlan,
+    in_learning_range,
     ambient_rate_factor,
     bucket_index,
     extrapolate_within_band,
@@ -594,6 +597,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         target=new_target,
                         opening_eta=(datetime.now(timezone.utc)
                                      + timedelta(minutes=est_minutes)),
+                        # So the final half degree has something to measure from when
+                        # the session starts inside the last band and never crosses an
+                        # edge. See ShadowPlan.crossing.
+                        start_time=datetime.now(timezone.utc),
                     )
                     buckets_str = "/".join(
                         f"{b:.2f}" if b is not None else "-"
@@ -1112,10 +1119,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # the only thing the shadow will measure between.
             if shadow.crossing(new_temp, now):
                 _LOGGER.info(
-                    "Ready at: plan revised at %.1f °C — rates now %s, ready %s",
-                    new_temp,
-                    "/".join(f"{r:.2f}" for r in shadow.rates),
-                    shadow.eta.isoformat(timespec="minutes"),
+                    "Ready at: re-anchored at %.1f °C (band edge or final approach) "
+                    "— ready %s, revision %d",
+                    new_temp, shadow.eta.isoformat(timespec="minutes"), shadow.revisions,
                 )
         self.temp_anchor_time     = now
         self.temp_anchor_temp     = anchored
@@ -1476,10 +1482,36 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         _bp = self._bucket_base_value
                         _span = abs(curr_temp - self._rate_last_temp)
                         _alpha = _EMA_ALPHA * min(1.0, _span / _BUCKET_SPAN_FULL_C)
-                        self.heat_rate_buckets[_bi] = (
-                            _alpha * rate + (1 - _alpha) * _bp
-                        ) if _bp is not None else rate
-                        self._session_fresh_buckets.add(_bi)
+                        # The outer buckets learn over a bounded span, like the
+                        # middle one.
+                        #
+                        # Left open-ended the hot bucket absorbed the 39-40 tail, where
+                        # a session with a 40 °C setpoint spends its slowest hour, and
+                        # the chord it settled on described neither half. Bounded at 39
+                        # the rate above is extrapolated instead, which the recordings
+                        # say costs nothing: across five sessions the final half degree
+                        # runs at 1.05x the degree below it, flat within the noise of a
+                        # 0.5 °C span. Errors there also fall on the forgiving side —
+                        # the water is heating faster than modelled, so the spa is ready
+                        # sooner than promised rather than later.
+                        #
+                        # The cold bucket is bounded at 20 for symmetry. Nothing in the
+                        # archive goes below 22, so this only refuses to learn from a
+                        # span nobody has recorded.
+                        _in_learn_range = in_learning_range(
+                            self._rate_last_temp, curr_temp)
+                        if _in_learn_range:
+                            self.heat_rate_buckets[_bi] = (
+                                _alpha * rate + (1 - _alpha) * _bp
+                            ) if _bp is not None else rate
+                            self._session_fresh_buckets.add(_bi)
+                        else:
+                            _LOGGER.debug(
+                                "Heat rate sample %.3f °C/h not learned: %.1f→%.1f °C "
+                                "lies outside the %.0f-%.0f learning range",
+                                rate, self._rate_last_temp, curr_temp,
+                                HEAT_BUCKET_LEARN_MIN, HEAT_BUCKET_LEARN_MAX,
+                            )
                         # Track the baseline outdoor temperature under which
                         # rates are being learned, so the ambient correction
                         # knows what "normal" looks like for this spa.  Slow

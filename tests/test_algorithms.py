@@ -419,6 +419,45 @@ class TestTempAnchorOnlyMovesOnRealChange:
                 f"estimate {est} left the band of reading {reading} after {hours} h")
 
 
+class TestBucketsLearnOverABoundedSpan:
+    """A bucket rate is the chord between two edges, so both edges have to exist.
+
+    The hot bucket was open-ended, which let it absorb the 39-40 tail — where a session
+    with a 40 °C setpoint spends its slowest hour — and the chord it settled on suited
+    neither half of what it covered. Bounded at 39, the rate above is extrapolated
+    instead, and the recordings say that costs nothing: across five sessions the final
+    half degree runs at 1.05x the degree below it, flat within the noise of a 0.5 °C
+    span, and any error there is on the forgiving side.
+    """
+
+    def test_a_span_inside_the_range_is_learned(self):
+        from custom_components.mspa.predictor import in_learning_range
+        assert in_learning_range(37.0, 39.0) is True
+        assert in_learning_range(30.0, 37.0) is True
+        assert in_learning_range(22.0, 30.0) is True
+
+    def test_the_tail_above_the_hot_bucket_is_not_learned(self):
+        """The half degree from 39.0 to 39.5, and anything a 40 °C setpoint adds."""
+        from custom_components.mspa.predictor import in_learning_range
+        assert in_learning_range(37.0, 39.5) is False
+        assert in_learning_range(39.0, 40.0) is False
+
+    def test_below_the_cold_bucket_is_not_learned(self):
+        from custom_components.mspa.predictor import in_learning_range
+        assert in_learning_range(18.0, 25.0) is False
+
+    def test_the_edges_themselves_count_as_inside(self):
+        from custom_components.mspa.predictor import in_learning_range
+        assert in_learning_range(20.0, 39.0) is True
+
+    def test_unknowns_do_not_move_a_stored_bucket(self):
+        """Other sessions depend on these, so a sample that cannot be placed is dropped."""
+        from custom_components.mspa.predictor import in_learning_range
+        assert in_learning_range(None, 38.0) is False
+        assert in_learning_range(37.0, None) is False
+        assert in_learning_range("warm", 38.0) is False
+
+
 class TestShadowPlan:
     """The private rate curve that owns the displayed ready time during a session.
 
@@ -450,89 +489,106 @@ class TestShadowPlan:
         assert p.eta == self._T0 + timedelta(minutes=426)
         assert p.revisions == 0
 
-    def test_nothing_is_measured_until_the_warm_up_is_over(self):
-        """The opening crossings time where the water sat in its band and the heater
-        coming up, not steady heating — 2026-08-12 implied 7.9 °C/h over its first."""
+    def test_a_session_inside_one_band_holds_its_opening_estimate(self):
+        """37.0 → 38.5 crosses no edge and never reaches the final half degree, so there
+        is nothing it is entitled to revise against."""
         p = self._plan(start=37.0, target=39.5, opening_min=190)
         # 0.5 °C in 2 minutes is 15 °C/h; nothing here may reach the curve.
         self._feed(p, [(2, 37.5), (30, 38.0), (60, 38.5)])
         assert p.eta == self._T0 + timedelta(minutes=190)
         assert p.revisions == 0
 
-    def test_a_top_up_shorter_than_the_warm_up_still_gets_its_last_look(self):
-        """38.0 → 39.5 never climbs the 2 °C that starts a measurement, so the final
-        half-degree is the only correction it will ever get. It has to stay reachable."""
+    def test_a_top_up_that_crosses_no_edge_still_gets_its_last_look(self):
+        """38.0 → 39.5 is entirely inside the hot band, so the final half degree is the
+        only correction it will ever get. It has to stay reachable."""
         p = self._plan(start=38.0, target=39.5, opening_min=120)
         self._feed(p, [(40, 38.5)])
         assert p.revisions == 0
         self._feed(p, [(80, 39.0)])
         assert p.revisions == 1
 
-    def test_the_settle_shrinks_as_the_target_nears(self):
+    def test_a_band_edge_revises(self):
+        """30.0 and 37.0 are the only temperatures at which a band has been traversed
+        end to end, so they are the only ones that may move the estimate."""
         p = self._plan()
-        assert p.settle_for(22.0) == pytest.approx(17.5 / 3.0)   # a long cold-start run
-        assert p.settle_for(35.0) == pytest.approx(1.5)
-        assert p.settle_for(39.0) == pytest.approx(1.0)          # floored, not 0.17
-
-    def test_it_recalibrates_once_it_has_measured_its_share(self):
-        """37.0 → 38.0 measures 1.0 °C with 2.5 °C left, so the settle is the floor."""
-        p = self._plan()
-        self._feed(p, [(200, 37.0), (260, 38.0)])
+        self._feed(p, [(200, 37.0)])
         assert p.revisions == 1
-        # 1.0 °C in 60 min is 1.0 °C/h against a shadow of 0.79, so the curve speeds up
-        assert p.rates[2] > 0.79
+        assert p.eta == self._T0 + timedelta(minutes=200 + p.minutes(37.0, 39.5))
 
-    def test_it_holds_while_the_measurement_is_short_for_what_remains(self):
-        """Anchored at 35.0 with 4.5 °C to go, one degree is not yet a third of it."""
-        p = self._plan()
-        self._feed(p, [(0, 33.5), (60, 34.0), (120, 35.0), (180, 36.0)])
+    def test_nothing_between_the_edges_revises(self):
+        """The old design measured a sub-span here and compared it against the band's
+        chord. Inside 30-37 the real rate runs from 1.33 to 1.05 °C/h, so that comparison
+        finds a difference that is arithmetically real and physically meaningless — on
+        2026-08-20 it turned an 8-minute error into a 58-minute one."""
+        p = self._plan(start=30.0, opening_min=560)
+        self._feed(p, [(30, 30.5), (90, 31.5), (150, 32.5), (240, 34.0), (330, 35.5),
+                       (400, 36.5)])
         assert p.revisions == 0
-        self._feed(p, [(240, 36.5)])                # 1.5 °C measured — now it qualifies
-        assert p.revisions == 1
+        assert p.eta == self._T0 + timedelta(minutes=560)
 
-    def test_each_revision_must_earn_its_own_measurement(self):
-        """Revising moves the anchor. Without that the span keeps growing past the
-        settle and every later crossing would revise the curve again."""
-        p = self._plan(start=30.0)
-        self._feed(p, [(30, 30.5), (60, 31.5), (90, 32.0)])     # warm-up, then anchored
-        self._feed(p, [(150, 33.0), (210, 34.5)])               # 2.5 °C measured — fires
+    def test_the_rates_never_move_during_a_session(self):
+        """A revision at an edge is a re-anchor, not a recalibration. The elapsed time to
+        that exact temperature is fact; the bands ahead keep what the session opened
+        with, because nothing measured says anything about a band not yet entered.
+
+        Tested two ways over five recorded sessions: scaling only the next band by the
+        observed ratio oscillates, and one session-wide condition factor takes the worst
+        error from 39 minutes to between 75 and 110."""
+        p = self._plan(start=30.0, opening_min=560)
+        before = list(p.rates)
+        self._feed(p, [(120, 31.0), (300, 34.0), (520, 37.0), (600, 38.5), (660, 39.0)])
+        assert p.revisions >= 2                      # the 37.0 edge and the final look
+        assert p.rates == before
+
+    def test_each_edge_revises_once(self):
+        p = self._plan(start=29.0, opening_min=700)
+        self._feed(p, [(60, 29.5), (120, 30.0)])
         assert p.revisions == 1
-        # Re-anchored at 34.5 with 5.0 °C left, so the next revision needs 1.67 °C.
-        self._feed(p, [(270, 35.0), (330, 35.5), (390, 36.0)])
+        self._feed(p, [(180, 30.5), (240, 31.0), (400, 34.0)])
         assert p.revisions == 1
-        self._feed(p, [(450, 36.5)])
+        self._feed(p, [(560, 37.0)])
         assert p.revisions == 2
 
-    def test_a_measurement_may_cross_a_band_boundary(self):
-        """A 24 °C start needs 4.5 °C before it may commit, and the 30 °C boundary
-        arrives after 3.5. Re-anchoring there threw the cold run away and left the first
-        correction until 33.5 — every start from 23 to 28 fell in that hole."""
-        p = self._plan(start=24.0, opening_min=780)
-        self._feed(p, [(60, 25.0), (120, 26.0)])                # warm-up ends at 26.0
-        self._feed(p, [(240, 28.0), (360, 30.0)])               # boundary, must not reset
-        assert p.revisions == 0                                 # 4.0 °C — not yet 4.5
-        self._feed(p, [(420, 30.5)])
-        assert p.revisions == 1
+    def test_a_slow_first_band_pushes_the_estimate_out(self):
+        """Re-anchoring carries the whole of the elapsed time, so a band that took
+        longer than planned moves the finish out by exactly that much — without
+        touching the rates for what is still to come."""
+        p = self._plan(start=30.0, opening_min=560)
+        planned_to_37 = p.minutes(30.0, 37.0)
+        self._feed(p, [(planned_to_37 + 90, 37.0)])     # an hour and a half slow
+        assert p.eta == self._T0 + timedelta(
+            minutes=planned_to_37 + 90 + p.minutes(37.0, 39.5))
 
-    def test_a_run_is_judged_against_the_whole_curve_it_spanned(self):
-        """Two bands at different rates, measured in one go: the comparison has to be
-        against what the curve predicted for that exact span, not one band's rate."""
-        p = self._plan(start=24.0, opening_min=780)
-        self._feed(p, [(60, 26.0)])
-        planned = p.minutes(26.0, 30.5)                         # crosses 30.0
-        self._feed(p, [(60 + planned, 30.5)])                   # exactly to plan
+    def test_the_final_half_degree_uses_the_rate_just_below_it(self):
+        """The one place a sub-span is trusted: it sits immediately below the span it
+        predicts and the horizon is a single crossing. Across five recorded sessions the
+        final half degree runs at 1.05x the degree below it — flat within the noise of a
+        0.5 °C span."""
+        p = self._plan(start=33.0, opening_min=426)
+        self._feed(p, [(200, 37.0)])                     # edge: band entry is 37.0 here
+        at_39 = 200 + 120                                # 2.0 °C in 120 min = 1.0 °C/h
+        self._feed(p, [(at_39, 39.0)])
+        # 0.5 °C left at the measured 1.0 °C/h is 30 minutes, not the curve's 0.79.
+        assert p.eta == self._T0 + timedelta(minutes=at_39 + 30)
+
+    def test_the_final_look_happens_once(self):
+        p = self._plan(start=38.0, target=39.5, opening_min=120)
+        self._feed(p, [(40, 38.5), (80, 39.0)])
         assert p.revisions == 1
-        assert p.rates == pytest.approx([1.10, 0.99, 0.79], rel=1e-3)
+        self._feed(p, [(100, 39.0), (110, 39.0)])
+        assert p.revisions == 1
 
     def test_a_faster_spa_pulls_the_estimate_earlier(self):
         p = self._plan()
         self._feed(p, [(200, 37.0), (230, 38.0)])   # 1.0 °C in 30 min = 2.0 °C/h
         assert p.eta < self._T0 + timedelta(minutes=426)
 
-    def test_drift_is_capped_relative_to_where_it_started(self):
+    def test_an_impossible_reading_cannot_distort_the_curve(self):
+        """There is no drift clamp any more because there is no drift: a physically
+        impossible crossing moves the anchor and nothing else."""
         p = self._plan()
         self._feed(p, [(200, 37.0), (205, 38.0)])   # 12 °C/h, physically impossible
-        assert max(p.rates) <= 1.10 * 2.0 + 1e-9
+        assert p.rates == [1.10, 0.99, 0.79]
 
     def test_the_final_half_degree_gets_a_look(self):
         p = self._plan()

@@ -17,3 +17,8 @@ history.csv
 # they carry device aliases and the owner's usage patterns.
 *.csv
 mspa_rates_*
+
+# Recorded sessions, moved out of the repo root 2026-08-21. Ignored as a directory as
+# well as by extension: the patterns above cover .csv and .log, but a Zone.Identifier
+# stream or anything else dropped in here carries the same private data.
+historical-data/

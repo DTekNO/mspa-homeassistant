@@ -247,30 +247,49 @@ class HeatPredictor:
 # short run is exactly what this design exists to avoid.
 SHADOW_BOUNDS = (30.0, 37.0)
 
-# How much of the remaining journey one measurement may speak for. A rate measured over
-# one degree and applied to sixteen multiplies its own error sixteenfold: recalibrating
-# that early made every recorded session worse, by 150, 102 and 267 minutes. So the
-# measurement is sized to the journey rather than fixed — measure a third of what is
-# left, and what remains is then worth only twice what was measured, whatever the
-# starting temperature. A cold start from 22 °C measures 5.5 °C before it commits; a
-# top-up from 38 °C measures a single crossing.
-SHADOW_SETTLE_DIVISOR = 3.0
-SHADOW_SETTLE_MIN_C = 1.0
+# The band edges. These are where the plan is allowed to revise itself, because they
+# are the only temperatures at which a *complete* traverse has been measured — and a
+# bucket rate describes exactly that, the chord between the two edges. Extra edges at
+# 34 and 26 were both tried and both made things worse, and a leave-one-out test over
+# five recorded sessions agreed: bands at 33 and 36 leave the worst mid-session error
+# where it was, and six bands make it worse. Half-degree quantisation is why — a 1 °C
+# band traversed in under an hour is measured to about ±50%, a 3 °C band to ±17%.
+SHADOW_BOUNDS = (30.0, 37.0)
 
-# How far a session must heat before its first measurement begins. The opening
-# crossings time the water's unknown position inside its 0.5 °C band and the heater's
-# engagement rather than any steady heating — 2026-08-12 implied 7.9 °C/h over its first
-# degree, which no heater here can produce, and that session went on to finish within a
-# minute of its plan. Two degrees is what it took to stop that transient reaching the
-# display: it halves the error at the halfway mark, 61 minutes to 30 in the worst
-# recorded session. Band boundaries need no such allowance; they are exact positions.
-SHADOW_WARMUP_C = 2.0
+# The hot bucket learns over 37–39 and is then used for everything above 37.
+#
+# Left unbounded it absorbed the 39–40 tail, where a session with a 40 °C setpoint
+# spends its slowest hour, and the resulting chord suited neither. Bounded at 39 the
+# rate above it is extrapolated, which the recordings say costs nothing: across five
+# sessions the final half degree runs at 1.05x the rate of the degree below it, flat
+# within the noise of a 0.5 °C span.
+HEAT_BUCKET_LEARN_MAX = 39.0
 
-# How far the shadow may stray from the rates it started with. Applied to the
-# cumulative deviation, not to each step: a single large factor is legitimate when it
-# is undoing an earlier over-correction, and clamping steps individually blocks
-# exactly that recovery.
-SHADOW_DRIFT_MIN, SHADOW_DRIFT_MAX = 0.5, 2.0
+# The cold bucket's lower edge, for the same reason at the other end. The lowest water
+# temperature in the archive is 22 °C, so this sits just under the observed range
+# without inventing structure inside it. Only one recorded session reaches below 30 and
+# it does show the rate falling — 1.20 °C/h at 22.5, 1.02 by 28.5 — but one session is
+# not enough to justify a boundary in there, and putting one in on that evidence is the
+# mistake this file has already made once.
+HEAT_BUCKET_LEARN_MIN = 20.0
+
+def in_learning_range(from_temp, to_temp) -> bool:
+    """Whether a rate sample spanning `from_temp` to `to_temp` may update a bucket.
+
+    Extracted so a test can ask it directly rather than reach into the sampling block —
+    the same reason `_update_near_target` was pulled out of the coordinator, after its
+    hand-written copy in the tests drifted from the real rule.
+
+    Unknowns answer False: a sample that cannot be placed on the curve should not move
+    a bucket that other sessions depend on.
+    """
+    if from_temp is None or to_temp is None:
+        return False
+    try:
+        return (HEAT_BUCKET_LEARN_MIN - 1e-9 <= float(from_temp)
+                and float(to_temp) <= HEAT_BUCKET_LEARN_MAX + 1e-9)
+    except (TypeError, ValueError):
+        return False
 
 
 class ShadowPlan:
@@ -311,24 +330,21 @@ class ShadowPlan:
     """
 
     def __init__(self, base_rates, start_temp, target, opening_eta,
-                 bounds=SHADOW_BOUNDS, divisor=SHADOW_SETTLE_DIVISOR,
-                 settle_min=SHADOW_SETTLE_MIN_C, warmup=SHADOW_WARMUP_C):
+                 bounds=SHADOW_BOUNDS, start_time=None):
         self.bounds = tuple(bounds)
         self.target = target
-        self.divisor = divisor
-        self.settle_min = settle_min
-        self.warmup = warmup
         self.eta = opening_eta
         self.revisions = 0
         self._start_temp = start_temp
         self._base = self._seed(base_rates)
+        # Frozen for the session. Nothing measured mid-session may move them: see
+        # crossing() for the two experiments that establish why.
         self.rates = list(self._base)
-        self._anchor = None          # (temp, when) — always a crossing, never the start
-
-    def settle_for(self, anchor_temp):
-        """Degrees to measure from `anchor_temp` before the curve may be revised."""
-        return max(self.settle_min,
-                   (self.target - anchor_temp) / self.divisor)
+        # Where the water entered the band it is in, and when. Seeded from the session
+        # start even though that is usually mid-band — the time is still real, and the
+        # only thing it is used for is the local rate in the final half degree.
+        self._band_entry = (start_temp, start_time)
+        self._final_look = False
 
     def _seed(self, base_rates):
         """Seed each shadow band from the stored bucket covering its midpoint."""
@@ -355,62 +371,71 @@ class ShadowPlan:
     def crossing(self, temp, when):
         """Feed one reported-temperature change. True when the estimate was revised.
 
-        Measurement does not begin at the session start. The water sits somewhere
-        unknown inside its 0.5 °C band and the heater has yet to settle, so the opening
-        crossings time that rather than any heating; nothing is measured until the spa
-        has climbed `warmup` degrees. From there the anchor moves only when the curve is
-        revised — band boundaries do not interrupt a measurement, because the run is
-        compared against what the whole curve predicted for it rather than against any
-        one band's rate.
+        Revision happens where a band completes, and once more with half a degree to go.
+        Nowhere else.
+
+        A bucket rate is the *chord* of the heating curve between the band's two edges —
+        the straight line, not the rate anywhere along it. Inside the 30–37 band the real
+        rate falls from about 1.33 to 1.05 °C/h, so a sub-span measured low in the band
+        runs 14% above the chord and one measured high runs 9% below, while the chord
+        itself is exactly right for the whole traverse. Comparing a sub-span against it
+        therefore finds a difference that is arithmetically real and physically
+        meaningless, and the old proportional settle guaranteed the first such comparison
+        landed low in the range, where the discrepancy is largest and always in the same
+        direction. On 2026-08-20 it turned an opening estimate 8 minutes out into one 58
+        minutes out, and the plan did not beat its own opening again until 38.5 °C.
+
+        At a band edge there is nothing to compare: the elapsed time to that exact
+        temperature is fact. So the revision is a re-anchor, not a recalibration — the
+        remaining bands keep the rates the session opened with, and only the starting
+        point moves. That is why the rates no longer change during a session.
+
+        What is deliberately *not* done is carrying the completed band's measurement into
+        the bands ahead. Tested two ways over five recorded sessions: scaling only the
+        next band by the observed ratio oscillates (−3, +22, −24, +7, −30, +2, −22, +8,
+        −7 at one-degree bands), and a single session-wide condition factor is worse
+        still, taking the worst error from 39 to between 75 and 110 minutes. A band the
+        water has not entered has no evidence about it, and inventing some costs more
+        than admitting it.
+
+        The last half degree is the one place a sub-span is used, because there the
+        objection does not apply: the measurement sits immediately below the span it
+        predicts, and the horizon is one crossing. Over the five sessions the rate in
+        the final half degree averages 1.05× the rate in the degree below it — flat
+        within the quantisation noise of a 0.5 °C span.
         """
-        anchored = self._anchor is not None
-        if not anchored and temp - self._start_temp >= self.warmup - 1e-9:
-            self._anchor = (temp, when)
-
         revised = False
-        # A top-up that starts within `warmup` of its target never measures anything, so
-        # the last-half-degree look below has to stay reachable without an anchor.
-        if anchored:
-            from_temp, since = self._anchor
-            if temp - from_temp >= self.settle_for(from_temp) - 1e-9:
-                actual = (when - since).total_seconds() / 60.0
-                revised = self._recalibrate(from_temp, temp, actual, when)
-                # Measure the next share from here. Without this the span keeps growing
-                # past the settle and the curve is revised at every later crossing —
-                # the churn this design replaced.
-                self._anchor = (temp, when)
 
-        # One last look with half a degree to go, using whatever the curve has become.
-        if not revised and self.target - 0.5 - 1e-9 <= temp < self.target:
+        # A band edge, reached from below: elapsed time to here is known exactly.
+        if (self._band_entry is not None
+                and temp > self._band_entry[0]
+                and any(abs(temp - b) < 1e-9 for b in self.bounds)):
+            self._band_entry = (temp, when)
             mins = self.minutes(temp, self.target)
+            if mins is not None:
+                self.eta = when + timedelta(minutes=mins)
+                self.revisions += 1
+                revised = True
+
+        # One last look with half a degree to go, from the rate measured immediately
+        # below it. Falls back to the curve when this band was never entered from its
+        # edge — a top-up starting inside the final band has nothing local to measure.
+        if not revised and not self._final_look and (
+                self.target - 0.5 - 1e-9 <= temp < self.target):
+            self._final_look = True
+            mins = None
+            entry_temp, entry_when = self._band_entry or (None, None)
+            if entry_when is not None and temp > entry_temp:
+                hours = (when - entry_when).total_seconds() / 3600.0
+                if hours > 0:
+                    local = (temp - entry_temp) / hours
+                    if local > 0:
+                        mins = (self.target - temp) / local * 60.0
+            if mins is None:
+                mins = self.minutes(temp, self.target)
             if mins is not None:
                 self.eta = when + timedelta(minutes=mins)
                 self.revisions += 1
                 revised = True
         return revised
 
-    def _recalibrate(self, from_temp, temp, actual, when):
-        """Scale the whole curve by how the run from `from_temp` compared to plan.
-
-        Against what the curve predicted for that exact span, not against a single
-        band's rate — which is what lets a measurement cross a band boundary. It has to:
-        a 24 °C start needs 4.5 °C before it may commit and the 30 °C boundary arrives
-        after 3.5, so re-anchoring there threw the whole cold run away and left the
-        first correction until 33.5 °C. Every start from 23 to 28 fell in that hole.
-        """
-        planned = self.minutes(from_temp, temp)
-        if not planned or actual <= 0:
-            return False
-        factor = planned / actual
-        cumulative = (self.rates[0] / self._base[0]) * factor
-        if cumulative > SHADOW_DRIFT_MAX:
-            factor *= SHADOW_DRIFT_MAX / cumulative
-        elif cumulative < SHADOW_DRIFT_MIN:
-            factor *= SHADOW_DRIFT_MIN / cumulative
-        self.rates = [r * factor for r in self.rates]
-        mins = self.minutes(temp, self.target)
-        if mins is None:
-            return False
-        self.eta = when + timedelta(minutes=mins)
-        self.revisions += 1
-        return True

@@ -30,6 +30,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ready at no longer walks away from a good estimate mid-session.** A bucket rate is
+  the *chord* of the heating curve between the two edges of its band, not the rate
+  anywhere along it — inside 30–37 °C the real rate falls from about 1.33 to 1.05 °C/h.
+  The plan used to measure a sub-span and compare it against that chord, which finds a
+  difference that is arithmetically real and physically meaningless, and it always took
+  that measurement low in the band where the discrepancy is largest. On 2026-08-20 it
+  turned an opening estimate 8 minutes out into one 58 minutes out, and did not beat its
+  own opening again until the water was half a degree from target.
+
+  The plan is now revised only where a band completes — 30 °C and 37 °C, the two
+  temperatures at which a whole traverse has been measured — plus one look with half a
+  degree to go. At a band edge there is nothing to compare, because the elapsed time to
+  that exact temperature is fact, so the revision moves the starting point and leaves
+  the rates alone. Replayed over five recorded sessions the finish lands within five
+  minutes every time.
+
+- **The hot rate is learned over 37–39 °C instead of everything above 37.** Left
+  open-ended it absorbed the 39–40 tail, where a session with a 40 °C setpoint spends
+  its slowest hour, and the single rate it settled on described neither half. Above 39
+  the rate is extrapolated, which costs nothing measurable — across five sessions the
+  final half degree runs at 1.05x the degree below it — and errs on the forgiving side.
+  The cold rate is bounded at 20 °C for the same reason.
+
 - **Stopping a heat-up part way is no longer recorded as having finished it.** A session
   ends when the water reaches the setpoint, and dropping the thermostat onto the water
   satisfies that without a degree of progress — so aborting a run at 30 °C on its way to
