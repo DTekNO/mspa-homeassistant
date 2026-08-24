@@ -101,13 +101,24 @@ _BUCKET_SPAN_FULL_C = 4.0
 # release the readiness latch when the user raises the setpoint.
 _NEW_SESSION_DELTA = 2.0          # °C
 
-# The live ETA holds the opening estimate until BOTH of these are met, then replans
-# at every 0.5 °C crossing against rates frozen at session start.  Simulated over the
-# four recorded sessions in analysis/settle_time.py: replanning converges to 0 min at
-# the finish where holding carries its opening error all the way in (10 min mean, 35
-# on the worst session).  Before the settle point the opposite is true — a recompute
-# from a partial span is badly wrong, and the opening crossings measure band position
-# rather than heating — so each is used where it wins.
+# The settle guard: both must be met before a partial span is trusted.
+#
+# Written for a plan that recomputed the ETA at every 0.5 °C crossing, and measured
+# against that over the four recorded sessions in analysis/settle_time.py — replanning
+# converges to 0 min at the finish where holding carries its opening error all the way
+# in (10 min mean, 35 on the worst session), while before the settle point the opposite
+# is true, because a recompute from a partial span is badly wrong and the opening
+# crossings measure band position rather than heating.
+#
+# It no longer gates the live ETA. ShadowPlan owns that, revises only at band edges
+# where the elapsed time is fact, and is returned before this guard is consulted (see
+# sensor.py). Two uses remain: nulling `progress_deviation` until a deviation measures
+# heating rather than band position, and the fallback ETA for a session whose plan was
+# cancelled, which does still recompute from the anchor.
+#
+# Note it is a one-shot gate — once both are past it stays true for the session — and
+# that a session starting below the cold bucket passes it well before its first band
+# edge at 20 °C, so it has already fallen away by the time anything can revise.
 _PLAN_SETTLE_MINUTES = 90.0
 _PLAN_SETTLE_DEGREES = 1.5
 

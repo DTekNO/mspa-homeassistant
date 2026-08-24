@@ -315,27 +315,36 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
                       anc_time, anc_temp, target_temp or 0)
         return None
 
-    # Within a session, integrate the rate curve frozen at its start and hold the
-    # opening estimate until the settle guard passes.
+    # The shadow curve owns the displayed estimate whenever a session is running. It is
+    # held between revisions rather than recomputed, so this returns a timestamp rather
+    # than a span from the anchor — and it returns here, before the settle guard below,
+    # which is why that guard no longer has any part in the live ETA.
     #
-    # Both halves are measured (analysis/settle_time.py, four recorded sessions).
-    # Replanning at each 0.5 °C crossing converges to 0 min at the finish, where
-    # holding carries its opening error all the way in — 35 min on the worst session,
-    # still 35 min wrong at the moment the spa was ready. Before the settle point the
-    # opposite holds: a recompute from a partial span is badly wrong, because the plan
-    # is only accurate over a full span and the opening crossings measure position
-    # within the 0.5 °C band rather than heating.
+    # The settle guard predates the boundary-only replan and was written for a plan that
+    # recomputed at every 0.5 °C crossing. That needed protecting from itself early on:
+    # a recompute from a partial span is badly wrong, because a bucket rate is the chord
+    # of a full traverse, and the opening crossings measure position within the 0.5 °C
+    # band rather than heating. Holding the opening estimate until 90 minutes and 1.5 °C
+    # had passed was the cheapest way to keep those samples out of the display.
     #
-    # Freezing the rates matters as much as the settle: recomputing with rates that
-    # move as they are learned was the shipped behaviour, and it was worse than either
-    # (21 min mean against 10 for holding).
-    # The shadow curve owns the displayed estimate whenever a session is running: it
-    # is held between revisions rather than recomputed, so this returns a timestamp
-    # rather than a span from the anchor.
+    # ShadowPlan.crossing revises only where a band completes and once with half a degree
+    # to go, and at a band edge the elapsed time is fact rather than an estimate — so
+    # there is no longer a partial span for a settle to guard against. What remains of
+    # the guard is used in two narrower places, and only those: nulling
+    # `progress_deviation` until a deviation means something, which is unaffected by any
+    # of this, and the fallback below for a session whose plan was cancelled.
+    #
+    # Freezing the rates is the part that still carries the original measurement.
+    # Recomputing with rates that move as they are learned was the shipped behaviour and
+    # was worse than either alternative — 21 min mean against 10 for holding, over the
+    # four recorded sessions in analysis/settle_time.py.
     shadow = coordinator.shadow_eta()
     if shadow is not None:
         return shadow
 
+    # No shadow curve: the session's plan was cancelled, most often because the setpoint
+    # moved. Here the settle guard is still doing its original job, because this path
+    # does recompute from the anchor.
     plan = coordinator.session_plan()
     if plan is not None and not coordinator.session_settled(anc_temp, now_utc):
         opening = coordinator.session_opening_eta()
