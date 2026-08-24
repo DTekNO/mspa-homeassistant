@@ -8,6 +8,7 @@ from .predictor import (
     HeatPredictor,
     ShadowPlan,
     in_learning_range,
+    learning_anchor_zone,
     ambient_rate_factor,
     bucket_index,
     extrapolate_within_band,
@@ -1559,9 +1560,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # and is measured on its own), or the sample was rejected (a bad
                 # span must never be re-used).  Otherwise hold the anchor so the
                 # span keeps widening and the estimate keeps improving.
-                if not accepted or _heat_bucket_index(curr_temp) != anchor_bucket:
+                #
+                # The zone, not the bucket. Everything below HEAT_BUCKET_LEARN_MIN is one
+                # bucket with the 20-30 range, so an anchor set at the start of a cold
+                # session sat there until 30 — and in_learning_range tests the *from*
+                # temperature, so every sample a session starting at 15 could offer was
+                # 15→x and every one was refused, the complete 20→30 traverse included.
+                # Refusing a full traverse of the cold bucket because the session began
+                # below it throws away the one measurement that stretch exists to make.
+                # Re-anchoring at 20 turns it back into an ordinary chord.
+                if not accepted or (learning_anchor_zone(curr_temp)
+                                    != learning_anchor_zone(self._rate_last_temp)):
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono
+                    # A new window measures a new chord, so the value it recomputes from
+                    # must be re-read rather than carried over from the window before it.
+                    self._bucket_base_bucket = None
             # else: temperature unchanged — let elapsed time accumulate, don't touch anchor
         else:
             # Heater off/preheat — reset anchor so next on-cycle starts fresh

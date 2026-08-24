@@ -481,8 +481,13 @@ class TestShadowPlan:
         return plan
 
     def test_bands_are_seeded_from_the_stored_buckets(self):
+        """Four bands, three stored buckets: each band takes the bucket covering its
+        own midpoint, so the sub-20 band and the 20-30 band both draw the cold rate.
+        Nothing below HEAT_BUCKET_LEARN_MIN was ever measured — the rate down there is
+        the cold chord extrapolated, and the band exists to mark where that ends and to
+        let the plan re-anchor at 20 rather than carry the extrapolation to 30."""
         p = self._plan()
-        assert p.rates == [1.10, 0.99, 0.79]
+        assert p.rates == [1.10, 1.10, 0.99, 0.79]
 
     def test_the_opening_estimate_stands_until_something_qualifies(self):
         p = self._feed(self._plan(), [(30, 33.5), (60, 34.0), (90, 34.5)])
@@ -588,7 +593,7 @@ class TestShadowPlan:
         impossible crossing moves the anchor and nothing else."""
         p = self._plan()
         self._feed(p, [(200, 37.0), (205, 38.0)])   # 12 °C/h, physically impossible
-        assert p.rates == [1.10, 0.99, 0.79]
+        assert p.rates == [1.10, 1.10, 0.99, 0.79]
 
     def test_the_final_half_degree_gets_a_look(self):
         p = self._plan()

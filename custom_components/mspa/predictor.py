@@ -241,12 +241,6 @@ class HeatPredictor:
 
 
 # ── Shadow plan ──────────────────────────────────────────────────────────────
-# The stored buckets' own boundaries. Extra ones at 34 and at 26 were both tried and
-# both make things worse — 30 minutes wrong at the halfway mark becomes 61 and 112.
-# Every boundary re-anchors the measurement, so more of them means shorter runs, and a
-# short run is exactly what this design exists to avoid.
-SHADOW_BOUNDS = (30.0, 37.0)
-
 # The band edges. These are where the plan is allowed to revise itself, because they
 # are the only temperatures at which a *complete* traverse has been measured — and a
 # bucket rate describes exactly that, the chord between the two edges. Extra edges at
@@ -254,7 +248,19 @@ SHADOW_BOUNDS = (30.0, 37.0)
 # five recorded sessions agreed: bands at 33 and 36 leave the worst mid-session error
 # where it was, and six bands make it worse. Half-degree quantisation is why — a 1 °C
 # band traversed in under an hour is measured to about ±50%, a 3 °C band to ±17%.
-SHADOW_BOUNDS = (30.0, 37.0)
+#
+# 20 is the exception to that finding, and does not contradict it. The objection to an
+# extra edge is that it shortens a *measured* run; below HEAT_BUCKET_LEARN_MIN there is
+# no measured run to shorten, because nothing down there was ever learned and the rate
+# in use is the 20–30 chord extrapolated. Marking where the extrapolation ends is worth
+# a re-anchor precisely because that stretch is the least trustworthy in the session:
+# without it, a start at 15 carries its opening error all the way to 30 before the plan
+# is allowed to correct itself.
+#
+# It also cannot disturb any of the evidence above. The archive's floor is 22 °C, so 20
+# sits below the start of all five recorded sessions and never fires on one — the
+# leave-one-out result is unchanged by construction, not by argument.
+SHADOW_BOUNDS = (20.0, 30.0, 37.0)
 
 # The hot bucket learns over 37–39 and is then used for everything above 37.
 #
@@ -272,6 +278,33 @@ HEAT_BUCKET_LEARN_MAX = 39.0
 # not enough to justify a boundary in there, and putting one in on that evidence is the
 # mistake this file has already made once.
 HEAT_BUCKET_LEARN_MIN = 20.0
+
+def learning_anchor_zone(temp):
+    """Which measuring window a temperature belongs to, for anchoring purposes.
+
+    The bucket index, except that everything below HEAT_BUCKET_LEARN_MIN is a zone of
+    its own. The measuring window holds its anchor while the water stays in one zone and
+    re-anchors when it leaves, so this is what decides where a new chord starts.
+
+    Without the sub-range zone the anchor set at the start of a cold session never moves
+    until 30 °C, and `in_learning_range` tests the *from* temperature — so a session
+    beginning at 15 offers every one of its samples as 15→x and has all of them refused,
+    including the full 20→30 traverse that is exactly what the cold bucket wants. The
+    top end has no equivalent problem: there the anchor (37) is inside the learning
+    range and only the far end of the span leaves it, so the samples up to 39 are taken
+    normally and only the tail above is refused.
+
+    Returns None for an unknown temperature, which never equals another zone, so an
+    unusable reading closes the window rather than silently extending it.
+    """
+    if temp is None:
+        return None
+    try:
+        t = float(temp)
+    except (TypeError, ValueError):
+        return None
+    return -1 if t < HEAT_BUCKET_LEARN_MIN else bucket_index(t)
+
 
 def in_learning_range(from_temp, to_temp) -> bool:
     """Whether a rate sample spanning `from_temp` to `to_temp` may update a bucket.

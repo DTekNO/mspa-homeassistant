@@ -363,3 +363,98 @@ class TestDwellAfterACrossing:
         assert c._rate_last_temp == 33.5, "anchor moved during the dwell"
         c._track_heating_rate(34.5, 3, 70 * _MIN)
         assert c._rate_last_temp == 33.5, "anchor moved on the next crossing"
+
+
+class TestColdStartBelowLearningRange:
+    """A session starting below HEAT_BUCKET_LEARN_MIN must still learn 20→30.
+
+    The measuring window holds its anchor while the water stays in one bucket, and
+    everything below 30 is one bucket. `in_learning_range` tests the *from* temperature,
+    so an anchor set at 15 made every sample 15→x — and every one of them was refused,
+    the complete 20→30 traverse included. Refusing a full traverse of the cold bucket
+    because the session happened to begin below it discards the one measurement that
+    stretch exists to make.
+
+    Nothing recorded starts below 22 °C, so this path has never run against real data;
+    it exists for the deliberate cold-start session that will produce that data.
+    """
+
+    def _cold(self):
+        c = _coord()
+        c.heat_rate_buckets = [1.10, 1.30, None]
+        return c
+
+    def test_below_twenty_is_not_learned(self):
+        """The extrapolated stretch stays extrapolated: no bucket may move there."""
+        c = self._cold()
+        c._track_heating_rate(15.0, 3, 0.0)               # heater-on anchor
+        c._track_heating_rate(15.5, 3, 20 * _MIN)         # phase-uncertain, re-anchors
+        c._track_heating_rate(16.5, 3, 60 * _MIN)
+        c._track_heating_rate(18.0, 3, 120 * _MIN)
+        assert c.heat_rate_buckets[0] == 1.10, "nothing below 20 may be learned"
+        assert 0 not in c._session_fresh_buckets
+
+    def test_crossing_twenty_reanchors_the_window(self):
+        """The anchor must move to the crossing, not stay in the sub-range tail."""
+        c = self._cold()
+        c._track_heating_rate(15.0, 3, 0.0)
+        c._track_heating_rate(15.5, 3, 20 * _MIN)
+        c._track_heating_rate(20.0, 3, 200 * _MIN)
+        assert c._rate_last_temp == 20.0
+        assert c._rate_last_time == 200 * _MIN
+        assert c._bucket_base_bucket is None, "a new window re-reads its base value"
+
+    def test_the_full_cold_traverse_is_learned(self):
+        """20 → 30 is an ordinary chord and must land in the cold bucket."""
+        c = self._cold()
+        c._track_heating_rate(15.0, 3, 0.0)
+        c._track_heating_rate(15.5, 3, 20 * _MIN)         # phase-uncertain
+        c._track_heating_rate(20.0, 3, 200 * _MIN)        # re-anchor at the floor
+        c._track_heating_rate(25.0, 3, 500 * _MIN)        # 5 °C in 300 min = 1.0 °C/h
+        assert 0 in c._session_fresh_buckets, "the cold bucket must learn from 20 up"
+        assert c.heat_rate_buckets[0] != 1.10
+
+    def test_a_start_inside_the_range_is_unchanged(self):
+        """The 22 °C start every recorded session begins at behaves exactly as before."""
+        c = self._cold()
+        c._track_heating_rate(22.0, 3, 0.0)
+        c._track_heating_rate(22.5, 3, 20 * _MIN)         # phase-uncertain
+        c._track_heating_rate(25.0, 3, 170 * _MIN)        # 2.5 °C in 150 min = 1.0 °C/h
+        assert c._rate_last_temp == 22.5, "the window still widens inside one zone"
+        assert 0 in c._session_fresh_buckets
+
+    def test_the_mid_and_hot_buckets_still_learn_from_a_cold_start(self):
+        """The defect was unique to the bottom; the other two edges were never affected.
+
+        Above 20 a zone boundary and a bucket boundary are the same temperature, so the
+        window re-anchors exactly on 30 and on 37 and each bucket is measured from its
+        own lower edge. Only the cold bucket could have an anchor that sat outside the
+        learning range while staying inside the bucket, which is what made it the one
+        place a full traverse could be refused.
+        """
+        c = self._cold()
+        c.heat_rate_buckets = [1.10, 1.30, 1.05]
+        c._track_heating_rate(15.0, 3, 0.0)               # below the learning floor
+        c._track_heating_rate(15.5, 3, 20 * _MIN)         # phase-uncertain
+        c._track_heating_rate(20.0, 3, 200 * _MIN)        # re-anchor at the floor
+        c._track_heating_rate(30.0, 3, 800 * _MIN)        # cold traverse, re-anchor
+        assert c._rate_last_temp == 30.0, "the window re-anchors on the bucket edge"
+        c._track_heating_rate(37.0, 3, 1300 * _MIN)       # mid traverse, re-anchor
+        assert c._rate_last_temp == 37.0
+        c._track_heating_rate(39.0, 3, 1450 * _MIN)       # hot, still inside 39
+        assert c._session_fresh_buckets == {0, 1, 2}, (
+            "every bucket the session traversed must have learned"
+        )
+
+    def test_the_hot_tail_above_thirty_nine_is_still_refused(self):
+        """The upper bound is unchanged: 37 anchors inside the range, so only the
+        far end of the span leaves it and the tail alone is refused."""
+        c = self._cold()
+        c.heat_rate_buckets = [1.10, 1.30, 1.05]
+        c._track_heating_rate(37.0, 3, 0.0)
+        c._track_heating_rate(37.5, 3, 30 * _MIN)         # phase-uncertain
+        c._track_heating_rate(39.0, 3, 130 * _MIN)        # learned
+        learned = c.heat_rate_buckets[2]
+        assert 2 in c._session_fresh_buckets
+        c._track_heating_rate(40.0, 3, 210 * _MIN)        # to > 39 — refused
+        assert c.heat_rate_buckets[2] == learned, "the 39-40 tail must not move it"
