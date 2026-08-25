@@ -1709,3 +1709,93 @@ class TestLoweredSetpointIsNotReady:
         c = MockCoordinator(water_temp=28.5, target_temp=20.0,
                             near_target=True, ready_latched=True)
         assert _ready_at(c) == "Ready"
+
+
+class TestManualHeatUnderAPendingSchedule:
+    """Raising the thermostat while a schedule is pending must show *that* heat-up.
+
+    Reported 2026-08-25: a schedule was set for several days out, the setpoint was
+    raised by hand to heat the tub now, and Ready at went on reporting the scheduled
+    day. It looked as though the setpoint change had been ignored, and the only way to
+    see when the water would actually be warm was to cancel the schedule.
+
+    Nothing was wrong underneath — the coordinator opens a real session for that change
+    like any other, builds a plan and measures it. The schedule-pending branch of the
+    display simply returned before the free-heating branch could be reached.
+
+    A heat-up happening now outranks one scheduled for later, and the schedule is
+    neither cancelled nor altered by being outranked.
+    """
+
+    def _pending(self, **kw):
+        """A schedule three days out, far enough that its display is unmistakable."""
+        return MockCoordinator(
+            near_target=False, ready_latched=False,
+            scheduled_ready_at=datetime.now(timezone.utc) + timedelta(days=3),
+            schedule_target_temp=39.5,
+            heat_rate=2.0,
+            **kw,
+        )
+
+    def _session(self, c):
+        """Mark a session open, the way the coordinator does when the setpoint jumps."""
+        c._prediction = {
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "start_temp": 24.0,
+            "target_temp": 39.5,
+            "estimated_minutes": 480.0,
+            "plan_rates": [1.21, 1.04, 0.86],
+        }
+        return c
+
+    def test_the_scheduled_day_is_shown_while_nothing_is_heating(self):
+        """The behaviour that must not change: a pending schedule with the thermostat
+        parked low is still a pending schedule."""
+        c = self._pending(water_temp=24.0, target_temp=20.0, heater="off")
+        val = _ready_at(c)
+        assert val is not None and "+3d" in val, val
+
+    def test_maintenance_cycling_does_not_take_over_the_display(self):
+        """The heater running to hold a low setpoint is not a heat-up.
+
+        This is the case that keeps the branch quiet for the days a schedule usually
+        spends pending: no session is open, so there is nothing to report but the
+        schedule.
+        """
+        c = self._pending(water_temp=19.6, target_temp=20.0, heater="on")
+        val = _ready_at(c)
+        assert val is not None and "+3d" in val, val
+
+    def test_a_manual_heat_up_replaces_the_scheduled_time(self):
+        """The report: setpoint raised by hand, heater on, session open."""
+        c = self._session(
+            self._pending(water_temp=24.0, target_temp=39.5, heater="on"))
+        val = _ready_at(c)
+        assert val is not None, "a heat-up in progress must show a time"
+        assert "+3d" not in val, f"still showing the schedule: {val}"
+        assert re.match(r"^\d{2}:\d{2}", val), val
+
+    def test_the_schedule_is_left_alone(self):
+        """Outranked, not cancelled: the Heat Schedule sensor is unaffected, and the
+        scheduled time returns once the manual session ends."""
+        c = self._session(
+            self._pending(water_temp=24.0, target_temp=39.5, heater="on"))
+        before = c.scheduled_ready_at
+        _ready_at(c)
+        assert c.scheduled_ready_at == before
+        assert c.schedule_target_temp == 39.5
+        # Session over and the water long since cooled: the schedule drives the
+        # display again. Cooled deliberately — at 39.5 the honest answer is "Ready",
+        # because the tub is already at the temperature the schedule is aiming for,
+        # and that would prove nothing about which branch produced it.
+        c._prediction = None
+        _apply_temp_update(c, new_temp=24.0, new_target=20.0)
+        c._last_data["heater"] = "off"
+        c.ready_latched = False
+        assert "+3d" in (_ready_at(c) or ""), _ready_at(c)
+
+    def test_almost_there_reads_ready_rather_than_a_time(self):
+        """Within five minutes of the manual target, the same rule as free heating."""
+        c = self._session(
+            self._pending(water_temp=39.4, target_temp=39.5, heater="on"))
+        assert _ready_at(c) == "Ready"

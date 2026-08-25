@@ -589,6 +589,45 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
     # near_target is thermostat-based and may refer to a lower maintenance setpoint,
     # so we only use proximity to the schedule target here.
     if sra_future and not triggered:
+        # A heat-up happening *now* outranks one scheduled for later.
+        #
+        # This branch used to return the scheduled time unconditionally, which shut out
+        # the free-heating branch below and made a manual setpoint change look ignored:
+        # raise the thermostat with a schedule pending and Ready at went on reporting the
+        # scheduled day, with no way to see when the water you are actually heating will
+        # be warm. The only way out was to cancel the schedule.
+        #
+        # Nothing was wrong underneath. The coordinator starts a real session for that
+        # setpoint change like any other, builds a plan and measures it; the display
+        # simply never asked. The schedule is not cancelled or altered by this — it still
+        # governs once the manual session ends, and the Heat Schedule sensor goes on
+        # showing it throughout.
+        #
+        # "Now" is the coordinator's own definition of a session rather than a second
+        # opinion: a plan exists only where it decided a session had begun, which is a
+        # setpoint more than _NEW_SESSION_DELTA above the water with the heater in full
+        # heat. Ordinary maintenance cycling toward a low holding setpoint never
+        # qualifies, which is what keeps this branch quiet for the days a schedule
+        # usually spends pending.
+        manual_eta = None
+        if heater_on and coordinator.session_plan() is not None:
+            try:
+                thermostat = float(coordinator._last_data.get("target_temperature") or 0)
+            except (TypeError, ValueError):
+                thermostat = None
+            if thermostat is not None and water is not None and thermostat > water:
+                manual_eta = _anchor_eta_utc(coordinator, thermostat, now_utc)
+        if manual_eta is not None:
+            remaining = (manual_eta - now_utc).total_seconds()
+            if remaining <= 300:
+                _LOGGER.debug("ready_at → Ready (manual heat under a pending schedule)")
+                return ("ready", None)
+            _LOGGER.debug(
+                "ready_at → %s (manual heat under a pending schedule, target=%.1f)",
+                manual_eta.isoformat(), thermostat,
+            )
+            return ("eta", manual_eta)
+
         near_sched = (
             sched_temp is not None and water is not None
             and abs(water - sched_temp) <= 0.5
