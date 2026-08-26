@@ -183,14 +183,22 @@ On a brand-new installation the integration has no observed heating or cooling r
 
 ### How the model learns
 
-The integration uses an **adaptive machine learning model** to predict heating and cooling times. It updates continuously from observed data and corrects for changing conditions — season, ambient temperature, cover on or off, water fill level — without any configuration required.
+**In short.** The integration learns how fast *your* spa heats, from the spa's own reported temperature, and uses that both to tell you when the water will be ready and to decide when to start heating to hit a scheduled time. The rate is not a single number: water heats more slowly as it approaches the set-point, so it is learned separately for the cold, middle and near-target stretches of a heat-up.
+
+**Those learned rates are always a little out of date, mostly because of the weather.** The same spa that climbs at 1.3 °C/h on a mild afternoon will manage noticeably less on a cold, windy night, and the gap widens as the water gets hotter and loses heat faster to the air. A rate learned across the summer cannot describe today on its own, so two corrections sit on top of it: one applied *before* heating starts, from the outdoor temperature, and one applied *during* the heat-up, from how the spa is actually behaving today. Neither changes what has been learned — the stored rates go on improving slowly, across sessions.
+
+It updates continuously from observed data and corrects for changing conditions — season, ambient temperature, cover on or off, water fill level — without any configuration required.
 
 #### Online learning with exponential smoothing
 
 Heating and cooling rates are sampled from actual temperature changes observed during operation:
 
-- **Heating rate** — sampled while the climate entity is in `heating` action (full-heat mode). The first valid sample is taken after the water has moved at least 0.5 °C and at least 3 minutes have elapsed.
-- **Cooling rate** — sampled passively when the heater is off and the temperature is actually dropping. Same minimum requirements.
+- **Heating rate** — sampled while the climate entity is in `heating` action (full-heat mode).
+- **Cooling rate** — sampled passively when the heater is off and the temperature is actually dropping.
+
+**The first crossing after the heater engages is not learned from.** The spa reports temperature in 0.5 °C steps, so the reading at heater-on sits at an unknown position inside its step: the time to the first crossing measures that random position rather than any heating rate — about twice too fast on average, and arbitrarily fast if the water happened to start just below a boundary. That first crossing re-anchors instead, which puts the anchor exactly on a step boundary, and learning starts from the second.
+
+**From there the measurement window widens rather than resetting.** Each sample runs from the first boundary reached in the current temperature band to wherever the water is now, so a sample late in a band may span several degrees and a couple of hours. Every crossing lands exactly on a boundary, so a wide span is no more biased than a narrow one and far less noisy — a few minutes of report-timing jitter matters much less over two hours than over one 30-minute step.
 
 Each sample is fed into an **exponential moving average (EMA)** with smoothing factor **α = 0.25**:
 
@@ -200,7 +208,7 @@ new_rate = 0.25 × observed_rate + 0.75 × stored_rate
 
 This gives recent observations 25% weight while retaining the history of previous sessions. After 4–5 sessions the estimate has settled to a representative value; it continues to adapt gradually as seasonal conditions change. Outliers — rates below 0.05 °C/h (sensor noise) or above 3.0 °C/h (e.g. adding water) — are rejected before they can distort the EMA.
 
-The **Ready at** sensor shows as **unavailable** until at least one valid rate sample has been collected. On a typical heating cycle this means the sensor becomes active after the first 0.5 °C step (usually well within the first 30 minutes of heating).
+The **Ready at** sensor shows as **unavailable** until at least one valid rate sample has been collected — ever, not in the current session — so on a spa that has heated before it is available immediately. On a brand-new installation with no device seed, the first learned sample arrives at the *second* 0.5 °C crossing of the first heat-up, since the first only sets the anchor.
 
 #### Temperature-segmented rates
 
@@ -214,6 +222,10 @@ A spa does not heat at a constant rate across its full temperature range. Heat l
 
 Each bucket is updated only by observations made in that temperature range. When estimating time-to-target, the remaining delta is split at the 30 °C and 37 °C boundaries; each segment is calculated at its own observed rate; the results are summed. This gives substantially more accurate estimates for long heating runs (e.g. 20 °C → 40 °C) compared to a single flat rate.
 
+**Learning is bounded to 20–39 °C**, and the two ends are bounded for different reasons. Above 39 °C a spa set to 40 spends its slowest hour, and letting that into the hot bucket dragged the rate down for the whole stretch above 37; the rate there is extrapolated instead, which measurement says costs nothing — the final half degree runs at about 1.05× the degree below it. Below 20 °C there is simply nothing to learn from, since no recorded heat-up has started that cold, so a rate learned there would be a guess rather than an observation. A heat-up beginning below 20 °C still works: it is estimated by extrapolation and begins learning, and revising, from 20 °C.
+
+Each bucket update is also **weighted by how much of the bucket it measured**. A sample covering half a degree of a seven-degree band moves that bucket far less than one covering five degrees, so an early, short measurement cannot swing a rate that a later, longer one will describe better.
+
 #### In-session condition correction (session scalar)
 
 Outdoor conditions — temperature, wind, whether the cover is on — can shift the effective heating rate by 20–40% between a cold winter morning and a warm summer afternoon. The model detects this within the first few minutes of a new heating session, from the spa's own behaviour and with no weather data required.
@@ -221,6 +233,8 @@ Outdoor conditions — temperature, wind, whether the cover is on — can shift 
 At the start of each session (heater engages with delta > 2 °C) the **session scalar** is reset to 1.0. As soon as the first bucket receives a live observation, the ratio of observed rate to stored base rate for that bucket is computed. This ratio is smoothed (weighted 40% new / 60% prior) and applied as a multiplier to any bucket that has not yet received direct observations in the current session.
 
 The effect: today's ambient conditions are reflected across the entire estimate within the first few minutes of heating, before the spa has passed through all three temperature ranges.
+
+This scalar governs the **scheduling** estimate — the Heat Schedule sensor, and the working rates the model plans from. The **Ready at** time you watch during a heat-up is produced separately, and is corrected by measuring completed stages rather than by this early sample; see [Revising the estimate as the heat-up runs](#revising-the-estimate-as-the-heat-up-runs).
 
 #### Outdoor-temperature correction (weather model)
 
@@ -266,6 +280,50 @@ Configuring one enables two things:
 - **gentler decay on stored rates** — ≈ 0.6 %/day instead of ≈ 2 %/day, because that correction explains some of the seasonal variation directly, so stored rates stay useful for longer.
 
 It is entirely optional. Everything degrades gracefully to the plain learned rates if no entity is set, or if the one you set becomes unavailable.
+
+#### Revising the estimate as the heat-up runs
+
+The corrections above all happen before or near the start. A long heat-up can run for
+eleven hours, from a cold morning into a warm afternoon, so an estimate that commits at
+the start and never looks again will be wrong for most of it.
+
+The **Ready at** sensor is therefore driven by a private copy of the rate curve, taken
+when the session opens and kept separate from the stored buckets. Nothing learned during
+the session moves it, so rates learned today take effect on the next heat-up rather than
+sliding the estimate you are currently watching.
+
+That copy is revised at exactly three points:
+
+| Revised at | What it measures |
+|---|---|
+| **30 °C** | how long 20–30 °C actually took, against how long it was predicted to take |
+| **37 °C** | the same for 30–37 °C |
+| **half a degree from target** | the rate achieved over the stretch immediately below it |
+
+At each point the ratio of predicted to actual is applied to the whole remaining curve,
+and the estimate is re-anchored to the current time. Arriving at 30 °C an hour early no
+longer just banks that hour — everything still to come is re-priced by the same
+proportion.
+
+**Why only those three.** The time taken to reach a stage boundary is a fact. A
+measurement taken part way through a stage is not comparable to that stage's rate, which
+describes the whole traverse rather than any point along it — comparing them finds a
+difference that is arithmetically real and physically meaningless, and an estimate
+corrected that way wanders without getting closer.
+
+**Why the stage just finished, rather than the session so far.** Both were measured. The
+whole session scores marginally better on average, but it loses on exactly the runs this
+exists for — the long ones, where the weather genuinely changed while the water heated.
+The stage just finished is the closest thing to current conditions available.
+
+Two guards apply. A stage is only used if what remains is comparable to what it measured,
+so a heat-up starting just below 30 °C does not apply one degree of evidence to the nine
+still ahead. And the curve is not allowed to drift indefinitely far from the rates the
+session opened with.
+
+Measured across five recorded heat-ups, this takes the average error over a whole session
+from **62 to 43 minutes**, and the worst mid-session error from **192 minutes to 57**. The
+finish itself was already accurate and is unchanged, landing within a few minutes.
 
 #### Historical bias correction
 
