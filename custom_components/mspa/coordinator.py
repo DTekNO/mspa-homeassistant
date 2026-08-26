@@ -307,6 +307,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._window_amb_n: int = 0
         self._window_wind_sum: float = 0.0
         self._window_wind_n: int = 0
+        # Set if anything happened during this window that makes the rate unmeasurable.
+        self._window_disturbed: bool = False
         # Full-band traverses, each a clean (water span, mean ambient, realised rate)
         # observation. Kept to learn how much the weather moves each band's rate, which
         # is currently a hard-coded guess per band.
@@ -1556,7 +1558,69 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             "ambient_seen": (st["min_amb"], st["max_amb"]),
         }
 
-    def _seed_window_ambient(self) -> None:
+    def _tub_is_disturbed(self) -> bool:
+        """Whether the spa is in a state where its heating rate cannot be measured.
+
+        Bubbles or jets mean the tub is in use or being cleaned — never part of a heating
+        cycle. Either way the cover is off, air or water is being driven through, and
+        what is being measured is the evening rather than the spa.
+
+        The signal is one-way, and that is the whole of how it is used. A switch being
+        *on* is conclusive: stop recording. A switch being *off* concludes nothing — the
+        cover comes off before anyone reaches for a switch, and plenty of soaks happen
+        with neither running. So this can only ever add a reason to discard; it can never
+        be read as permission to trust a span.
+
+        Everything that says a span *is* trustworthy comes from watching the water
+        instead — see `_window_looks_unmeasurable`. Once either has fired the flag
+        persists to the end of the band, because the pieces after a disturbance are
+        measuring the recovery rather than the spa.
+        """
+        data = getattr(self, "_last_data", None) or {}
+        return data.get("bubble") == "on" or data.get("jet") == "on"
+
+    # A heating spa whose water is *falling* is not being measured — something is taking
+    # heat out faster than a 2 kW heater puts it in, which in practice means the cover is
+    # off in weather. Unambiguous, and needs no model to detect.
+    #
+    # Below this fraction of what the curve expects, a span is treated the same way. The
+    # threshold is deliberately generous: the danger of a tighter one is circular, since a
+    # model that is wrongly high would reject the very evidence that would correct it. It
+    # is applied only once the band has enough observations to have a real expectation.
+    _UNMEASURABLE_RATE_FRACTION = 0.4
+    _EXPECTATION_NEEDS_N = 10.0
+
+    def _window_looks_unmeasurable(self, band, from_temp, rate) -> str | None:
+        """Why this span cannot be learned from, or None if it can.
+
+        Watches the water rather than the accessories, which matters because the
+        accessories lag: the cover is off for some minutes before anyone switches
+        anything on. It also catches a cover simply left open, where no switch is touched
+        at all.
+        """
+        if rate is None:
+            return None
+        if getattr(self, "ready_latched", False):
+            # Already at temperature. Whatever the heater does now is maintenance against
+            # losses, not a heat-up, and the tub is at its most likely to be in use — so
+            # this is where the noisiest readings live and none of them are wanted.
+            return "the spa was already up to temperature"
+        if rate <= 0:
+            return "the water was falling while the heater was on"
+        st = self._band_stats.get(str(int(band)))
+        if not st or st["n"] < self._EXPECTATION_NEEDS_N:
+            return None                       # no expectation worth measuring against yet
+        try:
+            expected = self._predictor().bucket_rate(from_temp)
+        except Exception:                     # a model that cannot answer is not evidence
+            return None
+        if expected and rate < expected * self._UNMEASURABLE_RATE_FRACTION:
+            return (f"{rate:.2f} °C/h against about {expected:.2f} expected — "
+                    f"the cover is probably off")
+        return None
+
+
+    def _seed_window_ambient(self, *, new_band: bool = True) -> None:
         """Start a fresh ambient window at the conditions the band is entered in.
 
         Zeroing instead of seeding leaves the mean covering only the polls *after* the
@@ -1569,8 +1633,21 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._window_amb_n = 1 if self.ambient_temp is not None else 0
         self._window_wind_sum = float(self.ambient_wind) if self.ambient_wind is not None else 0.0
         self._window_wind_n = 1 if self.ambient_wind is not None else 0
+        # The disturbance survives a mid-band re-anchor.
+        #
+        # Rejecting a sample re-anchors the window, so a spell with the cover off splits
+        # one traverse into pieces — and the pieces after it would otherwise look clean.
+        # They are not: the water has just been churned, the cover has only this moment
+        # gone back on, and what is being measured is the recovery rather than the spa.
+        # The flag is cleared when the band is genuinely left, which is also when the
+        # traverse it belonged to is over.
+        if new_band:
+            self._window_disturbed = self._tub_is_disturbed()
+        else:
+            self._window_disturbed = self._window_disturbed or self._tub_is_disturbed()
 
-    def _record_band_observation(self, band, from_temp, to_temp, hours, rate):
+    def _record_band_observation(self, band, from_temp, to_temp, hours, rate,
+                                 *, usable: bool = True):
         """Record one full band traverse, with the weather that prevailed across it.
 
         Each of these is a single clean point for the question the model currently
@@ -1599,6 +1676,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         water_mean = (float(from_temp) + float(to_temp)) / 2.0
         self._band_observations.append({
             "at": datetime.now(timezone.utc).isoformat(),
+            # Kept even when it cannot be learned from. A discarded traverse still says
+            # what happened, and a run of them is how a fault shows itself — an empty
+            # record would look like a spa that simply was not used.
+            "usable": bool(usable),
+            "disturbed": bool(self._window_disturbed),
             "band": int(band),
             "from_temp": round(float(from_temp), 2),
             "to_temp": round(float(to_temp), 2),
@@ -1614,9 +1696,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         })
         self._band_observations = (
             self._band_observations[-self._BAND_OBSERVATIONS_MAX:])
-        self._accumulate_band_stats(
-            band, float(rate), amb if amb is None else float(amb),
-            None if amb is None else water_mean - float(amb))
+        if usable:
+            self._accumulate_band_stats(
+                band, float(rate), amb if amb is None else float(amb),
+                None if amb is None else water_mean - float(amb))
         _LOGGER.debug(
             "Band observation: band %d, %.1f→%.1f °C in %.2f h = %.3f °C/h, "
             "ambient mean %s °C (water-air %s)",
@@ -1704,6 +1787,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # Temperature has changed — elapsed time since the window anchor
                 # is the true duration of the whole boundary-to-boundary span.
                 elapsed_hours = (now_mono - self._rate_last_time) / 3600
+                if self._tub_is_disturbed():
+                    self._window_disturbed = True
                 if self.ambient_temp is not None:
                     self._window_amb_sum += float(self.ambient_temp)
                     self._window_amb_n += 1
@@ -1715,7 +1800,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
                     delta = curr_temp - self._rate_last_temp
                     rate = delta / elapsed_hours  # guarded: elapsed_hours > 0
-                    if _MIN_HEAT_RATE <= rate <= _MAX_HEAT_RATE:
+                    # Before the branches: a span that cannot be learned from is still
+                    # recorded, and the record needs to know whether it was in range.
+                    _in_learn_range = in_learning_range(self._rate_last_temp, curr_temp)
+                    # Bound here rather than in the accepted branch: a span that cannot
+                    # be learned from still belongs to a band, and is still recorded.
+                    _bi = anchor_bucket
+                    _why = (self._window_looks_unmeasurable(
+                                anchor_bucket, self._rate_last_temp, rate)
+                            or ("the tub was in use — bubbles or jets ran"
+                                if self._window_disturbed else None))
+                    if _why:
+                        self._window_disturbed = True
+                        _LOGGER.info(
+                            "Heat rate sample %.3f °C/h ignored: %s", rate, _why
+                        )
+                    elif _MIN_HEAT_RATE <= rate <= _MAX_HEAT_RATE:
                         accepted = True
                         if self.computed_heat_rate is None:
                             self.computed_heat_rate = rate
@@ -1724,9 +1824,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                                 _EMA_ALPHA * rate
                                 + (1 - _EMA_ALPHA) * self.computed_heat_rate
                             )
-                        # Also update the temperature bucket for this observation.
                         # The window anchor is the *start* temperature of the span.
-                        _bi = anchor_bucket
                         # Weight the sample by how much of the bucket it measured, and
                         # recompute from the value the window started at.
                         #
@@ -1766,8 +1864,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # The cold bucket is bounded at 20 for symmetry. Nothing in the
                         # archive goes below 22, so this only refuses to learn from a
                         # span nobody has recorded.
-                        _in_learn_range = in_learning_range(
-                            self._rate_last_temp, curr_temp)
                         if _in_learn_range:
                             self.heat_rate_buckets[_bi] = (
                                 _alpha * rate + (1 - _alpha) * _bp
@@ -1838,7 +1934,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # Re-anchoring at 20 turns it back into an ordinary chord.
                 _left_the_band = (learning_anchor_zone(curr_temp)
                                   != learning_anchor_zone(self._rate_last_temp))
-                if _left_the_band and accepted and _in_learn_range:
+                if _left_the_band and _in_learn_range and elapsed_hours > 0:
                     # A whole band, entered and left at its edges, measured against the
                     # weather that prevailed while it was crossed. That is the observation
                     # a per-band ambient sensitivity has to be fitted from, and until now
@@ -1846,11 +1942,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     # history kept one ambient temperature per *session*, taken at its
                     # start, which describes a five-hour band not at all.
                     self._record_band_observation(
-                        _bi, self._rate_last_temp, curr_temp, elapsed_hours, rate)
+                        _bi, self._rate_last_temp, curr_temp, elapsed_hours, rate,
+                        usable=bool(accepted) and not self._window_disturbed)
                 if not accepted or _left_the_band:
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono
-                    self._seed_window_ambient()
+                    self._seed_window_ambient(new_band=_left_the_band)
                     # A new window measures a new chord, so the value it recomputes from
                     # must be re-read rather than carried over from the window before it.
                     self._bucket_base_bucket = None

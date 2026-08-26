@@ -40,6 +40,7 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     c._window_amb_n = c._window_wind_n = 0
     c._band_observations = []
     c._band_stats = {}
+    c._window_disturbed = False
     for k, v in overrides.items():
         setattr(c, k, v)
     return c
@@ -658,3 +659,100 @@ class TestTheFitForgetsSlowlyAndOnlyOnUse:
         mean = c._band_stats["1"]["sum_rate"] / c._band_stats["1"]["n"]
         assert mean == pytest.approx(1.0, abs=0.02), (
             f"the old rate should have washed out, mean is {mean:.3f}")
+
+
+class TestUnmeasurableConditionsAreIgnored:
+    """A tub with its cover off is not measuring its own heating rate.
+
+    Detected from what the water does, not from which switch is on. An open cover on a
+    cold, windy evening shows up the same way whatever the owner happens to be running,
+    and a spa used in a way nobody anticipated needs no new rule written for it.
+
+    Jets are deliberately not a signal: on at least one spa they run routinely shortly
+    after heating starts, so treating them as a disturbance would discard most of that
+    owner's evidence.
+    """
+
+    def _feed(self, c, pairs, bubble_at=()):
+        """pairs: (minutes, temperature)."""
+        for i, (t, temp) in enumerate(pairs):
+            c._last_data = {"bubble": "on" if i in bubble_at else "off", "jet": "off"}
+            c._track_heating_rate(temp, 3, t * _MIN)
+
+    def _c(self):
+        c = _coord(heat_rate_buckets=[1.10, 1.30, None])
+        c.ambient_temp = 10.0
+        return c
+
+    def test_a_normal_traverse_is_learned_from(self):
+        c = self._c()
+        self._feed(c, [(0, 28.0), (30, 28.5), (60, 29.0), (90, 29.5), (120, 30.0),
+                       (150, 30.5)])
+        assert 0 in c._session_fresh_buckets
+        obs = [o for o in c._band_observations if o["band"] == 0]
+        assert obs and obs[0]["usable"] is True
+
+    def test_jets_disqualify_a_span_as_bubbles_do(self):
+        """Neither runs during a heating cycle — both mean the tub is in use or being
+        cleaned, and either way the cover is off."""
+        c = self._c()
+        for i, (t, temp) in enumerate([(0, 28.0), (30, 28.5), (60, 29.0), (90, 29.5),
+                                       (120, 30.0)]):
+            c._last_data = {"bubble": "off", "jet": "on" if i == 2 else "off"}
+            c._track_heating_rate(temp, 3, t * _MIN)
+        assert 0 not in c._session_fresh_buckets
+
+    def test_readings_while_already_up_to_temperature_are_discarded(self):
+        """Once the spa is at its setpoint the heater is only holding against losses, and
+        the tub is at its most likely to be in use. Nothing there describes a heat-up."""
+        c = self._c()
+        c.ready_latched = True
+        assert c._window_looks_unmeasurable(2, 38.0, 0.9) is not None
+        c.ready_latched = False
+        assert c._window_looks_unmeasurable(2, 38.0, 0.9) is None
+
+    def test_water_falling_while_heating_disqualifies_the_span(self):
+        """Something is taking heat out faster than the heater puts it in — in practice
+        the cover is off in weather. No model needed to see it."""
+        c = self._c()
+        self._feed(c, [(0, 28.0), (30, 28.5), (60, 29.0), (90, 28.5), (120, 29.0),
+                       (150, 30.0), (180, 30.5)])
+        obs = [o for o in c._band_observations if o["band"] == 0]
+        assert obs and obs[0]["usable"] is False, "a span that went backwards is not data"
+
+    def test_the_disturbance_survives_to_the_end_of_the_band(self):
+        """Rejecting a sample re-anchors the window, so a spell with the cover off splits
+        one traverse into pieces. The pieces after it are not clean: the water has been
+        churned and the cover has only just gone back on."""
+        c = self._c()
+        self._feed(c, [(0, 28.0), (30, 28.5), (60, 29.0), (90, 29.5), (120, 30.0),
+                       (150, 30.5)], bubble_at=(2,))
+        assert 0 not in c._session_fresh_buckets
+        assert c._band_stats.get("0") is None, "nothing disturbed may reach the fit"
+
+    def test_the_discarded_traverse_is_still_recorded(self):
+        """Kept and flagged. A run of discards is how a fault shows itself; an empty
+        record would look like a spa that simply was not used."""
+        c = self._c()
+        self._feed(c, [(0, 28.0), (30, 28.5), (60, 29.0), (90, 29.5), (120, 30.0)],
+                   bubble_at=(2,))
+        obs = [o for o in c._band_observations if o["band"] == 0]
+        assert obs and obs[0]["usable"] is False and obs[0]["disturbed"] is True
+
+    def test_no_expectation_means_no_rejection_on_expectation(self):
+        """The circular danger: a model that is wrongly high would reject the very
+        evidence that would correct it. The rate test waits until the band has enough
+        observations to have a real expectation."""
+        c = self._c()
+        assert c._window_looks_unmeasurable(0, 25.0, 0.05) is None, (
+            "with no evidence yet, a slow span is not evidence of a fault")
+
+    def test_a_span_far_below_expectation_is_rejected_once_there_is_one(self):
+        c = self._c()
+        for amb in (5.0, 10.0, 15.0):
+            for _ in range(5):
+                c._accumulate_band_stats(0, 1.20, amb, 25.0 - amb)
+        why = c._window_looks_unmeasurable(0, 25.0, 0.10)
+        assert why and "cover" in why
+        assert c._window_looks_unmeasurable(0, 25.0, 1.10) is None, (
+            "an ordinary span must still pass")
