@@ -539,6 +539,26 @@ class ShadowPlan:
                     local = (temp - entry_temp) / hours
                     if local > 0:
                         mins = (self.target - temp) / local * 60.0
+                        # Carry the same evidence into the curve, so the session does not
+                        # end with its rates still describing the band it just disproved.
+                        #
+                        # This changes no estimate. Over a span inside one band the two
+                        # routes are the same number by construction: the factor is
+                        # (span/rate)/actual, so rate x factor is span/actual, which is
+                        # the local rate this branch already uses. The ETA is left on the
+                        # local rate anyway, so the identity does not have to hold — it
+                        # also breaks for a session that began part-way up and whose entry
+                        # span crosses an edge, and there the measured average is the
+                        # honest answer for the half degree while the scaled curve is the
+                        # honest record.
+                        #
+                        # Which matters because the last band is the least trustworthy
+                        # part of the curve and the one nothing else corrects. It runs
+                        # from 37 upward with no edge above it, while the stored bucket
+                        # only learns to 39, so everything above that is extrapolation —
+                        # and a target of 40 measures 37→39.5 here, including the slower
+                        # tail past 39 that no bucket has ever been taught.
+                        self._rescale(entry_temp, entry_when, temp, when)
             if mins is None:
                 mins = self.minutes(temp, self.target)
             if mins is not None:

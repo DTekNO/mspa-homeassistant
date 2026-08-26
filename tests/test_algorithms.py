@@ -652,6 +652,40 @@ class TestShadowPlan:
         self._feed(p, [(205, 38.0)])                # 12 °C/h, physically impossible
         assert p.rates == settled
 
+    def test_the_final_look_also_records_what_it_measured(self):
+        """The last band is the one nothing else corrects, and it used to be the one the
+        curve never learned.
+
+        The final look measures the rate immediately below the target and uses it for the
+        remaining half degree, but it left `rates` describing the band it had just
+        disproved — so a session ended with its curve wrong about the only stretch that
+        carries most of the ambient sensitivity. It now writes the same evidence back.
+        The estimate is unchanged: over a span inside one band, scaling by
+        planned/actual and using the measured rate are the same number.
+        """
+        p = self._plan(start=30.0, opening_min=560)
+        self._feed(p, [(520, 37.0)])
+        before = list(p.rates)
+        eta_before_final = p.eta
+        self._feed(p, [(640, 39.0)])                 # 2.0 °C in 120 min = 1.0 °C/h
+        assert p.eta != eta_before_final, "the final look must still revise"
+        assert p.rates != before, "and must no longer leave the curve untouched"
+        assert p.rates[-1] == pytest.approx(1.0, rel=1e-6), (
+            "the top band should end at the rate the session actually achieved")
+
+    def test_a_target_above_the_learned_range_measures_its_own_tail(self):
+        """The top shadow band runs from 37 upward with no edge above it, while the
+        stored bucket only learns to 39 — so a 40 °C target has half a degree of pure
+        extrapolation in it. The final look lands at 39.5 and measures 37→39.5, which
+        includes that slower tail, and the recorded rate should come out below one taken
+        to 39.0 alone."""
+        fast = self._plan(start=30.0, target=39.5, opening_min=560)
+        self._feed(fast, [(520, 37.0), (640, 39.0)])          # 1.00 °C/h over 37→39
+        slow = self._plan(start=30.0, target=40.0, opening_min=560)
+        self._feed(slow, [(520, 37.0), (700, 39.5)])          # 0.83 °C/h over 37→39.5
+        assert slow.rates[-1] < fast.rates[-1], (
+            "a span carrying the tail past 39 must record a lower rate")
+
     def test_the_curve_cannot_drift_without_limit(self):
         """A cumulative clamp, not a per-step one, so a factor bringing the curve back
         toward its seed is never blocked. Inert on all five recorded sessions — the
