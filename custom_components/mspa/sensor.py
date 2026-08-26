@@ -181,10 +181,6 @@ class MSpaDiagnosticSensor(MSpaSensorEntity):
     def state(self):
         return self.coordinator._last_data.get(self._key)
 
-    @property
-    def entity_picture(self):
-        return None
-
 
 class MSpaFirmwareVersionSensor(MSpaDiagnosticSensor):
     """Combined firmware version, matching the MSpa app format (e.g. '141-3A1')."""
@@ -1427,13 +1423,6 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
         self._attr_name = "Ambient learning"
         self._attr_unique_id = (
             f"mspa_ambient_learning_{getattr(coordinator, 'device_id', 'unknown')}")
-
-    @property
-    def entity_picture(self):
-        """No picture. MSpaSensorEntity supplies the spa's own photo, and Home Assistant
-        shows a picture in preference to an icon — so without this the thermometer icon
-        never appears and a diagnostic entity is illustrated with a hot tub."""
-        return None
 
     @property
     def native_value(self):

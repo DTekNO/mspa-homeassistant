@@ -35,6 +35,22 @@ class MSpaClimate(MSpaClimateEntity):
         )
 
     @property
+    def entity_picture(self):
+        """The spa's photograph, so a picture card has something to point at.
+
+        It has to be `entity_picture` and not an attribute of our own naming — that is
+        the key the picture cards read. Home Assistant shows it in preference to the
+        icon, so this entity loses its mdi:hot-tub in the device panel; that is the
+        trade, and it is why the property lives here and not on MSpaBaseEntity, where
+        every sensor, switch and number would inherit it and the panel would be a column
+        of identical photographs with nothing to tell the rows apart.
+
+        The climate entity carries it because it is the spa itself — the one a card
+        would naturally be pointed at.
+        """
+        return getattr(self.coordinator, "product_pic_url", None)
+
+    @property
     def current_temperature(self):
         return self.coordinator.last_data.get("water_temperature")
 

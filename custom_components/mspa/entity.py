@@ -41,9 +41,15 @@ class MSpaBaseEntity:
             "serial_number": getattr(self.coordinator, "serial_number", None) or None,
         }
 
-    @property
-    def entity_picture(self):
-        return getattr(self.coordinator, "product_pic_url", None)
+    # No entity_picture here. Every entity type inherits from this class — sensors,
+    # switches, climate, numbers, buttons — and Home Assistant shows a picture in
+    # preference to an icon, so supplying one here replaced the icon on every row of the
+    # device panel with the same photograph of the spa, leaving nothing to tell the rows
+    # apart.
+    #
+    # The climate entity declares its own, because `entity_picture` is the key the
+    # picture cards read and there has to be one entity they can be pointed at. One row
+    # of the panel trades its icon for the photo; the rest keep theirs.
 
     @property
     def available(self):
