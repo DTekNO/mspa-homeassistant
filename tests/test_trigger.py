@@ -33,6 +33,8 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     c.computed_heat_rate = 2.0
     c.ambient_temp = None
     c.ambient_baseline = None
+    c._band_stats = {}
+    c._band_observations = []
     c._last_computed_start_at = None
     c.ready_latched = False
     c.near_target = False

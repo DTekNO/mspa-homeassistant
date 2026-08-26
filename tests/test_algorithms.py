@@ -711,3 +711,92 @@ class TestShadowPlan:
         from custom_components.mspa.predictor import ShadowPlan
         p = ShadowPlan((1.10, 0.0, 0.79), 33.0, 39.5, self._T0)
         assert p.minutes(33.0, 39.5) is None
+
+
+class TestLearnedAmbientFactor:
+    """The learned response to weather, and where it stops being trusted.
+
+    The gate is extrapolation distance, not spread. A least-squares line passes through
+    the mean of its data, so a fit built from a narrow band of ambients predicts well
+    inside that band however badly determined its slope is — it degrades to "the rate
+    this spa achieves at this temperature", which beats a bucket and a guessed
+    sensitivity. The danger is only away from the evidence, where the slope's uncertainty
+    is multiplied by the distance.
+
+    Which is why it is used from the second traverse onward rather than waiting for a
+    seasonal spread: where ambient moves slowly, today is nearly always a good forecast
+    of tomorrow, and the fit is being asked about conditions it has seen.
+    """
+
+    def _fit(self, slope, intercept, n=100.0, mean=10.0, sd=3.0):
+        return {"slope": slope, "intercept": intercept, "n": n,
+                "ambient_mean": mean, "ambient_sd": sd}
+
+    def _f(self, ambient, fit, seed=1.0, baseline=10.0):
+        from custom_components.mspa.predictor import learned_ambient_factor
+        return learned_ambient_factor(ambient, baseline, fit, seed)
+
+    def test_no_fit_leaves_the_seed_alone(self):
+        assert self._f(5.0, None, seed=0.9) == 0.9
+
+    def test_inside_the_evidence_the_fit_is_used(self):
+        # rate = 1.0 + 0.02 x ambient; at 13 against a baseline of 10 the fit says
+        # 1.26/1.20 = 1.05, against a seed saying 1.00. The result should sit close to
+        # the fit rather than equal it — the shrink term always keeps a little of the
+        # seed, which is the safety net working, not a wrong answer.
+        fit = self._fit(0.02, 1.0, n=1000.0)
+        got = self._f(13.0, fit, seed=1.0)
+        assert 1.0 < got <= 1.05
+        assert abs(got - 1.05) < abs(got - 1.0), "the fit should dominate, not the seed"
+
+    def test_far_outside_the_evidence_it_hands_back_to_the_seed(self):
+        """Three standard deviations out, the fit contributes nothing. A slope fitted
+        across a summer must not be extrapolated to a January night."""
+        fit = self._fit(0.02, 1.0, mean=10.0, sd=1.0)
+        assert self._f(-15.0, fit, seed=0.7) == pytest.approx(0.7)
+
+    def test_it_fades_across_the_gap_rather_than_switching(self):
+        fit = self._fit(0.02, 1.0, mean=10.0, sd=1.0)
+        near = self._f(11.0, fit, seed=0.7)
+        mid = self._f(12.0, fit, seed=0.7)
+        far = self._f(14.0, fit, seed=0.7)
+        assert near != pytest.approx(0.7), "close in, the fit should dominate"
+        assert far == pytest.approx(0.7), "far out, the seed should"
+        assert min(near, far) <= mid <= max(near, far), "and it should move between them"
+
+    def test_a_wild_slope_cannot_hurt_at_the_centre_of_its_own_data(self):
+        """The reason spread is not the gate.
+
+        A least-squares line passes through the mean of its data, so at that mean it
+        predicts the mean rate whatever the slope happens to be. Two fits with wildly
+        different slopes but the same mean rate must therefore give the same answer
+        there — which is why a narrow band of readings is safe to use where it was
+        measured, and only becomes dangerous further away.
+        """
+        gentle = self._fit(0.01, 1.37, mean=13.0, sd=0.5)   # mean rate 1.5 at 13 °C
+        absurd = self._fit(0.50, -5.0, mean=13.0, sd=0.5)   # also 1.5 at 13 °C
+        at_centre = [self._f(13.0, f, seed=0.8, baseline=13.0) for f in (gentle, absurd)]
+        assert at_centre[0] == pytest.approx(at_centre[1], rel=1e-9)
+        # And a degree away, where the slopes genuinely differ, they no longer agree.
+        assert self._f(14.0, gentle, seed=0.8, baseline=13.0) != pytest.approx(
+            self._f(14.0, absurd, seed=0.8, baseline=13.0), rel=1e-3)
+
+    def test_thin_evidence_leans_on_the_seed(self):
+        """With three observations even the intercept is noisy, whatever the spread."""
+        thin = self._fit(0.02, 1.0, n=3.0)
+        thick = self._fit(0.02, 1.0, n=300.0)
+        seed = 0.8
+        assert abs(self._f(11.0, thin, seed=seed) - seed) < \
+               abs(self._f(11.0, thick, seed=seed) - seed)
+
+    def test_an_impossible_fitted_rate_is_declined(self):
+        """A line that predicts a negative rate cannot form a ratio and must not try."""
+        assert self._f(5.0, self._fit(0.5, -20.0), seed=0.9) == 0.9
+
+    def test_the_result_is_clamped(self):
+        from custom_components.mspa.predictor import (
+            AMBIENT_FACTOR_MAX, AMBIENT_FACTOR_MIN)
+        wild = self._fit(0.5, 0.1, mean=10.0, sd=10.0)
+        for amb in (-20.0, 0.0, 40.0):
+            f = self._f(amb, wild, seed=1.0)
+            assert AMBIENT_FACTOR_MIN <= f <= AMBIENT_FACTOR_MAX

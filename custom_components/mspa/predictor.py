@@ -115,6 +115,67 @@ def ambient_rate_factor(bucket_idx, ambient_now, ambient_baseline) -> float:
     return max(AMBIENT_FACTOR_MIN, min(AMBIENT_FACTOR_MAX, factor))
 
 
+# How a learned fit is trusted, and where it stops being trusted.
+#
+# The gate is *extrapolation distance*, not spread. A least-squares line passes through
+# the mean of its data, so a fit built from a narrow band of ambients predicts perfectly
+# well inside that band however badly determined its slope is — it degrades to "the rate
+# this spa achieves at this temperature", which beats the bucket and a guessed sensitivity.
+# The error only becomes dangerous away from the data: from 12-14 °C observations the
+# slope's standard error is about as large as the slope, and multiplied by the twenty
+# degrees to a January night that is an error comparable to the rate itself.
+#
+# So the fit is used from the second traverse onward, which is what makes it useful in a
+# climate where ambient moves slowly and today is nearly always a good forecast of
+# tomorrow — and it hands back to the seed as the question moves away from the evidence.
+LEARNED_SHRINK_N = 20.0      # observations at which the fit carries half its weight
+LEARNED_TRUST_SD = 1.0       # within one standard deviation of the data, trusted whole
+LEARNED_FADE_SD = 3.0        # beyond three, not used at all
+
+
+def learned_ambient_factor(ambient_now, ambient_baseline, fit, seed_factor):
+    """Blend the seed sensitivity with what this spa has actually shown.
+
+    `fit` is a band_rate_fit result: slope and intercept of rate against ambient over
+    every traverse recorded, with the effective sample size and the weighted spread of
+    the ambients it was fitted across.
+
+    Returns the seed unchanged whenever the fit cannot improve on it: too few
+    observations, a degenerate line, a prediction far outside the evidence, or a fitted
+    rate at the baseline that is not positive and so cannot form a ratio.
+    """
+    if fit is None or ambient_now is None or ambient_baseline is None:
+        return seed_factor
+    a, b, n, sd = fit["intercept"], fit["slope"], fit["n"], fit.get("ambient_sd") or 0.0
+    at_baseline = a + b * ambient_baseline
+    at_now = a + b * ambient_now
+    if at_baseline <= 0 or at_now <= 0:
+        return seed_factor
+    # Two independent reasons to hold back, multiplied: how much evidence there is, and
+    # how far the question sits from it.
+    w_n = n / (n + LEARNED_SHRINK_N)
+    mean_amb = ambient_now if sd <= 0 else None
+    if sd > 0:
+        # Distance from the centre of the evidence, in standard deviations. The centre is
+        # recovered from the fit rather than stored: at x̄ the line predicts ȳ.
+        z = abs(ambient_now - fit.get("ambient_mean", ambient_now)) / sd
+    else:
+        # No spread at all: trusted only at the temperature it was measured at.
+        z = 0.0 if abs(ambient_now - fit.get("ambient_mean", ambient_now)) < 1e-9 else 99.0
+    if z <= LEARNED_TRUST_SD:
+        w_z = 1.0
+    elif z >= LEARNED_FADE_SD:
+        w_z = 0.0
+    else:
+        w_z = (LEARNED_FADE_SD - z) / (LEARNED_FADE_SD - LEARNED_TRUST_SD)
+    w = w_n * w_z
+    if w <= 0:
+        return seed_factor
+    learned = at_now / at_baseline
+    blended = w * learned + (1.0 - w) * seed_factor
+    return max(AMBIENT_FACTOR_MIN, min(AMBIENT_FACTOR_MAX, blended))
+
+
 class HeatPredictor:
     """Predicts heating time from learned rates and today's conditions."""
 
@@ -127,6 +188,7 @@ class HeatPredictor:
         fresh_buckets=frozenset(),
         ambient_temp=None,
         ambient_baseline=None,
+        band_fits=None,
         flat_rate=None,
         device_rate=None,
     ):
@@ -136,6 +198,9 @@ class HeatPredictor:
         self.fresh_buckets = fresh_buckets or frozenset()
         self.ambient_temp = ambient_temp
         self.ambient_baseline = ambient_baseline
+        # Per-band least-squares fits of rate against ambient, or None to use the seed
+        # sensitivities alone. Learning continues whether or not these are supplied.
+        self.band_fits = band_fits or {}
         self.flat_rate = flat_rate
         self.device_rate = device_rate
 
@@ -158,6 +223,10 @@ class HeatPredictor:
             fresh_buckets=getattr(coordinator, "_session_fresh_buckets", frozenset()),
             ambient_temp=getattr(coordinator, "ambient_temp", None),
             ambient_baseline=getattr(coordinator, "ambient_baseline", None),
+            # What this spa has shown about its own response to the weather. Absent on a
+            # coordinator that has not learned any yet, which leaves the seeds standing.
+            band_fits=(coordinator.band_fits()
+                       if hasattr(coordinator, "band_fits") else None),
             flat_rate=flat if (flat is not None and flat > 0) else None,
             device_rate=device_rate,
         )
@@ -196,7 +265,16 @@ class HeatPredictor:
             return rate
         if self.session_scalar != 1.0:
             return rate * self.session_scalar
-        return rate * ambient_rate_factor(idx, self.ambient_temp, self.ambient_baseline)
+        # The seed sensitivity, then whatever this spa has actually shown about its own
+        # response to the weather, blended by how much evidence there is and how far the
+        # question sits from it. With no fit for this band the seed stands unchanged.
+        seed = ambient_rate_factor(idx, self.ambient_temp, self.ambient_baseline)
+        factor = learned_ambient_factor(
+            self.ambient_temp, self.ambient_baseline,
+            self.band_fits.get(idx) or self.band_fits.get(str(idx)),
+            seed,
+        )
+        return rate * factor
 
     # ── time ─────────────────────────────────────────────────────────────────
 

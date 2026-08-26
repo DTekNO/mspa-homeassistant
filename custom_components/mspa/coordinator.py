@@ -1465,6 +1465,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         st["min_amb"] = ambient if st["min_amb"] is None else min(st["min_amb"], ambient)
         st["max_amb"] = ambient if st["max_amb"] is None else max(st["max_amb"], ambient)
 
+    def band_fits(self) -> dict:
+        """Every band's fit, keyed by band index, for handing to a HeatPredictor."""
+        return {i: self.band_rate_fit(i) for i in (0, 1, 2)
+                if self.band_rate_fit(i) is not None}
+
     def band_rate_fit(self, band, against="amb"):
         """Least-squares slope and intercept of rate against ambient, over all history.
 
@@ -1496,6 +1501,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         var = max(0.0, st["sum_amb2"] / n - mean_amb * mean_amb)
         return {
             "slope": slope, "intercept": intercept, "n": n,
+            # The centre of the evidence. A fit is trusted near it and handed back to the
+            # seed away from it, so a caller needs to know where "near" is.
+            "ambient_mean": mean_amb,
             "ambient_sd": var ** 0.5,
             # Kept for reading a log by eye. Deliberately not the gate: these do not fade.
             "ambient_seen": (st["min_amb"], st["max_amb"]),
