@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2026.8.2]
 
-Everything here is new since **2026.8.1**, the last full release. This release is focussed on 
-improving the learning and prediction algorithms for planning a heat-up from cold and 
-for display of the best estimate for when the required temperature will be reached, taking account 
+Everything here is new since **2026.8.1**, the last full release. This release is focussed on
+improving the learning and prediction algorithms for planning a heat-up from cold and
+for display of the best estimate for when the required temperature will be reached, taking account
 of current outside conditions.
 
 **How the prediction works, in short.** The integration learns how fast your spa heats,
@@ -33,10 +33,10 @@ come. The learned rates themselves are unchanged by this — they go on improvin
 across sessions — but the estimate you are shown now follows the conditions of the day
 rather than the assumption it opened with.
 
-**The *Ready at* estimate now corrects itself while the water heats.** Before, the ready time was
-worked out once at the start and the estimate stayed hours
-wrong until the very end. It now measures how long each stage actually took against how
-long it was supposed to, and rescales the rest of the plan by the difference.
+**The *Ready at* estimate now corrects itself while the water heats.** Before, it leaned on
+rates learned in earlier sessions for the whole of a run, and could stay hours wrong
+almost to the end. It now measures how long each stage actually took against how long it
+was supposed to, and rescales the rest of the plan by the difference.
 
 **When heating starts, this mspa integration now brings the circulation pump up first.** The spa
 will not turn on the heater without flow, so this ensures that the pump is always running
@@ -51,20 +51,15 @@ before commanding the heater to start. This is in addition to the guard imposed 
 
 - **When heating is initiated, the circulation pump is started first.** The integration
   waits, or retries, for confirmation that the pump is running before starting the heater. This is
-  just an extra layer of security in case the mspa rejects heating with an error. 
+  just an extra safeguard in case the mspa rejects heating with an error.
 
 - **The *Ready at* time is revised during heating at 30 °C, at 37 °C, and once with half a degree to go.**
   Each revision measures the stage just completed and scales what remains by how wrong it
   turned out to be.
-  
+
 - **The correction follows current conditions rather than an average of the session.** A
   long heat-up can start on a cold morning and finish on a warm afternoon, so the stage
   just finished describes what is coming better than the whole run does.
-
-- **The last stage of heating to set-point now learns from itself.** Learning the
-  last heat-up stage runs from 37 °C upward with nothing above
-  it to correct it, and it is the part of the curve most sensitive to the weather. It used
-  to be measured and then forgotten.
 
 - **A heat-up you started manually shows its own ready time, even with a schedule pending.**
   Raising the setpoint while a schedule was set left the display showing the scheduled
@@ -75,13 +70,14 @@ before commanding the heater to start. This is in addition to the guard imposed 
 - **Heating rates are measured over a wider span.** A single 0.5 °C step was too short to
   time accurately, and taught the model rates below what
   the spa actually achieved. The hot rate is now learned over 37–39 °C rather than
-  everything above 37, where a 40 °C setpoint spends its slowest hour; the cold rate is
-  bounded at 20 °C for the same reason.
+  everything above 37, where a 40 °C setpoint spends its slowest hour and drags the rate
+  down for the rest of the stretch. The cold rate is bounded at 20 °C for a different
+  reason: no recorded heat-up has started below 22 °C, so there is nothing to learn from
+  down there and a guess would be worse than an extrapolation.
 
 - **The estimate reads in five-minute steps and no longer wobbles.** Minute precision on
-  something hours away was never real. *Ready at* predictions would previously oscillate
-  frequently between estimates longer or shorter than necessary. *Ready-at* now holds steady
-  until heating rates are known.
+  something hours away was never real. *Ready at* used to oscillate as it re-planned from
+  every reading; it now holds steady between the three revisions and moves once at each.
 
 ### Fixed
 
@@ -112,9 +108,9 @@ before commanding the heater to start. This is in addition to the guard imposed 
 ### Verified
 
 - A 16.5-hour heat-up from 22.0 to 39.5 °C predicted to within **2 minutes**.
-- The 2026-08-25 session — eleven hours from 24.5 °C on a 10.8 °C morning — finished
-  within **2 minutes** of its final estimate, having converged from an opening four hours
-  out.
+- The 2026-08-25 session — nearly twelve hours from 24.5 °C on a 10.8 °C morning —
+  finished within **2 minutes** of its final estimate, having converged from an opening
+  three and a half hours out.
 
 ## [2026.8.1]
 
