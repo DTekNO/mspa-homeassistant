@@ -1402,6 +1402,83 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 
 
 # This sensor is used to indicate faults or warnings in the MSpa system.
+class MSpaAmbientLearningSensor(MSpaSensorEntity):
+    """What the spa has learned about its own response to the weather.
+
+    Disabled by default and diagnostic: this exists to be watched over weeks while the
+    correction proves itself, not to sit on a dashboard. Its state is the factor
+    currently applied to the near-target rate — the band that carries almost all of the
+    weather sensitivity, and so the one worth charting — with the per-band fits as
+    attributes.
+
+    The finished-session comparison is recorded in prediction_history whether or not
+    this is enabled, so nothing depends on having thought to turn it on beforehand.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer-lines"
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_device_info = self.device_info
+        self.coordinator = coordinator
+        self._attr_name = "Ambient learning"
+        self._attr_unique_id = (
+            f"mspa_ambient_learning_{getattr(coordinator, 'device_id', 'unknown')}")
+
+    @property
+    def native_value(self):
+        """The factor now applied to the near-target band, or None without a weather
+        source to apply it from."""
+        from .predictor import ambient_rate_factor, learned_ambient_factor
+        c = self.coordinator
+        if c.ambient_temp is None or c.ambient_baseline is None:
+            return None
+        seed = ambient_rate_factor(2, c.ambient_temp, c.ambient_baseline)
+        fits = c.band_fits()                     # empty when the user has it switched off
+        return round(learned_ambient_factor(
+            c.ambient_temp, c.ambient_baseline, fits.get(2), seed), 4)
+
+    @property
+    def extra_state_attributes(self):
+        from .predictor import ambient_rate_factor
+        c = self.coordinator
+        out = {
+            "correction_applied": c.ambient_correction_enabled,
+            "ambient_temp_deg_c": c.ambient_temp,
+            "ambient_baseline_deg_c": c.ambient_baseline,
+            "observations_recorded": len(getattr(c, "_band_observations", [])),
+        }
+        if c.ambient_temp is not None and c.ambient_baseline is not None:
+            out["seed_factor_hot"] = round(
+                ambient_rate_factor(2, c.ambient_temp, c.ambient_baseline), 4)
+        for band, label in ((0, "cold"), (1, "mid"), (2, "hot")):
+            fit = c.band_rate_fit(band)
+            if not fit:
+                continue
+            out[f"fit_{label}"] = {
+                "n": round(fit["n"], 1),
+                "slope_per_deg": round(fit["slope"], 5),
+                "rate_at_baseline": round(
+                    fit["intercept"] + fit["slope"] * (c.ambient_baseline or 0.0), 3),
+                "ambient_mean": round(fit["ambient_mean"], 1),
+                "ambient_sd": round(fit["ambient_sd"], 2),
+                "ambient_seen": fit.get("ambient_seen"),
+            }
+        errs = [(r.get("error_minutes_seed_only"), r.get("error_minutes_learned"))
+                for r in getattr(c, "_prediction_history", [])]
+        errs = [(a, b) for a, b in errs if a is not None and b is not None]
+        if errs:
+            out["sessions_compared"] = len(errs)
+            out["mean_abs_error_seed_only_min"] = round(
+                sum(abs(a) for a, _ in errs) / len(errs), 1)
+            out["mean_abs_error_learned_min"] = round(
+                sum(abs(b) for _, b in errs) / len(errs), 1)
+        return out
+
+
 class MSpaFaultSensor(MSpaDiagnosticSensor):
     name = "Fault"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
