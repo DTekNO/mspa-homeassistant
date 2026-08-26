@@ -28,6 +28,8 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_AMBIENT_CORRECTION,
+    DEFAULT_AMBIENT_CORRECTION,
     DOMAIN,
     DEFAULT_SCAN_INTERVAL,
     IDLE_SCAN_INTERVAL,
@@ -222,6 +224,19 @@ def _read_weather_entity(hass: HomeAssistant, entity_id: str | None) -> tuple[fl
             wind = None
 
     return temp, wind
+
+
+
+def _round_or_none(value, digits: int = 1):
+    """Round where there is something to round. Estimates are legitimately absent."""
+    return None if value is None else round(float(value), digits)
+
+
+def _error_against(estimate, actual_minutes):
+    """Minutes the estimate was out by: positive is late, negative early."""
+    if estimate is None or actual_minutes is None:
+        return None
+    return round(float(actual_minutes) - float(estimate), 1)
 
 
 class MSpaUpdateCoordinator(DataUpdateCoordinator):
@@ -605,6 +620,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         "target_temp": new_target,
                         "estimated_minutes": round(raw_minutes, 1),
                         "estimated_minutes_biased": round(est_minutes, 1),
+                        # The same session priced both ways, so the learned weather
+                        # response can be scored against the seed on real finishes.
+                        "estimated_minutes_seed_only": _round_or_none(
+                            self._heating_minutes_variant(
+                                new_temp, new_target, use_fits=False)),
+                        "estimated_minutes_learned": _round_or_none(
+                            self._heating_minutes_variant(
+                                new_temp, new_target, use_fits=True)),
+                        "ambient_correction_applied": self.ambient_correction_enabled,
                         "prediction_bias": round(self.prediction_bias, 3),
                         "session_scalar": self._session_scalar,
                         "ambient_temp": self.ambient_temp,
@@ -711,6 +735,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     "error_minutes": round(error_minutes, 1),
                     "error_percent": round(error_pct, 1),
                     "error_minutes_biased": round(error_minutes_biased, 1),
+                    "error_minutes_seed_only": _error_against(
+                        self._prediction.get("estimated_minutes_seed_only"),
+                        actual_minutes),
+                    "error_minutes_learned": _error_against(
+                        self._prediction.get("estimated_minutes_learned"),
+                        actual_minutes),
                     "end_time": datetime.now(timezone.utc).isoformat(),
                 }
                 self._prediction_history.append(result)
@@ -1465,8 +1495,25 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         st["min_amb"] = ambient if st["min_amb"] is None else min(st["min_amb"], ambient)
         st["max_amb"] = ambient if st["max_amb"] is None else max(st["max_amb"], ambient)
 
-    def band_fits(self) -> dict:
-        """Every band's fit, keyed by band index, for handing to a HeatPredictor."""
+    @property
+    def ambient_correction_enabled(self) -> bool:
+        """Whether learned weather response is applied. Learning happens regardless."""
+        entry = getattr(self, "config_entry", None)
+        if entry is None:
+            return DEFAULT_AMBIENT_CORRECTION
+        return bool(entry.options.get(
+            CONF_AMBIENT_CORRECTION, DEFAULT_AMBIENT_CORRECTION))
+
+    def band_fits(self, *, force: bool = False) -> dict:
+        """Every band's fit, keyed by band index, for handing to a HeatPredictor.
+
+        Empty when the user has turned the correction off — the fits go on being
+        learned either way, so switching it back on finds the evidence waiting.
+        `force` returns them regardless, for the side-by-side comparison that is
+        recorded whether or not the correction is in use.
+        """
+        if not force and not self.ambient_correction_enabled:
+            return {}
         return {i: self.band_rate_fit(i) for i in (0, 1, 2)
                 if self.band_rate_fit(i) is not None}
 
@@ -2016,6 +2063,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         not exist.  They had drifted; see predictor.py.
         """
         return self._predictor().heating_minutes(from_temp, to_temp)
+
+    def _heating_minutes_variant(self, from_temp, to_temp, *, use_fits: bool):
+        """The same estimate, with the learned weather response forced on or off.
+
+        Both are recorded for every session so the correction can be judged on finished
+        sessions rather than on argument — and judged retroactively, without anyone
+        having had to enable a diagnostic beforehand. The user's own setting decides
+        which one is *shown*; this decides nothing.
+        """
+        p = HeatPredictor.from_coordinator(self)
+        p.band_fits = self.band_fits(force=True) if use_fits else {}
+        return p.heating_minutes(from_temp, to_temp)
 
     # Map of features to their respective API methods
     FEATURE_API_MAP = {

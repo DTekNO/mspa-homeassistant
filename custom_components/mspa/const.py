@@ -87,6 +87,14 @@ DEFAULT_HEATER_POWER_HEAT = 2000  # Heating element in active heating (estimated
 # Reads temperature and wind_speed from a weather entity (e.g. Met.no, OpenWeatherMap).
 CONF_WEATHER_ENTITY = "weather_entity"
 
+# Whether the *learned* response to outdoor temperature is applied to estimates.
+#
+# Off does not stop the spa's response being learned — that continues regardless, so a
+# user who turns it off and later on again finds the evidence waiting rather than having
+# to start over. It only decides whether the estimates use it.
+CONF_AMBIENT_CORRECTION = "ambient_correction"
+DEFAULT_AMBIENT_CORRECTION = True
+
 # Optional heat-schedule: calendar-driven automatic preheat scheduling.
 CONF_SCHEDULE_TARGET_TEMP = "schedule_target_temp"
 CONF_SCHEDULE_LOOKAHEAD_DAYS = "schedule_lookahead_days"

@@ -1799,3 +1799,55 @@ class TestManualHeatUnderAPendingSchedule:
         c = self._session(
             self._pending(water_temp=39.4, target_temp=39.5, heater="on"))
         assert _ready_at(c) == "Ready"
+
+
+class TestAmbientCorrectionOptOut:
+    """Turning the correction off stops it being *used*, never stops it being learned.
+
+    Someone who switches it off and later back on should find the evidence waiting, not
+    have to start over — and the side-by-side comparison is recorded either way, so the
+    question "would it have helped?" can be answered afterwards rather than only by
+    people who thought to enable something in advance.
+    """
+
+    def _coord(self, enabled):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_stats = {}
+        c._band_observations = []
+        c.ambient_temp = 5.0
+        c.ambient_baseline = 15.0
+
+        class _Entry:
+            options = {"ambient_correction": enabled}
+        c.config_entry = _Entry()
+        # A fit the hot band has genuinely earned.
+        for amb in (0.0, 5.0, 10.0, 15.0, 20.0):
+            for _ in range(10):
+                c._accumulate_band_stats(2, 0.8 + 0.01 * amb, amb, 38.0 - amb)
+        return c
+
+    def test_off_means_the_estimate_does_not_use_it(self):
+        assert self._coord(False).band_fits() == {}
+
+    def test_but_the_fit_is_still_there(self):
+        c = self._coord(False)
+        assert c.band_rate_fit(2) is not None, "learning must not stop"
+        assert c.band_fits(force=True), "and must be reachable for the comparison"
+
+    def test_on_means_it_is_used(self):
+        assert 2 in self._coord(True).band_fits()
+
+    def test_switching_back_on_finds_the_evidence_waiting(self):
+        off = self._coord(False)
+        stats = off._band_stats
+        on = self._coord(True)
+        on._band_stats = stats
+        assert on.band_fits()[2]["n"] == pytest.approx(off.band_rate_fit(2)["n"])
+
+    def test_the_default_is_on(self):
+        from custom_components.mspa.const import DEFAULT_AMBIENT_CORRECTION
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.config_entry = None
+        assert c.ambient_correction_enabled is DEFAULT_AMBIENT_CORRECTION is True

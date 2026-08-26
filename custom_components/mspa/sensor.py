@@ -99,6 +99,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     async_add_entities(entities)
     async_add_entities([MSpaFaultSensor(coordinator)], update_before_add=True)
+    async_add_entities([MSpaAmbientLearningSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaFilterSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaHeaterTimerBinarySensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaHeaterTimerTimeSensor(coordinator)], update_before_add=True)
