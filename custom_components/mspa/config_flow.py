@@ -295,7 +295,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_AMBIENT_CORRECTION,
                 default=self.config_entry.options.get(
                     CONF_AMBIENT_CORRECTION, DEFAULT_AMBIENT_CORRECTION),
-                description="Adjust heating estimates for the outdoor temperature",
             ): bool,
             vol.Optional(
                 CONF_SCHEDULE_TARGET_TEMP,

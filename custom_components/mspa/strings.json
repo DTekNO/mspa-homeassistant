@@ -43,14 +43,16 @@
           "bubble_power": "Bubble Generator Power (Watts)",
           "heater_power_preheat": "Heater Preheat Power (Watts)",
           "heater_power_heat": "Heater Active Heating Power (Watts)",
-          "weather_entity": "Weather Entity (optional)"
+          "weather_entity": "Weather Entity (optional)",
+          "ambient_correction": "Adjust estimates for the outdoor temperature"
         },
         "data_description": {
           "pump_power": "Power consumption when the filter pump is running (typically 60W)",
           "bubble_power": "Power consumption when bubbles are active (typically 900W)",
           "heater_power_preheat": "Power consumption during preheat mode (typically 1500W)",
           "heater_power_heat": "Power consumption during active heating (typically 2000W)",
-          "weather_entity": "Select a weather entity (e.g. Met.no, OpenWeatherMap) to bias heating estimates by ambient temperature and wind speed. Historical sessions are weighted by how closely their conditions match the current weather."
+          "weather_entity": "Select a weather entity (e.g. Met.no, OpenWeatherMap) to bias heating estimates by ambient temperature and wind speed. Historical sessions are weighted by how closely their conditions match the current weather.",
+          "ambient_correction": "Uses the weather entity above, and what this spa has shown about its own response to the weather, to correct the heating estimates. Turning this off does not stop it being learned — switching it back on later picks up where it left off."
         }
       }
     }
