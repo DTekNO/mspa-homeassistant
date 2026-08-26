@@ -564,13 +564,18 @@ class TestBandStatsPersistForever:
         c._band_observations = []                    # as trimming eventually does
         assert c.band_rate_fit(1)["slope"] == pytest.approx(0.02, abs=1e-9)
 
-    def test_the_range_seen_is_reported_with_the_fit(self):
-        """Range is what decides whether a slope means anything — a whole winter of
+    def test_the_spread_seen_is_reported_with_the_fit(self):
+        """Spread is what decides whether a slope means anything — a whole winter of
         readings between 12 and 14 °C is not evidence about a cold night."""
         c = _coord()
         for amb in (12.0, 12.5, 13.0, 13.5, 14.0):
             self._obs(c, 2, 0.9, amb)
-        assert c.band_rate_fit(2)["ambient_span"] == pytest.approx(2.0)
+        narrow = c.band_rate_fit(2)["ambient_sd"]
+        c2 = _coord()
+        for amb in (-5.0, 2.0, 9.0, 16.0, 23.0):
+            self._obs(c2, 2, 0.9, amb)
+        assert narrow < 1.0 < c2.band_rate_fit(2)["ambient_sd"], (
+            "a narrow band of readings must not look like a wide one")
 
     def test_one_temperature_gives_no_fit_rather_than_a_wrong_one(self):
         c = _coord()
@@ -595,3 +600,61 @@ class TestBandStatsPersistForever:
             self._obs(c, 1, 1.5 - 0.01 * (32.0 - amb), amb, water=32.0)
         fit = c.band_rate_fit(1, against="delta")
         assert fit["slope"] == pytest.approx(-0.01, abs=1e-9)
+
+
+class TestTheFitForgetsSlowlyAndOnlyOnUse:
+    """Fading is counted in observations, never in elapsed time.
+
+    Decaying by the calendar would erase a spa that sits unused over winter, and erase
+    exactly the cold observations that are scarcest. Plenty of owners do not use a spa
+    from October to April, and every spa has gaps. Per observation, a gap costs nothing:
+    the evidence waits and comes back weighted as it was left.
+    """
+
+    def _obs(self, c, band, rate, ambient, water=32.0):
+        c._accumulate_band_stats(band, rate, ambient, water - ambient)
+
+    def test_a_gap_of_any_length_costs_nothing(self):
+        """The whole point. Nothing here reads a clock, so an idle winter is free."""
+        c = _coord()
+        for amb in (-5.0, 0.0, 5.0, 10.0):
+            self._obs(c, 1, 1.5 + 0.02 * amb, amb)
+        before = c.band_rate_fit(1)
+        # However long you like: no observations, no change.
+        after = c.band_rate_fit(1)
+        assert after == before
+
+    def test_nothing_fades_until_there_is_something_to_lose(self):
+        c = _coord()
+        for i in range(c._BAND_FADE_AFTER):
+            self._obs(c, 1, 1.2, float(i % 20))
+        assert c._band_stats["1"]["n"] == pytest.approx(float(c._BAND_FADE_AFTER)), (
+            "early evidence must not be diluted while it is still scarce")
+
+    def test_it_fades_slowly_once_it_starts(self):
+        """A year of ordinary use is about 450 traverses; last winter should still carry
+        most of its weight."""
+        c = _coord()
+        for _ in range(450 + c._BAND_FADE_AFTER):
+            self._obs(c, 1, 1.2, 10.0)
+        remaining = c._BAND_FADE ** 450
+        assert 0.6 < remaining < 0.7, f"a year should leave ~two thirds, got {remaining:.2f}"
+
+    def test_the_effective_sample_never_collapses(self):
+        """Fading must not walk the evidence down to nothing on a heavily used spa."""
+        c = _coord()
+        for _ in range(5000):
+            self._obs(c, 1, 1.2, 10.0)
+        n = c._band_stats["1"]["n"]
+        assert n > 500, f"effective sample plateaus rather than decaying away, got {n:.0f}"
+
+    def test_old_evidence_loses_ground_to_new(self):
+        """What fading is actually for: a changed cover or fill level washing out."""
+        c = _coord()
+        for _ in range(c._BAND_FADE_AFTER):
+            self._obs(c, 1, 2.0, 10.0)          # the old spa
+        for _ in range(2000):
+            self._obs(c, 1, 1.0, 10.0)          # the same spa, now slower
+        mean = c._band_stats["1"]["sum_rate"] / c._band_stats["1"]["n"]
+        assert mean == pytest.approx(1.0, abs=0.02), (
+            f"the old rate should have washed out, mean is {mean:.3f}")

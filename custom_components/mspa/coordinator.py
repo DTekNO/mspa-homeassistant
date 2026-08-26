@@ -1411,6 +1411,24 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # has to be fitted across. Bounded because this file is written on every save.
     _BAND_OBSERVATIONS_MAX = 200
 
+    # How the running fit forgets, and why it is counted in observations rather than days.
+    #
+    # Decaying by elapsed time would erase a spa that sits unused over winter — and it
+    # would erase exactly the cold observations that are scarcest and hardest to replace.
+    # Plenty of owners do not use a spa from October to April, and any spa has gaps. Faded
+    # per observation, a gap costs nothing: the evidence waits, and comes back weighted as
+    # it was left.
+    #
+    # 0.999 per traverse is deliberately slower than it looks. Three traverses per heat-up
+    # and three heat-ups a week is about 450 a year, so last winter still carries roughly
+    # two thirds of its weight a year later, and half of it after about eighteen months.
+    # Fading exists so a new cover or a different fill level eventually washes out, not so
+    # the model chases the season.
+    _BAND_FADE = 0.999
+    # Nothing fades until there is something to lose. Below this the fit is short of
+    # evidence already and diluting it would only slow it down.
+    _BAND_FADE_AFTER = 30
+
     @staticmethod
     def _empty_band_stats() -> dict:
         return {"n": 0, "sum_amb": 0.0, "sum_amb2": 0.0,
@@ -1429,6 +1447,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if rate is None or ambient is None:
             return
         st = self._band_stats.setdefault(str(int(band)), self._empty_band_stats())
+        # Fade before adding, so the newest traverse always carries full weight.
+        if st["n"] >= self._BAND_FADE_AFTER:
+            f = self._BAND_FADE
+            for k in ("n", "sum_amb", "sum_amb2", "sum_delta", "sum_delta2",
+                      "sum_rate", "sum_amb_rate", "sum_delta_rate"):
+                st[k] *= f
         st["n"] += 1
         st["sum_amb"] += ambient
         st["sum_amb2"] += ambient * ambient
@@ -1460,9 +1484,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return None                      # every observation at the same temperature
         slope = (n * sxy - sx * sy) / denom
         intercept = (sy - slope * sx) / n
-        span = ((st["max_amb"] - st["min_amb"])
-                if st["min_amb"] is not None and st["max_amb"] is not None else 0.0)
-        return {"slope": slope, "intercept": intercept, "n": n, "ambient_span": span}
+        # Spread as a weighted standard deviation, not as min-to-max.
+        #
+        # min/max never fade, so a single cold night three winters ago would go on
+        # claiming a wide range long after its weight had gone. It is also a poor measure
+        # of evidence in its own right: two readings at the extremes and thirty in the
+        # middle is not the same body of evidence as thirty spread evenly, and min/max
+        # cannot tell them apart. The standard deviation decays with the sums it is
+        # computed from, so the reported spread always describes the fit actually in hand.
+        mean_amb = st["sum_amb"] / n
+        var = max(0.0, st["sum_amb2"] / n - mean_amb * mean_amb)
+        return {
+            "slope": slope, "intercept": intercept, "n": n,
+            "ambient_sd": var ** 0.5,
+            # Kept for reading a log by eye. Deliberately not the gate: these do not fade.
+            "ambient_seen": (st["min_amb"], st["max_amb"]),
+        }
 
     def _seed_window_ambient(self) -> None:
         """Start a fresh ambient window at the conditions the band is entered in.
