@@ -39,6 +39,7 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     c._window_amb_sum = c._window_wind_sum = 0.0
     c._window_amb_n = c._window_wind_n = 0
     c._band_observations = []
+    c._band_stats = {}
     for k, v in overrides.items():
         setattr(c, k, v)
     return c
@@ -529,3 +530,68 @@ class TestBandObservations:
         c._band_observations = [{"band": 0}] * (c._BAND_OBSERVATIONS_MAX + 50)
         self._heating(c, [28.0, 28.5, 29.5, 30.0, 30.5], [10.0] * 5)
         assert len(c._band_observations) == c._BAND_OBSERVATIONS_MAX
+
+
+class TestBandStatsPersistForever:
+    """The fit is kept as running sums, not as a list of observations.
+
+    A bounded list forgets. At three traverses per heat-up and a few heat-ups a week it
+    holds a few months, which is less than the seasonal range a weather sensitivity has
+    to be fitted across — so the very observations that make the fit possible would be
+    the first discarded. Five numbers per band recover the exact least-squares fit over
+    every traverse ever made, and never grow.
+    """
+
+    def _obs(self, c, band, rate, ambient, water=32.0):
+        c._accumulate_band_stats(band, rate, ambient, water - ambient)
+
+    def test_the_fit_recovers_a_known_line(self):
+        """Least squares over the sums must equal least squares over the data."""
+        c = _coord()
+        # rate = 1.5 + 0.02 x ambient, exactly
+        for amb in (-5.0, 0.0, 5.0, 10.0, 15.0, 20.0):
+            self._obs(c, 1, 1.5 + 0.02 * amb, amb)
+        fit = c.band_rate_fit(1)
+        assert fit["slope"] == pytest.approx(0.02, abs=1e-9)
+        assert fit["intercept"] == pytest.approx(1.5, abs=1e-9)
+        assert fit["n"] == 6
+
+    def test_it_survives_the_observation_list_being_trimmed(self):
+        """The point of the sums: the fit does not depend on the bounded list at all."""
+        c = _coord()
+        for amb in (-5.0, 0.0, 5.0, 10.0, 15.0, 20.0):
+            self._obs(c, 1, 1.5 + 0.02 * amb, amb)
+        c._band_observations = []                    # as trimming eventually does
+        assert c.band_rate_fit(1)["slope"] == pytest.approx(0.02, abs=1e-9)
+
+    def test_the_range_seen_is_reported_with_the_fit(self):
+        """Range is what decides whether a slope means anything — a whole winter of
+        readings between 12 and 14 °C is not evidence about a cold night."""
+        c = _coord()
+        for amb in (12.0, 12.5, 13.0, 13.5, 14.0):
+            self._obs(c, 2, 0.9, amb)
+        assert c.band_rate_fit(2)["ambient_span"] == pytest.approx(2.0)
+
+    def test_one_temperature_gives_no_fit_rather_than_a_wrong_one(self):
+        c = _coord()
+        for _ in range(20):
+            self._obs(c, 0, 1.2, 10.0)
+        assert c.band_rate_fit(0) is None, "a vertical fit must be declined, not invented"
+
+    def test_bands_are_kept_apart(self):
+        c = _coord()
+        for amb in (0.0, 10.0, 20.0):
+            self._obs(c, 0, 1.2, amb)                 # flat: cold band ignores weather
+            self._obs(c, 2, 1.2 + 0.06 * amb, amb)    # steep: hot band feels it
+        assert c.band_rate_fit(0)["slope"] == pytest.approx(0.0, abs=1e-9)
+        assert c.band_rate_fit(2)["slope"] == pytest.approx(0.06, abs=1e-9)
+
+    def test_the_physical_regressor_is_accumulated_too(self):
+        """Loss scales with the water/air gap, so a Newton's-law fit wants that rather
+        than ambient alone. Accumulating both avoids finding out in spring that the
+        wrong one was kept."""
+        c = _coord()
+        for amb in (0.0, 5.0, 10.0, 15.0):
+            self._obs(c, 1, 1.5 - 0.01 * (32.0 - amb), amb, water=32.0)
+        fit = c.band_rate_fit(1, against="delta")
+        assert fit["slope"] == pytest.approx(-0.01, abs=1e-9)

@@ -296,6 +296,21 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # observation. Kept to learn how much the weather moves each band's rate, which
         # is currently a hard-coded guess per band.
         self._band_observations: list[dict] = []
+        # Running least-squares sums, one set per band, kept for the life of the spa.
+        #
+        # The observations above are bounded and will start forgetting after a few
+        # months. These do not: five numbers per regressor recover the exact
+        # least-squares fit over every traverse ever recorded, at constant storage. The
+        # bounded list stays for offline analysis and for trying a different model later;
+        # the fit the integration uses comes from here.
+        #
+        # Both regressors are accumulated. `amb` fits the form the code already applies,
+        # rate = a + b x ambient, from which the existing sensitivity falls out. `delta`
+        # fits rate against the water/air gap, which is the physical quantity — loss
+        # scales with it — and is what a Newton's-law model would want. Keeping both
+        # costs ten numbers per band and avoids discovering in the spring that the wrong
+        # one was accumulated.
+        self._band_stats: dict = {}
         self._bucket_base_value: float | None = None
         self._rate_last_time: float | None = None     # monotonic seconds at last sample
         # True while the rate anchor is phase-uncertain: the temperature reports
@@ -789,6 +804,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     stored_buckets = stored.get("heat_rate_buckets")
                     self._prediction_history = stored.get("prediction_history", [])
                     self._band_observations = stored.get("band_observations", [])
+                    self._band_stats = stored.get("band_stats", {})
                     # Restore the bias as a stored value — never recompute it here.
                     # Recomputing on load made it depend on the weather at startup,
                     # so a restart alone could change every subsequent prediction.
@@ -916,6 +932,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "bucket_save_ts": time.time(),
                 "prediction_history": self._prediction_history,
                 "band_observations": self._band_observations,
+                "band_stats": self._band_stats,
                 "prediction_bias": self.prediction_bias,
                 "active_prediction": self._prediction,
                 # Persisted so a restart mid-scheduled-heating resumes as
@@ -1394,6 +1411,59 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # has to be fitted across. Bounded because this file is written on every save.
     _BAND_OBSERVATIONS_MAX = 200
 
+    @staticmethod
+    def _empty_band_stats() -> dict:
+        return {"n": 0, "sum_amb": 0.0, "sum_amb2": 0.0,
+                "sum_delta": 0.0, "sum_delta2": 0.0,
+                "sum_rate": 0.0, "sum_amb_rate": 0.0, "sum_delta_rate": 0.0,
+                "min_amb": None, "max_amb": None}
+
+    def _accumulate_band_stats(self, band, rate, ambient, delta) -> None:
+        """Fold one traverse into the running fit for its band.
+
+        Also tracks the range of ambient seen, because that is what decides whether the
+        fit means anything. A slope from thirty observations all taken between 12 and
+        14 °C is noise wearing a number: the correction it implies is dominated by
+        whatever else varied. Range is the gate, not count.
+        """
+        if rate is None or ambient is None:
+            return
+        st = self._band_stats.setdefault(str(int(band)), self._empty_band_stats())
+        st["n"] += 1
+        st["sum_amb"] += ambient
+        st["sum_amb2"] += ambient * ambient
+        st["sum_rate"] += rate
+        st["sum_amb_rate"] += ambient * rate
+        if delta is not None:
+            st["sum_delta"] += delta
+            st["sum_delta2"] += delta * delta
+            st["sum_delta_rate"] += delta * rate
+        st["min_amb"] = ambient if st["min_amb"] is None else min(st["min_amb"], ambient)
+        st["max_amb"] = ambient if st["max_amb"] is None else max(st["max_amb"], ambient)
+
+    def band_rate_fit(self, band, against="amb"):
+        """Least-squares slope and intercept of rate against ambient, over all history.
+
+        Returns None where there is nothing worth fitting. `against="delta"` fits the
+        water/air gap instead, for the physical form.
+        """
+        st = self._band_stats.get(str(int(band)))
+        if not st or st["n"] < 2:
+            return None
+        n = st["n"]
+        sx = st["sum_amb"] if against == "amb" else st["sum_delta"]
+        sxx = st["sum_amb2"] if against == "amb" else st["sum_delta2"]
+        sxy = st["sum_amb_rate"] if against == "amb" else st["sum_delta_rate"]
+        sy = st["sum_rate"]
+        denom = n * sxx - sx * sx
+        if abs(denom) < 1e-9:
+            return None                      # every observation at the same temperature
+        slope = (n * sxy - sx * sy) / denom
+        intercept = (sy - slope * sx) / n
+        span = ((st["max_amb"] - st["min_amb"])
+                if st["min_amb"] is not None and st["max_amb"] is not None else 0.0)
+        return {"slope": slope, "intercept": intercept, "n": n, "ambient_span": span}
+
     def _seed_window_ambient(self) -> None:
         """Start a fresh ambient window at the conditions the band is entered in.
 
@@ -1452,6 +1522,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         })
         self._band_observations = (
             self._band_observations[-self._BAND_OBSERVATIONS_MAX:])
+        self._accumulate_band_stats(
+            band, float(rate), amb if amb is None else float(amb),
+            None if amb is None else water_mean - float(amb))
         _LOGGER.debug(
             "Band observation: band %d, %.1f→%.1f °C in %.2f h = %.3f °C/h, "
             "ambient mean %s °C (water-air %s)",
