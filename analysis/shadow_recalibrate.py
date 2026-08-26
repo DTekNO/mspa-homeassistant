@@ -199,7 +199,7 @@ def _sessions():
     return out
 
 
-def strategy_band_edge(session, final_replan=True, from_start=True):
+def strategy_band_edge(session, final_replan=True, from_start=True, cumulative=False):
     """Scale the curve at each band edge by how wrong the band just finished was.
 
     The 2026-08-26 proposal, and a different measurement from strategy_shadow above.
@@ -220,9 +220,12 @@ def strategy_band_edge(session, final_replan=True, from_start=True):
     phase error — under a tenth of a 5.5 °C band, against most of a 1 °C one.
     """
     shadow = list(session.rates)
+    origin = list(session.rates)          # never rescaled; the frame `cumulative` uses
     eta = session.start_time + timedelta(minutes=session.logged_raw)
     out, events = [], []
     anchor = (session.start_time, session.start_temp) if from_start else None
+    # Where the measurement starts when scaling from the whole session so far.
+    first = (session.start_time, session.start_temp)
 
     for i, (t, temp) in enumerate(session.crossings):
         if anchor is None and i > 0:
@@ -240,9 +243,19 @@ def strategy_band_edge(session, final_replan=True, from_start=True):
             measured = temp - anchor[1]
             remaining = session.target - temp
             amplification = remaining / measured if measured > 0 else 999.0
+            if cumulative:
+                # Measured over everything so far, and applied to the *original* rates.
+                # Compounding it onto the already-scaled curve would re-apply the
+                # previous correction on top of itself — the one real hazard here, since
+                # comparing times over identical spans has no chord problem at any span.
+                planned = _minutes(origin, first[1], temp)
+                actual = (t - first[0]).total_seconds() / 60.0
+                measured = temp - first[1]
+                amplification = (session.target - temp) / measured if measured > 0 else 999.0
             if planned > 0 and actual > 0 and amplification <= MAX_AMPLIFICATION:
                 factor = planned / actual          # >1 means today is running fast
-                shadow = [r * factor if r else r for r in shadow]
+                shadow = ([r * factor for r in origin] if cumulative
+                          else [r * factor if r else r for r in shadow])
                 eta = t + timedelta(minutes=_minutes(shadow, temp, session.target))
                 events.append((t, temp, anchor[1], actual, planned, factor))
             anchor = (t, temp)
@@ -336,6 +349,7 @@ def main() -> None:
         ("LATE ONLY: last bucket + final 0.5", lambda x: strategy_late_only(x)[0]),
         ("AS BUILT: re-anchor only + final 0.5", lambda x: strategy_as_built(x)[0]),
         ("BAND EDGE: actual/planned + final 0.5", lambda x: strategy_band_edge(x)[0]),
+        ("BAND EDGE, cumulative from start", lambda x: strategy_band_edge(x, True, True, True)[0]),
         ("BAND EDGE, no final replan", lambda x: strategy_band_edge(x, False)[0]),
         ("BAND EDGE, first band from crossing",
          lambda x: strategy_band_edge(x, True, False)[0]),
@@ -350,7 +364,9 @@ def main() -> None:
     print("\n  minutes late (+) or early (-) against the true finish\n")
     print(f"  {'session':<26}{'opening':>9}{'rev 1':>9}{'rev 2':>9}{'final':>9}")
     for how, label in ((strategy_as_built, "as built"),
-                       (strategy_band_edge, "band-edge scaling")):
+                       (strategy_band_edge, "band-edge, residual (each band)"),
+                       (lambda x: strategy_band_edge(x, True, True, True),
+                        "band-edge, cumulative from start")):
         print(f"\n  -- {label} --")
         for sess in sessions:
             ser, ev = how(sess)
