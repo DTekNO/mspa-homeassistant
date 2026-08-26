@@ -5,66 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2026.8.2]
 
-Everything here is new since **2026.8.1**, the last full release. 2026.8.2-beta was a
-prerelease of it and its changes are included below.
+Everything here is new since **2026.8.1**, the last full release. This release is focussed on 
+improving the learning and prediction algorithms for planning a heat-up from cold and 
+for display of the best estimate for when the required temperature will be reached, taking account 
+of current outside conditions.
 
-**The estimate now corrects itself while the water heats.** Before, the ready time was
-worked out once at the start and then only re-anchored: reaching a milestone early banked
-the time already saved, but everything still to come was priced at the rates the session
-opened with. On a cold morning those rates can be well out, and the estimate stayed hours
+@CLAUDE intro here
+
+**The *Ready at* estimate now corrects itself while the water heats.** Before, the ready time was
+worked out once at the start and the estimate stayed hours
 wrong until the very end. It now measures how long each stage actually took against how
 long it was supposed to, and rescales the rest of the plan by the difference.
 
-Replayed over five recorded heat-ups, the worst mid-session error falls from **192 minutes
-to 57**, and the average error across a whole session from **62 to 43 minutes**. The
-finish itself was already good and is unchanged, landing within a few minutes.
-
-**Also, every heater start now brings the circulation pump up first.** The spa refuses to
-heat without flow, and this changes how the integration issues its most consequential
-command.
+**When heating starts, this mspa integration now brings the circulation pump up first.** The spa
+will not turn on the heater without flow, so this ensures that the pump is always running
+before commanding the heater to start. This is in addition to the guard imposed by the mspa itself.
 
 ### Added
 
 - **Cancel Heat Schedule button** — clears a pending schedule and leaves the heater alone.
-  Requested by romd87. Home Assistant gives no way to clear a datetime, so **Scheduled
-  for** used to be a one-way door. Automatable with `button.press`; needs a restart after
-  upgrading for the new button to appear.
+  Requested by romd87. Automatable with `button.press`.
 
 ### Changed
 
-- **The heater always starts the circulation pump first.** If the pump will not start, the
-  heater is no longer commanded and the scheduler retries.
+- **When heating is initiated, the circulation pump is started first first.** The integration
+  waits, or retries, for confirmation that the pump is running before starting the heater. This is
+  just an extra layer of security in case the mspa rejects heating with an error. 
 
-- **The ready time is revised at 30 °C, at 37 °C, and once with half a degree to go.**
+- **The *Ready at* time is revised during heating at 30 °C, at 37 °C, and once with half a degree to go.**
   Each revision measures the stage just completed and scales what remains by how wrong it
-  turned out to be. Those points are chosen because the time taken to reach them is a fact
-  rather than an estimate — a heating rate only means something measured across a whole
-  stage, not sampled part way through one.
-
+  turned out to be.
+  
 - **The correction follows current conditions rather than an average of the session.** A
   long heat-up can start on a cold morning and finish on a warm afternoon, so the stage
   just finished describes what is coming better than the whole run does.
 
-- **The last stage now learns from itself.** It runs from 37 °C upward with nothing above
+- **The last stage of heating to set-point now learns from itself.** Learning the
+  last heat-up stage runs from 37 °C upward with nothing above
   it to correct it, and it is the part of the curve most sensitive to the weather. It used
   to be measured and then forgotten.
 
-- **A heat-up you start by hand shows its own ready time, even with a schedule pending.**
+- **A heat-up you started manually shows its own ready time, even with a schedule pending.**
   Raising the setpoint while a schedule was set left the display showing the scheduled
-  day, with no way to see when the water you were actually heating would be warm short of
-  cancelling the schedule. A heat-up happening now takes precedence; the schedule is
+  day, with no way to see when the water you were actually heating would be warm. A heat-up
+  happening now takes precedence for the *Ready at* predictor; the schedule is
   untouched and takes over again afterwards.
 
 - **Heating rates are measured over a wider span.** A single 0.5 °C step was too short to
-  time accurately, which both unsettled the estimate and taught the model rates below what
+  time accurately, and taught the model rates below what
   the spa actually achieved. The hot rate is now learned over 37–39 °C rather than
   everything above 37, where a 40 °C setpoint spends its slowest hour; the cold rate is
   bounded at 20 °C for the same reason.
 
 - **The estimate reads in five-minute steps and no longer wobbles.** Minute precision on
-  something hours away was never real.
+  something hours away was never real. *Ready at* predictions would previously oscillate
+  frequently between estimates longer or shorter than necessary. *Ready-at* now holds steady
+  until heating rates are known.
 
 ### Fixed
 
@@ -98,11 +96,6 @@ command.
 - The 2026-08-25 session — eleven hours from 24.5 °C on a 10.8 °C morning — finished
   within **2 minutes** of its final estimate, having converged from an opening four hours
   out.
-
-## [2026.8.2-beta]
-
-A prerelease of the above. Its changes are listed under Unreleased rather than repeated
-here.
 
 ## [2026.8.1]
 
