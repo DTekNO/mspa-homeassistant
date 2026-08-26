@@ -20,6 +20,9 @@
         "description": "Multiple MSpa devices were found on your account. Select the device to add.",
         "data": {
           "device_id": "Device"
+        },
+        "data_description": {
+          "device_id": "Which spa on this account to add. Only one can be set up per entry \u2014 add the integration again for a second spa."
         }
       }
     },
@@ -43,16 +46,24 @@
           "bubble_power": "Bubble Generator Power (Watts)",
           "heater_power_preheat": "Heater Preheat Power (Watts)",
           "heater_power_heat": "Heater Active Heating Power (Watts)",
+          "track_temperature_unit": "Reset the spa's \u00b0C/\u00b0F after a power cut",
+          "always_enforce_unit": "Check the unit on every poll, not only after a power cut",
+          "restore_state": "Restore the previous settings after a power cut",
           "weather_entity": "Weather Entity (optional)",
-          "ambient_correction": "Adjust estimates for the outdoor temperature"
+          "ambient_correction": "Adjust estimates for the outdoor temperature",
+          "schedule_target_temp": "Target temperature for a scheduled heat-up"
         },
         "data_description": {
           "pump_power": "Power consumption when the filter pump is running (typically 60W)",
           "bubble_power": "Power consumption when bubbles are active (typically 900W)",
           "heater_power_preheat": "Power consumption during preheat mode (typically 1500W)",
           "heater_power_heat": "Power consumption during active heating (typically 2000W)",
+          "track_temperature_unit": "The spa forgets whether it is set to Celsius or Fahrenheit when it loses power. When it comes back online, set it again to match Home Assistant.",
+          "always_enforce_unit": "For spas that forget the unit without ever losing power. Checks on every update and sends a command only when the unit is actually wrong.",
+          "restore_state": "When the spa comes back online, send back the target temperature and settings it had before the power cut. This writes to the spa, so leave it off if you would rather nothing were set on your behalf.",
           "weather_entity": "Select a weather entity (e.g. Met.no, OpenWeatherMap) to bias heating estimates by ambient temperature and wind speed. Historical sessions are weighted by how closely their conditions match the current weather.",
-          "ambient_correction": "Uses the weather entity above, and what this spa has shown about its own response to the weather, to correct the heating estimates. Turning this off does not stop it being learned — switching it back on later picks up where it left off."
+          "ambient_correction": "Uses the weather entity above, and what this spa has shown about its own response to the weather, to correct the heating estimates. Turning this off does not stop it being learned \u2014 switching it back on later picks up where it left off.",
+          "schedule_target_temp": "What a scheduled heat-up aims for, as opposed to the setpoint you choose by hand. Also adjustable at any time from the Schedule Target Temperature entity."
         }
       }
     }
