@@ -173,14 +173,126 @@ def _sessions():
          "2026-08-12T14:57:18+00:00"),
         ("D  14 Aug  33.0 → 39.5", (1.10, 0.99, 0.79), 15.2, 14.793, 33.0, 425.7, 391.1,
          "2026-08-14T03:46:08+00:00"),
+        # From the 2026-08-25 log: PREDICTION_START 24.5 -> 39.5, raw 955, buckets
+        # 1.20/1.04/0.86, ambient 10.8 against a 15.3 baseline; PREDICTION_RESULT actual
+        # 712 min. The longest run in the set, and the coldest morning.
+        ("E  25 Aug  24.5 → 39.5", (1.20, 1.04, 0.86), 10.8, 15.3, 24.5, 955.0, 712.0,
+         "2026-08-25T06:41:47+00:00"),
     ]
     out = []
-    for (name, buckets, amb, base, start_temp, raw, actual, started), run in zip(defs, runs):
+    for name, buckets, amb, base, start_temp, raw, actual, started in defs:
         s = st.Session(name, buckets, amb, base, start_temp, 39.5, raw, actual, started)
+        # Matched by date, not by position. These were zipped against the detected runs
+        # in order, which silently mis-pairs the moment a session is added anywhere but
+        # the end — or a new export introduces a run between two existing ones. A
+        # mis-paired session reports no crossings at all and scores as if nothing had
+        # been recalibrated, which looks like a strategy failing rather than a harness
+        # fault.
+        run = next((r for r in runs
+                    if r[0][0] <= s.started_at <= r[-1][0] + timedelta(hours=2)), None)
+        if run is None:
+            print(f"  !! no recorded run matches {name} — skipped")
+            continue
         later = [(t, v) for t, v in run if t >= s.started_at and v <= s.target + 1e-9]
         s.crossings = [(s.started_at, s.start_temp)] + later
         out.append(s)
     return out
+
+
+def strategy_band_edge(session, final_replan=True, from_start=True):
+    """Scale the curve at each band edge by how wrong the band just finished was.
+
+    The 2026-08-26 proposal, and a different measurement from strategy_shadow above.
+    That one measures a fixed span *into* the band just entered — a degree, which the
+    0.5 °C reporting quantises to about +/-50% and which is then applied to everything
+    remaining. This one measures the band just *completed*: actual elapsed against
+    planned elapsed over the identical temperature span, hours long rather than one
+    degree.
+
+    The distinction matters beyond the noise. Comparing a measured rate against a band
+    chord finds a difference that is arithmetically real and physically meaningless,
+    because a chord is exact only over a full traverse. Comparing actual minutes against
+    planned minutes over the same span is like for like, whatever the span.
+
+    `from_start` measures the first band from the session start, which is what "how far
+    out was the opening plan" means. The cost is that the start sits somewhere unknown
+    inside its 0.5 °C reporting band, so that first ratio carries up to half a degree of
+    phase error — under a tenth of a 5.5 °C band, against most of a 1 °C one.
+    """
+    shadow = list(session.rates)
+    eta = session.start_time + timedelta(minutes=session.logged_raw)
+    out, events = [], []
+    anchor = (session.start_time, session.start_temp) if from_start else None
+
+    for i, (t, temp) in enumerate(session.crossings):
+        if anchor is None and i > 0:
+            anchor = (t, temp)
+        elif (anchor is not None and temp > anchor[1]
+                and any(abs(temp - b) < 1e-9 for b in (T1, T2))):
+            planned = _minutes(shadow, anchor[1], temp)
+            actual = (t - anchor[0]).total_seconds() / 60.0
+            # The rule already established in this file: a measurement is only worth
+            # applying where the remaining span is comparable to the span measured.
+            # Session B enters at 29.0, so its first band is a single degree, and an
+            # unguarded ratio of 2.48 over one degree gets applied to the nine and a half
+            # remaining — then needs 0.37 to undo it. Guarding on amplification skips that
+            # measurement and keeps the useful one at 30→37.
+            measured = temp - anchor[1]
+            remaining = session.target - temp
+            amplification = remaining / measured if measured > 0 else 999.0
+            if planned > 0 and actual > 0 and amplification <= MAX_AMPLIFICATION:
+                factor = planned / actual          # >1 means today is running fast
+                shadow = [r * factor if r else r for r in shadow]
+                eta = t + timedelta(minutes=_minutes(shadow, temp, session.target))
+                events.append((t, temp, anchor[1], actual, planned, factor))
+            anchor = (t, temp)
+
+        # The same final look the card already performs: the rate measured immediately
+        # below the target, not the curve. Simulating it any other way compares this
+        # variant's endgame against a different mechanism from the one it would ship
+        # with, and made it look 5 minutes worse at the finish than it is.
+        if final_replan and session.target - 0.5 - 1e-9 <= temp < session.target:
+            mins = None
+            if anchor is not None and temp > anchor[1]:
+                hours = (t - anchor[0]).total_seconds() / 3600.0
+                if hours > 0:
+                    local = (temp - anchor[1]) / hours
+                    if local > 0:
+                        mins = (session.target - temp) / local * 60.0
+            if mins is None:
+                mins = _minutes(shadow, temp, session.target)
+            eta = t + timedelta(minutes=mins)
+
+        out.append((t, eta))
+    return out, events
+
+
+def strategy_as_built(session):
+    """What the card does today: re-anchor at a band edge, keep the opening rates.
+
+    The ETA becomes "now + the remaining journey at the rates the session opened with".
+    Arriving early therefore buys only the time already saved; everything ahead is still
+    priced at rates that have just been shown to be wrong. The final half degree is the
+    exception and uses the rate measured immediately below it, which is why it lands.
+    """
+    shadow = list(session.rates)
+    eta = session.start_time + timedelta(minutes=session.logged_raw)
+    out, events, entry = [], [], (session.start_time, session.start_temp)
+
+    for t, temp in session.crossings:
+        if temp > entry[1] and any(abs(temp - b) < 1e-9 for b in (T1, T2)):
+            eta = t + timedelta(minutes=_minutes(shadow, temp, session.target))
+            events.append((t, temp, entry[1], 0.0, 0.0, 1.0))
+            entry = (t, temp)
+        if session.target - 0.5 - 1e-9 <= temp < session.target and temp > entry[1]:
+            hours = (t - entry[0]).total_seconds() / 3600.0
+            if hours > 0:
+                local = (temp - entry[1]) / hours
+                if local > 0:
+                    eta = t + timedelta(minutes=(session.target - temp) / local * 60.0)
+                    events.append((t, temp, entry[1], 0.0, 0.0, 1.0))
+        out.append((t, eta))
+    return out, events
 
 
 def main() -> None:
@@ -202,6 +314,18 @@ def main() -> None:
                   f"{obs:5.2f} °C/h against {base:4.2f} -> factor {f:5.2f}{flag}")
         print()
 
+    print("What the band-edge variant measures:\n")
+    for sess in sessions:
+        _, ev = strategy_band_edge(sess)
+        print(f"  {sess.name}")
+        if not ev:
+            print("     never recalibrated")
+        for t, temp, frm, act, plan, f in ev:
+            at = (t - sess.start_time).total_seconds() / 60.0
+            print(f"     at {at:5.0f} min, {frm:4.1f}→{temp:4.1f} °C: "
+                  f"took {act:6.1f} min against {plan:6.1f} planned -> factor {f:5.2f}")
+        print()
+
     variants = [
         ("shadow, settle 1.0 °C, unclamped", lambda x: strategy_shadow(x, 1.0, False, False)[0]),
         ("shadow, settle 1.0 °C", lambda x: strategy_shadow(x, 1.0, False, True)[0]),
@@ -210,10 +334,42 @@ def main() -> None:
         ("shadow, 1.5 °C + final 0.5 replan", lambda x: strategy_shadow(x, 1.5, True, True)[0]),
         ("shadow, 2.0 °C + final 0.5 replan", lambda x: strategy_shadow(x, 2.0, True, True)[0]),
         ("LATE ONLY: last bucket + final 0.5", lambda x: strategy_late_only(x)[0]),
+        ("AS BUILT: re-anchor only + final 0.5", lambda x: strategy_as_built(x)[0]),
+        ("BAND EDGE: actual/planned + final 0.5", lambda x: strategy_band_edge(x)[0]),
+        ("BAND EDGE, no final replan", lambda x: strategy_band_edge(x, False)[0]),
+        ("BAND EDGE, first band from crossing",
+         lambda x: strategy_band_edge(x, True, False)[0]),
         ("hold the opening estimate", st.strategy_hold),
         ("settle 90/1.5 then replan each crossing",
          lambda x: st.strategy_settle_then_replan(x, 90, 1.5)),
     ]
+
+    print("=" * 78)
+    print("CONVERGENCE: how wrong the displayed ready time was, at each revision")
+    print("=" * 78)
+    print("\n  minutes late (+) or early (-) against the true finish\n")
+    print(f"  {'session':<26}{'opening':>9}{'rev 1':>9}{'rev 2':>9}{'final':>9}")
+    for how, label in ((strategy_as_built, "as built"),
+                       (strategy_band_edge, "band-edge scaling")):
+        print(f"\n  -- {label} --")
+        for sess in sessions:
+            ser, ev = how(sess)
+            truth = sess.started_at + timedelta(minutes=sess.logged_actual)
+            # The estimate standing at each moment: opening, then after each revision.
+            def err_at(when):
+                held = None
+                for t, e in ser:
+                    if t <= when:
+                        held = e
+                return (held - truth).total_seconds() / 60.0 if held else float("nan")
+            opening = (sess.started_at + timedelta(minutes=sess.logged_raw) - truth)
+            cells = [f"{opening.total_seconds()/60:+8.0f}"]
+            times = [t for t, *_ in ev]
+            for k in range(2):
+                cells.append(f"{err_at(times[k]):+8.0f}" if k < len(times) else "       -")
+            cells.append(f"{err_at(ser[-1][0]):+8.0f}")
+            print(f"  {sess.name:<26}" + "".join(f"{c:>9}" for c in cells))
+    print()
 
     print("=" * 78)
     print("SCORED AGAINST THE TRUE FINISH")

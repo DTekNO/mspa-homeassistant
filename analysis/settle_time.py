@@ -82,8 +82,27 @@ def load_crossings() -> list[tuple[datetime, float]]:
     """Distinct reported temperatures from the recorder exports, in time order."""
     rows = set()
     # Every history export in the repo — they overlap, and duplicates collapse below.
-    for path in sorted(ROOT.glob("history*.csv")):
+    # Both places: the exports used to sit at the repo root and now live in
+    # historical-data/, which is gitignored because the recordings are private. Globbing
+    # only the old location returned nothing at all and every analysis quietly reported
+    # on an empty series.
+    paths = sorted(ROOT.glob("history*.csv")) + sorted(
+        (ROOT / "historical-data").glob("history*.csv"))
+    for path in paths:
         for row in csv.DictReader(path.open()):
+            # One sensor only. Exports from 2026-08-26 onward carry the floating
+            # analyser's temperature alongside the spa's own, and reading both interleaves
+            # a 0.1 °C series with a 0.5 °C one. The mixture is not monotonic — the
+            # analyser lags by up to an hour during a heat-up, so it reports *below* the
+            # spa — and rising_runs ends a run at the first fall, which silently truncated
+            # the 25 August session at 32 °C and made it look as though the recording
+            # stopped there.
+            #
+            # Matched by pattern rather than by id: the spa's entity has been renamed at
+            # least once across these exports.
+            entity = row.get("entity_id", "")
+            if "mspa" not in entity or "water_temperature" not in entity:
+                continue
             try:
                 value = float(row["state"])
             except ValueError:
