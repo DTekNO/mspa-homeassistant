@@ -17,6 +17,35 @@ jobs:
         id: get_version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
+      # The tag is the only source of the version — the manifest is written from it —
+      # so nothing downstream can disagree with a mistyped one. hassfest sees a
+      # well-formed string and is satisfied, and HACS validates structure rather than
+      # plausibility. v2028.8.2 was tagged in 2026 and every check passed.
+      #
+      # CalVer gives the year a correct answer, so it can be checked. A window of one
+      # year either side allows a release tagged either side of midnight on 31 December
+      # while still catching a slip of two years or more.
+      - name: Sanity-check the version in the tag
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          echo "Tag gives version: $VERSION"
+          if ! echo "$VERSION" | grep -qE '^[0-9]{4}\.[0-9]{1,2}(\.[0-9]+)?(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$VERSION' is not YYYY.M[.P][-suffix] — expected CalVer, e.g. 2026.8.2 or 2026.8.2-beta"
+            exit 1
+          fi
+          YEAR=$(echo "$VERSION" | cut -d. -f1)
+          MONTH=$(echo "$VERSION" | cut -d. -f2)
+          NOW_YEAR=$(date -u +%Y)
+          if [ "$YEAR" -lt $((NOW_YEAR - 1)) ] || [ "$YEAR" -gt $((NOW_YEAR + 1)) ]; then
+            echo "::error::Version year $YEAR is not within a year of $NOW_YEAR — mistyped tag?"
+            exit 1
+          fi
+          if [ "$MONTH" -lt 1 ] || [ "$MONTH" -gt 12 ]; then
+            echo "::error::Version month $MONTH is not a month"
+            exit 1
+          fi
+          echo "Version $VERSION looks sane for $(date -u +%Y-%m)."
+
       - name: Set manifest.json version
         uses: jossef/action-set-json-field@v2
         with:
