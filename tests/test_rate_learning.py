@@ -702,6 +702,27 @@ class TestUnmeasurableConditionsAreIgnored:
             c._track_heating_rate(temp, 3, t * _MIN)
         assert 0 not in c._session_fresh_buckets
 
+    def test_a_hot_top_up_is_flagged_rather_than_merely_discarded(self):
+        """Water added, not water heated. It matters beyond the bogus rate: a fill
+        changes how much water there is, so the rest of the band is measuring a
+        different tub."""
+        c = self._c()
+        why = c._window_looks_unmeasurable(0, 25.0, 12.0)     # 12 °C/h
+        assert why and "topped up" in why
+
+    def test_a_cold_top_up_shows_up_as_a_fall(self):
+        c = self._c()
+        assert c._window_looks_unmeasurable(0, 25.0, -4.0) is not None
+
+    def test_ready_being_off_is_not_permission(self):
+        """The same asymmetry as the switches. Ready on is a strong reason to discard;
+        ready off says nothing, and the exceptions — an open lid in wind, a fill — are
+        caught by watching the water instead."""
+        c = self._c()
+        c.ready_latched = False
+        assert c._window_looks_unmeasurable(0, 25.0, -0.5) is not None, (
+            "a cooling tub is not measurable just because Ready is off")
+
     def test_readings_while_already_up_to_temperature_are_discarded(self):
         """Once the spa is at its setpoint the heater is only holding against losses, and
         the tub is at its most likely to be in use. Nothing there describes a heat-up."""

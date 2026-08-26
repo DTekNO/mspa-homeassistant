@@ -1607,6 +1607,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return "the spa was already up to temperature"
         if rate <= 0:
             return "the water was falling while the heater was on"
+        if rate > _MAX_HEAT_RATE:
+            # Faster than any heater can manage, so the water was changed rather than
+            # heated — a top-up with hot water, most likely. Worth flagging rather than
+            # merely discarding: a fill alters how much water there is, so the rest of
+            # this band is measuring a different tub, and the mixing that follows is not
+            # a heating rate at all. A cold fill shows up the other way, as a sudden fall
+            # caught by the test above.
+            return (f"{rate:.1f} °C/h is faster than the heater can manage — "
+                    f"the water was probably topped up")
         st = self._band_stats.get(str(int(band)))
         if not st or st["n"] < self._EXPECTATION_NEEDS_N:
             return None                       # no expectation worth measuring against yet
