@@ -12,7 +12,26 @@ improving the learning and prediction algorithms for planning a heat-up from col
 for display of the best estimate for when the required temperature will be reached, taking account 
 of current outside conditions.
 
-@CLAUDE intro here
+**How the prediction works, in short.** The integration learns how fast your spa heats,
+from the spa's own reported temperature, and uses that both to tell you when the water
+will be ready and to decide when to start heating to hit a scheduled time. The rate is
+not a single number: water heats more slowly as it approaches the setpoint, so the rate
+is learned separately for the cold, middle and near-target stretches of a heat-up.
+
+**Those rates are always a little out of date, and mostly because of the weather.** The
+same spa that climbs at 1.3 °C/h on a mild afternoon will manage noticeably less on a
+cold, windy night, and the difference grows as the water gets hotter and loses heat
+faster to the air. A rate learned across the summer cannot describe today on its own, so
+the estimate has always been corrected for the outside temperature — but that correction
+is a guess made at the moment heating starts, and a long heat-up can run from a cold
+morning well into a warm afternoon.
+
+**This release stops trusting that opening guess for the whole run.** The heat-up is
+watched as it happens: at each stage the integration compares how long the water actually
+took against how long it had predicted, and applies the difference to everything still to
+come. The learned rates themselves are unchanged by this — they go on improving slowly,
+across sessions — but the estimate you are shown now follows the conditions of the day
+rather than the assumption it opened with.
 
 **The *Ready at* estimate now corrects itself while the water heats.** Before, the ready time was
 worked out once at the start and the estimate stayed hours
@@ -30,7 +49,7 @@ before commanding the heater to start. This is in addition to the guard imposed 
 
 ### Changed
 
-- **When heating is initiated, the circulation pump is started first first.** The integration
+- **When heating is initiated, the circulation pump is started first.** The integration
   waits, or retries, for confirmation that the pump is running before starting the heater. This is
   just an extra layer of security in case the mspa rejects heating with an error. 
 
