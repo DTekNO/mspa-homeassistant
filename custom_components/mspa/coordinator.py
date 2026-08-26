@@ -285,7 +285,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # The bucket's value when the current growing window opened.  Nested samples
         # recompute from this rather than compounding on each other — see the bucket
         # write in _track_heating_rate.
-        self._bucket_base_bucket: int | None = None
+        # Ambient accumulated across the current measuring window, so an observation can
+        # carry the mean conditions of the traverse rather than a snapshot at its start.
+        # A band can take five hours; the weather moves over that.
+        self._window_amb_sum: float = 0.0
+        self._window_amb_n: int = 0
+        self._window_wind_sum: float = 0.0
+        self._window_wind_n: int = 0
+        # Full-band traverses, each a clean (water span, mean ambient, realised rate)
+        # observation. Kept to learn how much the weather moves each band's rate, which
+        # is currently a hard-coded guess per band.
+        self._band_observations: list[dict] = []
         self._bucket_base_value: float | None = None
         self._rate_last_time: float | None = None     # monotonic seconds at last sample
         # True while the rate anchor is phase-uncertain: the temperature reports
@@ -778,6 +788,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             pass
                     stored_buckets = stored.get("heat_rate_buckets")
                     self._prediction_history = stored.get("prediction_history", [])
+                    self._band_observations = stored.get("band_observations", [])
                     # Restore the bias as a stored value — never recompute it here.
                     # Recomputing on load made it depend on the weather at startup,
                     # so a restart alone could change every subsequent prediction.
@@ -904,6 +915,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "heat_rate_buckets": self.heat_rate_buckets,
                 "bucket_save_ts": time.time(),
                 "prediction_history": self._prediction_history,
+                "band_observations": self._band_observations,
                 "prediction_bias": self.prediction_bias,
                 "active_prediction": self._prediction,
                 # Persisted so a restart mid-scheduled-heating resumes as
@@ -1377,6 +1389,77 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.ready_latched = False
         self.ready_latched_temp = None
 
+    # How many band traverses to keep. Three per full heat-up from cold, so roughly
+    # sixty sessions — enough to span a year of weather, which is what a sensitivity
+    # has to be fitted across. Bounded because this file is written on every save.
+    _BAND_OBSERVATIONS_MAX = 200
+
+    def _seed_window_ambient(self) -> None:
+        """Start a fresh ambient window at the conditions the band is entered in.
+
+        Zeroing instead of seeding leaves the mean covering only the polls *after* the
+        anchor, which biases it toward the end of the traverse — measurably: a band
+        crossed through 6, 10 and 14 °C reported 12.0 rather than 10.0, because the
+        reading at the anchor was the one poll that never reached the accumulator. The
+        anchor poll is the moment the band was entered and belongs in its mean.
+        """
+        self._window_amb_sum = float(self.ambient_temp) if self.ambient_temp is not None else 0.0
+        self._window_amb_n = 1 if self.ambient_temp is not None else 0
+        self._window_wind_sum = float(self.ambient_wind) if self.ambient_wind is not None else 0.0
+        self._window_wind_n = 1 if self.ambient_wind is not None else 0
+
+    def _record_band_observation(self, band, from_temp, to_temp, hours, rate):
+        """Record one full band traverse, with the weather that prevailed across it.
+
+        Each of these is a single clean point for the question the model currently
+        answers with a hard-coded guess: how much does the outdoor temperature move
+        *this* band's heating rate. `AMBIENT_SENSITIVITY` is (0.0, 0.02, 0.06) — three
+        constants chosen from measurement on a different spa — and nothing in the
+        integration has ever checked them against this one.
+
+        The mean matters more than it looks. Ambient was previously recorded once per
+        session, at the moment heating started: on 2026-08-25 that was 10.8 °C at 08:41,
+        while the mid band was crossed between 12:22 and 17:58 in a warming afternoon,
+        and the correction the session ran on was 20% out by the end. A band's own mean
+        is the number its rate should be regressed against.
+
+        The water span is kept rather than only the band index, because the physical
+        quantity is the gap between water and air: loss scales with it, which is why the
+        hot band is the weather-sensitive one. Storing both means either form can be
+        fitted later without re-recording.
+        """
+        if not hours or hours <= 0 or rate is None:
+            return
+        amb = (self._window_amb_sum / self._window_amb_n
+               if self._window_amb_n else self.ambient_temp)
+        wind = (self._window_wind_sum / self._window_wind_n
+                if self._window_wind_n else self.ambient_wind)
+        water_mean = (float(from_temp) + float(to_temp)) / 2.0
+        self._band_observations.append({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "band": int(band),
+            "from_temp": round(float(from_temp), 2),
+            "to_temp": round(float(to_temp), 2),
+            "hours": round(float(hours), 4),
+            "rate": round(float(rate), 4),
+            "water_mean": round(water_mean, 2),
+            "ambient_mean": round(float(amb), 2) if amb is not None else None,
+            "wind_mean": round(float(wind), 2) if wind is not None else None,
+            # The regressor the physics actually wants, stored so a fit need not
+            # reconstruct it and cannot reconstruct it differently.
+            "delta_mean": (round(water_mean - float(amb), 2)
+                           if amb is not None else None),
+        })
+        self._band_observations = (
+            self._band_observations[-self._BAND_OBSERVATIONS_MAX:])
+        _LOGGER.debug(
+            "Band observation: band %d, %.1f→%.1f °C in %.2f h = %.3f °C/h, "
+            "ambient mean %s °C (water-air %s)",
+            band, from_temp, to_temp, hours, rate,
+            f"{amb:.1f}" if amb is not None else "n/a",
+            f"{water_mean - amb:.1f}" if amb is not None else "n/a",
+        )
+
     def _track_heating_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the observed heating rate over a growing per-bucket window.
 
@@ -1427,6 +1510,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # First poll in heat mode — set a phase-uncertain anchor.
                 self._rate_last_temp = curr_temp
                 self._rate_last_time = now_mono
+                self._seed_window_ambient()
                 self._rate_prev_temp = curr_temp
                 self._rate_first_step = True
             elif curr_temp != self._rate_prev_temp:
@@ -1450,10 +1534,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._rate_first_step = False
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono
+                    self._seed_window_ambient()
                     return
                 # Temperature has changed — elapsed time since the window anchor
                 # is the true duration of the whole boundary-to-boundary span.
                 elapsed_hours = (now_mono - self._rate_last_time) / 3600
+                if self.ambient_temp is not None:
+                    self._window_amb_sum += float(self.ambient_temp)
+                    self._window_amb_n += 1
+                if self.ambient_wind is not None:
+                    self._window_wind_sum += float(self.ambient_wind)
+                    self._window_wind_n += 1
                 anchor_bucket = _heat_bucket_index(self._rate_last_temp)
                 accepted = False
                 if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
@@ -1580,10 +1671,21 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # Refusing a full traverse of the cold bucket because the session began
                 # below it throws away the one measurement that stretch exists to make.
                 # Re-anchoring at 20 turns it back into an ordinary chord.
-                if not accepted or (learning_anchor_zone(curr_temp)
-                                    != learning_anchor_zone(self._rate_last_temp)):
+                _left_the_band = (learning_anchor_zone(curr_temp)
+                                  != learning_anchor_zone(self._rate_last_temp))
+                if _left_the_band and accepted and _in_learn_range:
+                    # A whole band, entered and left at its edges, measured against the
+                    # weather that prevailed while it was crossed. That is the observation
+                    # a per-band ambient sensitivity has to be fitted from, and until now
+                    # it was computed, used once for the EMA, and discarded: the stored
+                    # history kept one ambient temperature per *session*, taken at its
+                    # start, which describes a five-hour band not at all.
+                    self._record_band_observation(
+                        _bi, self._rate_last_temp, curr_temp, elapsed_hours, rate)
+                if not accepted or _left_the_band:
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono
+                    self._seed_window_ambient()
                     # A new window measures a new chord, so the value it recomputes from
                     # must be re-read rather than carried over from the window before it.
                     self._bucket_base_bucket = None

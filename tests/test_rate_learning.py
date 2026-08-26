@@ -13,6 +13,7 @@ Ready at estimate from 15:34 to 12:16 against a 15:30 schedule.
 
 Run with: python -m pytest tests/test_rate_learning.py -v
 """
+import pytest
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
 
 
@@ -30,7 +31,14 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     c._session_scalar_bucket = None
     c._session_fresh_buckets = set()
     c.ambient_temp = None
+    c.ambient_wind = None
     c.ambient_baseline = None
+    # Mirrors the real __init__. This fixture is built by hand with object.__new__, so
+    # anything the coordinator initialises has to be repeated here or the first attribute
+    # the code adds fails only in the tests — which reads as the code being wrong.
+    c._window_amb_sum = c._window_wind_sum = 0.0
+    c._window_amb_n = c._window_wind_n = 0
+    c._band_observations = []
     for k, v in overrides.items():
         setattr(c, k, v)
     return c
@@ -458,3 +466,66 @@ class TestColdStartBelowLearningRange:
         assert 2 in c._session_fresh_buckets
         c._track_heating_rate(40.0, 3, 210 * _MIN)        # to > 39 — refused
         assert c.heat_rate_buckets[2] == learned, "the 39-40 tail must not move it"
+
+
+class TestBandObservations:
+    """Each full band traverse is recorded with the weather that prevailed across it.
+
+    The stored history kept one ambient temperature per session, sampled when heating
+    started. On 2026-08-25 that was 10.8 °C at 08:41, while the mid band was crossed
+    between 12:22 and 17:58 in a warming afternoon — so the number the session was
+    corrected by described none of the band it was applied to. A per-band sensitivity
+    cannot be fitted from that; it needs the rate of one band against the conditions of
+    that same band.
+    """
+
+    def _heating(self, c, temps, ambients, start=0.0, step_min=30.0):
+        """Feed crossings, moving the ambient between them."""
+        t = start
+        for temp, amb in zip(temps, ambients):
+            c.ambient_temp = amb
+            c._track_heating_rate(temp, 3, t * _MIN)
+            t += step_min
+
+    def test_a_completed_band_is_recorded(self):
+        c = _coord(heat_rate_buckets=[1.10, 1.30, None])
+        self._heating(c, [28.0, 28.5, 29.5, 30.0, 30.5], [10.0] * 5)
+        cold = [o for o in c._band_observations if o["band"] == 0]
+        assert cold, "leaving the cold band must record its traverse"
+        o = cold[0]
+        assert o["from_temp"] == 28.5 and o["to_temp"] == 30.0, o
+        assert o["rate"] > 0 and o["hours"] > 0
+
+    def test_the_ambient_is_the_mean_across_the_traverse(self):
+        """Not a snapshot at either end: the point of the record is the conditions the
+        band was actually crossed in."""
+        c = _coord(heat_rate_buckets=[1.10, 1.30, None])
+        # 6, 10, 14 °C while crossing, then out of the band.
+        self._heating(c, [28.0, 28.5, 29.0, 30.0, 30.5], [2.0, 6.0, 10.0, 14.0, 20.0])
+        o = [x for x in c._band_observations if x["band"] == 0][0]
+        assert o["ambient_mean"] == pytest.approx(10.0, abs=0.01), o
+        assert o["ambient_mean"] != 2.0 and o["ambient_mean"] != 20.0
+
+    def test_the_water_air_gap_is_stored_alongside(self):
+        """Loss scales with the gap between water and air, which is why the hot band is
+        the weather-sensitive one. Storing it means a later fit cannot reconstruct it
+        differently from how it was measured."""
+        c = _coord(heat_rate_buckets=[1.10, 1.30, None])
+        self._heating(c, [28.0, 28.5, 29.5, 30.0, 30.5], [10.0] * 5)
+        o = [x for x in c._band_observations if x["band"] == 0][0]
+        assert o["water_mean"] == pytest.approx((28.5 + 30.0) / 2)
+        assert o["delta_mean"] == pytest.approx(o["water_mean"] - 10.0)
+
+    def test_a_partial_band_is_not_recorded(self):
+        """Only a traverse between two edges is a clean chord. A session that stops part
+        way through has measured a sub-span, which is the thing that cannot be compared
+        against a band rate."""
+        c = _coord(heat_rate_buckets=[1.10, 1.30, None])
+        self._heating(c, [28.0, 28.5, 29.0, 29.5], [10.0] * 4)   # never reaches 30
+        assert c._band_observations == []
+
+    def test_the_record_is_bounded(self):
+        c = _coord(heat_rate_buckets=[1.10, 1.30, None])
+        c._band_observations = [{"band": 0}] * (c._BAND_OBSERVATIONS_MAX + 50)
+        self._heating(c, [28.0, 28.5, 29.5, 30.0, 30.5], [10.0] * 5)
+        assert len(c._band_observations) == c._BAND_OBSERVATIONS_MAX
