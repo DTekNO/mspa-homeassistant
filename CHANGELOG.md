@@ -5,82 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2026.8.2-beta]
+## [Unreleased]
 
-> **Beta.** Every heater start now brings the circulation pump up first, which changes
-> how the integration issues its most consequential command. That wants verifying on
-> real hardware before a full release.
+Everything here is new since **2026.8.1**, the last full release. 2026.8.2-beta was a
+prerelease of it and its changes are included below.
+
+**The estimate now corrects itself while the water heats.** Before, the ready time was
+worked out once at the start and then only re-anchored: reaching a milestone early banked
+the time already saved, but everything still to come was priced at the rates the session
+opened with. On a cold morning those rates can be well out, and the estimate stayed hours
+wrong until the very end. It now measures how long each stage actually took against how
+long it was supposed to, and rescales the rest of the plan by the difference.
+
+Replayed over five recorded heat-ups, the worst mid-session error falls from **192 minutes
+to 57**, and the average error across a whole session from **62 to 43 minutes**. The
+finish itself was already good and is unchanged, landing within a few minutes.
+
+**Also, every heater start now brings the circulation pump up first.** The spa refuses to
+heat without flow, and this changes how the integration issues its most consequential
+command.
 
 ### Added
 
-- **Cancel Heat Schedule button** — clears a pending schedule and leaves the heater
-  alone. Requested by romd87. Home Assistant gives no way to clear a datetime, so
-  **Scheduled for** used to be a one-way door. Automatable with `button.press`; needs
-  a restart after upgrading for the new button to appear.
+- **Cancel Heat Schedule button** — clears a pending schedule and leaves the heater alone.
+  Requested by romd87. Home Assistant gives no way to clear a datetime, so **Scheduled
+  for** used to be a one-way door. Automatable with `button.press`; needs a restart after
+  upgrading for the new button to appear.
 
 ### Changed
 
-- **The heater always starts the circulation pump first.** The spa refuses to heat
-  without flow, and the MSpa Link app never enables heating on its own. If the pump
-  will not start, the heater is no longer commanded and the scheduler retries.
+- **The heater always starts the circulation pump first.** If the pump will not start, the
+  heater is no longer commanded and the scheduler retries.
 
-- **Heating rates are measured over a wider span.** A single 0.5 °C step was too short
-  to time accurately, which both unsettled the Ready at estimate and taught the model
-  rates below what the spa actually achieved.
+- **The ready time is revised at 30 °C, at 37 °C, and once with half a degree to go.**
+  Each revision measures the stage just completed and scales what remains by how wrong it
+  turned out to be. Those points are chosen because the time taken to reach them is a fact
+  rather than an estimate — a heating rate only means something measured across a whole
+  stage, not sampled part way through one.
+
+- **The correction follows current conditions rather than an average of the session.** A
+  long heat-up can start on a cold morning and finish on a warm afternoon, so the stage
+  just finished describes what is coming better than the whole run does.
+
+- **The last stage now learns from itself.** It runs from 37 °C upward with nothing above
+  it to correct it, and it is the part of the curve most sensitive to the weather. It used
+  to be measured and then forgotten.
+
+- **A heat-up you start by hand shows its own ready time, even with a schedule pending.**
+  Raising the setpoint while a schedule was set left the display showing the scheduled
+  day, with no way to see when the water you were actually heating would be warm short of
+  cancelling the schedule. A heat-up happening now takes precedence; the schedule is
+  untouched and takes over again afterwards.
+
+- **Heating rates are measured over a wider span.** A single 0.5 °C step was too short to
+  time accurately, which both unsettled the estimate and taught the model rates below what
+  the spa actually achieved. The hot rate is now learned over 37–39 °C rather than
+  everything above 37, where a 40 °C setpoint spends its slowest hour; the cold rate is
+  bounded at 20 °C for the same reason.
+
+- **The estimate reads in five-minute steps and no longer wobbles.** Minute precision on
+  something hours away was never real.
 
 ### Fixed
 
-- **Ready at no longer walks away from a good estimate mid-session.** A bucket rate is
-  the *chord* of the heating curve between the two edges of its band, not the rate
-  anywhere along it — inside 30–37 °C the real rate falls from about 1.33 to 1.05 °C/h.
-  The plan used to measure a sub-span and compare it against that chord, which finds a
-  difference that is arithmetically real and physically meaningless, and it always took
-  that measurement low in the band where the discrepancy is largest. On 2026-08-20 it
-  turned an opening estimate 8 minutes out into one 58 minutes out, and did not beat its
-  own opening again until the water was half a degree from target.
+- **The estimate no longer walks away from a good opening.** It used to re-plan part way
+  through a stage, comparing a partial measurement against a whole-stage rate — a
+  difference that is arithmetically real and physically meaningless. On 2026-08-20 that
+  turned an opening 8 minutes out into one 58 minutes out.
 
-  The plan is now revised only where a band completes — 30 °C and 37 °C, the two
-  temperatures at which a whole traverse has been measured — plus one look with half a
-  degree to go. At a band edge there is nothing to compare, because the elapsed time to
-  that exact temperature is fact, so the revision moves the starting point and leaves
-  the rates alone. Replayed over five recorded sessions the finish lands within five
-  minutes every time.
+- **A heat-up that starts below 20 °C behaves like any other.** It learned nothing at all
+  and got no revision until 30 °C, because the measurement it offered was refused for
+  starting below the range the rates are learned in.
 
-- **The hot rate is learned over 37–39 °C instead of everything above 37.** Left
-  open-ended it absorbed the 39–40 tail, where a session with a 40 °C setpoint spends
-  its slowest hour, and the single rate it settled on described neither half. Above 39
-  the rate is extrapolated, which costs nothing measurable — across five sessions the
-  final half degree runs at 1.05x the degree below it — and errs on the forgiving side.
-  The cold rate is bounded at 20 °C for the same reason.
+- **Stopping a heat-up part way is no longer recorded as having finished it.** Dropping
+  the thermostat onto the water counted as arrival, so an abandoned run reached the stored
+  history as a completed prediction.
 
-- **Stopping a heat-up part way is no longer recorded as having finished it.** A session
-  ends when the water reaches the setpoint, and dropping the thermostat onto the water
-  satisfies that without a degree of progress — so aborting a run at 30 °C on its way to
-  39.5 was logged as a completed prediction, reporting an error of −1505%. Completion now
-  requires the setpoint to still be the one the plan was made for. The learned rate bias
-  was never affected, which rejects a ratio that far out, but the bogus session reached
-  the stored history and made the log read as though the model had failed.
+- **Ready at no longer says "Ready" after a restart** on a spa nowhere near its target. A
+  warm tub sitting above a parked setpoint was read as an arrival.
 
-- **Ready at said "Ready" the moment Home Assistant restarted**, on a spa that was
-  nowhere near its target. The readiness latch is set when the water first reaches the
-  setpoint, and the checks that stop a lowered thermostat from earning it — the water
-  was not already at target, the setpoint did not just move — are both trivially true on
-  the first poll after a restart, when there is no earlier reading to compare against.
-  A warm tub sitting above a parked setpoint was read as an arrival. The first reading
-  after a restart is now judged on how far above the setpoint the water actually sits:
-  ordinary overshoot is the spa having got there and still latches, several degrees is a
-  setpoint that was moved and does not.
+- **A thermostat turned down onto warm water is not the spa becoming ready**, and the dial
+  is allowed to settle before a change counts, so turning it from 38 to 39.5 no longer
+  discards the session's measurements on the way past.
 
-- **The Ready at time no longer wobbles.** It used to change frequently. It also reads in 5-minute steps,
-  since minute precision on an estimate hours away was never real.
-
-- **A schedule left far in the past no longer starts the heater.** Editing the date to
-  a past day — the only way to clear a schedule before the button existed — cleared it
-  but switched the heater on as it went.
+- **A schedule left far in the past no longer starts the heater.** Editing the date to a
+  past day — the only way to clear a schedule before the button existed — cleared it but
+  switched the heater on as it went.
 
 ### Verified
 
-- A 16.5-hour heat-up from 22.0 to 39.5 °C predicted to within **2 minutes** (0.2%).
+- A 16.5-hour heat-up from 22.0 to 39.5 °C predicted to within **2 minutes**.
+- The 2026-08-25 session — eleven hours from 24.5 °C on a 10.8 °C morning — finished
+  within **2 minutes** of its final estimate, having converged from an opening four hours
+  out.
+
+## [2026.8.2-beta]
+
+A prerelease of the above. Its changes are listed under Unreleased rather than repeated
+here.
 
 ## [2026.8.1]
 
