@@ -1429,6 +1429,13 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
             f"mspa_ambient_learning_{getattr(coordinator, 'device_id', 'unknown')}")
 
     @property
+    def entity_picture(self):
+        """No picture. MSpaSensorEntity supplies the spa's own photo, and Home Assistant
+        shows a picture in preference to an icon — so without this the thermometer icon
+        never appears and a diagnostic entity is illustrated with a hot tub."""
+        return None
+
+    @property
     def native_value(self):
         """The factor now applied to the near-target band, or None without a weather
         source to apply it from."""
