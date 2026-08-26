@@ -262,6 +262,20 @@ class HeatPredictor:
 # leave-one-out result is unchanged by construction, not by argument.
 SHADOW_BOUNDS = (20.0, 30.0, 37.0)
 
+# A band's measurement is only worth applying where the journey it is asked to predict is
+# comparable to the journey it measured. Session B of the recorded set enters at 29.0, so
+# its first band is a single degree: unguarded, a ratio of 2.48 measured over that degree
+# gets applied to the nine and a half remaining, and a later factor of 0.37 is needed to
+# undo it. Four is the ratio at which the recordings stop benefiting.
+MAX_AMPLIFICATION = 4.0
+
+# How far the curve may drift from the rates the session opened with, cumulatively. Inert
+# across all five recorded sessions — the largest cumulative drift is 1.32 — so this is a
+# guard against data nobody has seen yet rather than a tuning parameter. Applied to the
+# cumulative deviation, not to each step, so a large factor that is bringing the curve
+# back toward its seed is never blocked.
+SHADOW_FACTOR_MIN, SHADOW_FACTOR_MAX = 0.5, 2.0
+
 # The hot bucket learns over 37–39 and is then used for everything above 37.
 #
 # Left unbounded it absorbed the 39–40 tail, where a session with a 40 °C setpoint
@@ -401,6 +415,66 @@ class ShadowPlan:
                 total += span / rate * 60.0
         return total
 
+    def _rescale(self, frm, frm_when, to, to_when):
+        """Scale the curve by how wrong the band just completed turned out to be.
+
+        Actual minutes against planned minutes, over the identical temperature span.
+
+        Re-anchoring alone resets the clock but keeps the opening rates, so arriving
+        early buys only the time already saved while everything ahead stays priced at
+        rates that have just been shown to be wrong. On 2026-08-25 that left the estimate
+        192 minutes out at the first revision and 84 at the second, on a session that
+        finished 243 minutes before its opening plan.
+
+        This is not the recalibration the class docstring above rejects, and the
+        difference is the measurement rather than the idea. That one compared a rate
+        measured over a fixed span *into* the band just entered against that band's
+        chord: a degree, quantised by 0.5 °C reporting to roughly +/-50%, and compared
+        against a chord that is exact only over a full traverse — so it found differences
+        that were arithmetically real and physically meaningless, and oscillated. This
+        compares elapsed minutes against planned minutes over the same span, which is
+        like for like at any width, and measures over a whole band rather than a degree.
+
+        Simulated over the five recorded sessions in analysis/shadow_recalibrate.py,
+        against what the card did before:
+
+                                       whole   last 90   finish
+            re-anchor only            62.5 m    15.1 m    2.5 m
+            with this rescaling       43.4 m    13.5 m    2.5 m
+
+        The worst first-revision error falls from 192 minutes to 57. Sessions whose
+        opening estimate was already close come out slightly worse at the first revision
+        — A from -11 to -26, C from -33 to -47 — which is the expected trade and the
+        reason the whole-session figure is the one to read.
+
+        Scaling from the band just finished rather than from the whole session so far is
+        deliberate. Cumulative scored marginally better overall (42.6 against 43.4), but
+        it lost on the one session where the weather actually moved during the run — the
+        eleven-hour 25 August heat-up, from a 10.8 °C morning into a warm afternoon —
+        because averaging across the session dilutes exactly the evidence that matters.
+        The band just finished is the closest thing to current conditions the card has.
+        """
+        # start_time is optional, so a plan built without one has no clock to measure
+        # from until its first band edge. Nothing to rescale by; re-anchoring still
+        # happens, and the next band has a real entry time.
+        if frm_when is None or to_when is None:
+            return
+        planned = self.minutes(frm, to)
+        actual = (to_when - frm_when).total_seconds() / 60.0
+        measured = to - frm
+        if not planned or planned <= 0 or actual <= 0 or measured <= 0:
+            return
+        if (self.target - to) / measured > MAX_AMPLIFICATION:
+            return
+        factor = planned / actual
+        # Clamped on the cumulative deviation from the seeded curve, never per step.
+        cumulative = (self.rates[0] / self._base[0]) * factor if self._base[0] else factor
+        if cumulative > SHADOW_FACTOR_MAX:
+            factor *= SHADOW_FACTOR_MAX / cumulative
+        elif cumulative < SHADOW_FACTOR_MIN:
+            factor *= SHADOW_FACTOR_MIN / cumulative
+        self.rates = [r * factor if r else r for r in self.rates]
+
     def crossing(self, temp, when):
         """Feed one reported-temperature change. True when the estimate was revised.
 
@@ -443,6 +517,7 @@ class ShadowPlan:
         if (self._band_entry is not None
                 and temp > self._band_entry[0]
                 and any(abs(temp - b) < 1e-9 for b in self.bounds)):
+            self._rescale(self._band_entry[0], self._band_entry[1], temp, when)
             self._band_entry = (temp, when)
             mins = self.minutes(temp, self.target)
             if mins is not None:

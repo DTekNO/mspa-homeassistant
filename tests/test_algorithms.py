@@ -469,10 +469,18 @@ class TestShadowPlan:
 
     _T0 = datetime(2026, 8, 14, 4, 0, tzinfo=timezone.utc)
 
-    def _plan(self, start=33.0, target=39.5, opening_min=426):
+    def _plan(self, start=33.0, target=39.5, opening_min=426, start_time=True):
+        """A plan with a real start_time, so the rescaling path is exercised.
+
+        It was built without one, which left _band_entry with no clock — so every
+        rescaling returned before it did anything and this whole class was blind to that
+        half of crossing(). Pass start_time=False for the case a caller really does omit
+        it, which must still re-anchor.
+        """
         from custom_components.mspa.predictor import ShadowPlan
         return ShadowPlan((1.10, 0.99, 0.79), start, target,
-                          self._T0 + timedelta(minutes=opening_min))
+                          self._T0 + timedelta(minutes=opening_min),
+                          start_time=self._T0 if start_time else None)
 
     def _feed(self, plan, steps):
         """steps: (minutes since start, temperature)."""
@@ -531,19 +539,63 @@ class TestShadowPlan:
         assert p.revisions == 0
         assert p.eta == self._T0 + timedelta(minutes=560)
 
-    def test_the_rates_never_move_during_a_session(self):
-        """A revision at an edge is a re-anchor, not a recalibration. The elapsed time to
-        that exact temperature is fact; the bands ahead keep what the session opened
-        with, because nothing measured says anything about a band not yet entered.
+    def test_a_completed_band_rescales_the_curve(self):
+        """A revision at an edge re-anchors *and* rescales, by how wrong the band just
+        finished turned out to be: planned minutes over actual minutes, across the same
+        temperature span.
 
-        Tested two ways over five recorded sessions: scaling only the next band by the
-        observed ratio oscillates, and one session-wide condition factor takes the worst
-        error from 39 minutes to between 75 and 110."""
+        This class used to assert the opposite — that the rates never move — and gave the
+        recorded evidence for it. That evidence was against a different measurement: a
+        rate taken over a fixed span *into* the band just entered, compared against that
+        band's chord. A degree at 0.5 °C reporting is worth about +/-50%, and a chord is
+        exact only over a full traverse, so the comparison oscillated. Comparing elapsed
+        against planned over one identical span is like for like, and measured over a
+        whole band. Re-simulated over five sessions in analysis/shadow_recalibrate.py it
+        takes the whole-session error from 62.5 to 43.4 minutes and the worst
+        first-revision error from 192 to 57.
+
+        Note this test could not have failed before: _plan built its ShadowPlan without a
+        start_time, so there was no clock to measure a band against and every rescaling
+        returned before doing anything.
+        """
         p = self._plan(start=30.0, opening_min=560)
         before = list(p.rates)
-        self._feed(p, [(120, 31.0), (300, 34.0), (520, 37.0), (600, 38.5), (660, 39.0)])
-        assert p.revisions >= 2                      # the 37.0 edge and the final look
+        planned = p.minutes(30.0, 37.0)
+        self._feed(p, [(120, 31.0), (300, 34.0), (520, 37.0)])
+        assert p.revisions == 1
+        # 520 minutes actually taken against whatever the curve had predicted.
+        factor = planned / 520.0
+        assert p.rates == pytest.approx([r * factor for r in before])
+
+    def test_a_band_run_slower_than_planned_slows_the_curve(self):
+        """The correction is signed, not a one-way optimism."""
+        p = self._plan(start=30.0, opening_min=560)
+        planned = p.minutes(30.0, 37.0)
+        self._feed(p, [(int(planned * 2), 37.0)])
+        assert p.rates[0] < 1.10, "a band that took twice as long must slow the curve"
+
+    def test_a_band_too_short_to_trust_is_not_applied(self):
+        """The amplification guard: a measurement is worth applying only where the
+        journey ahead is comparable to the journey measured.
+
+        A session entering just below a boundary measures one degree and would apply it
+        to the nine remaining. In the recorded set that is session B, where an unguarded
+        ratio of 2.48 needed a later 0.37 to undo it.
+        """
+        p = self._plan(start=29.0, opening_min=620)
+        before = list(p.rates)
+        self._feed(p, [(20, 30.0)])                  # one degree, nine and a half to go
+        assert p.rates == before, "a one-degree band must not rescale the whole curve"
+        assert p.revisions == 1, "but the re-anchor still happens"
+
+    def test_without_a_start_time_it_still_re_anchors(self):
+        """A plan built with no clock has nothing to measure its first band against, and
+        must degrade to the old behaviour rather than fail."""
+        p = self._plan(start=30.0, opening_min=560, start_time=False)
+        before = list(p.rates)
+        self._feed(p, [(520, 37.0)])
         assert p.rates == before
+        assert p.revisions == 1
 
     def test_each_edge_revises_once(self):
         p = self._plan(start=29.0, opening_min=700)
@@ -588,12 +640,31 @@ class TestShadowPlan:
         self._feed(p, [(200, 37.0), (230, 38.0)])   # 1.0 °C in 30 min = 2.0 °C/h
         assert p.eta < self._T0 + timedelta(minutes=426)
 
-    def test_an_impossible_reading_cannot_distort_the_curve(self):
-        """There is no drift clamp any more because there is no drift: a physically
-        impossible crossing moves the anchor and nothing else."""
+    def test_an_impossible_reading_between_edges_changes_nothing(self):
+        """Only a band edge rescales, so a wild reading part-way through a band cannot.
+
+        The curve is still rescaled at the 37.0 edge by the band that genuinely completed
+        — that is the point of the change — but the 12 °C/h step above it touches nothing.
+        """
         p = self._plan()
-        self._feed(p, [(200, 37.0), (205, 38.0)])   # 12 °C/h, physically impossible
-        assert p.rates == [1.10, 1.10, 0.99, 0.79]
+        self._feed(p, [(200, 37.0)])
+        settled = list(p.rates)
+        self._feed(p, [(205, 38.0)])                # 12 °C/h, physically impossible
+        assert p.rates == settled
+
+    def test_the_curve_cannot_drift_without_limit(self):
+        """A cumulative clamp, not a per-step one, so a factor bringing the curve back
+        toward its seed is never blocked. Inert on all five recorded sessions — the
+        largest cumulative drift there is 1.32 — so this guards against data not yet
+        seen."""
+        from custom_components.mspa.predictor import (
+            SHADOW_FACTOR_MAX, SHADOW_FACTOR_MIN)
+        p = self._plan(start=30.0, opening_min=560)
+        seed = list(p.rates)
+        self._feed(p, [(1, 37.0)])                  # seven degrees in a minute
+        drift = p.rates[0] / seed[0]
+        assert drift <= SHADOW_FACTOR_MAX + 1e-9, f"drifted {drift:.2f}"
+        assert drift >= SHADOW_FACTOR_MIN - 1e-9
 
     def test_the_final_half_degree_gets_a_look(self):
         p = self._plan()
