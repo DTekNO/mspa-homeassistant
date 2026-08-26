@@ -159,6 +159,24 @@ class MSpaSensor(MSpaSensorEntity):
             self._attr_entity_registry_enabled_default = False
 
     @property
+    def entity_picture(self):
+        """The spa's photo, for a picture card showing the temperature over it.
+
+        The second of only two entities to carry one — climate is the other. It has to
+        be `entity_picture` rather than an attribute of our own naming, because that is
+        the key the picture cards read; the cost is that Home Assistant renders it in
+        preference to the icon, so this row of the device panel shows the photo. That is
+        an easy trade here: the entity is diagnostic and disabled by default, so the row
+        is only present for someone who went looking for it.
+
+        Guarded on the key so that a future addition to SENSOR_TYPES does not silently
+        inherit a photograph of a hot tub.
+        """
+        if self._key != "water_temperature":
+            return None
+        return getattr(self.coordinator, "product_pic_url", None)
+
+    @property
     def native_value(self):
         return self.coordinator._last_data.get(self._key)
 

@@ -47,9 +47,11 @@ class MSpaBaseEntity:
     # device panel with the same photograph of the spa, leaving nothing to tell the rows
     # apart.
     #
-    # The climate entity declares its own, because `entity_picture` is the key the
-    # picture cards read and there has to be one entity they can be pointed at. One row
-    # of the panel trades its icon for the photo; the rest keep theirs.
+    # Two entities declare their own, because `entity_picture` is the key the picture
+    # cards read and there has to be something they can be pointed at: climate, and the
+    # water temperature sensor (a picture card with the reading in the footer, as the
+    # MSpa Link app shows it). Those two rows trade their icon for the photo; the rest
+    # keep theirs.
 
     @property
     def available(self):

@@ -48,26 +48,30 @@ def test_no_undefined_names_anywhere_in_the_integration():
     )
 
 
-def test_entity_picture_is_declared_on_exactly_one_entity():
-    """Only the climate entity may carry entity_picture.
+def test_entity_picture_is_declared_only_where_intended():
+    """Only the climate and water-temperature entities may carry entity_picture.
 
     Home Assistant renders a picture in preference to an icon, so an entity_picture on
     MSpaBaseEntity puts the same photograph of the spa on every row of the device panel
     and there is nothing left to tell the rows apart. But the key cannot simply be
-    dropped either: `entity_picture` is what the picture cards read, so one entity has to
-    declare it. Climate is that entity — it is the spa itself.
+    dropped either: `entity_picture` is what the picture cards read, so the entities a
+    card would be pointed at have to declare it — climate (the spa itself) and water
+    temperature (a picture card with the reading in the footer, as the MSpa Link app
+    shows it). Water temperature is diagnostic and off by default, so its row is only
+    present for someone who went looking.
 
-    This guards both directions: a re-inherited picture, and a picture removed so
-    thoroughly that no card can be pointed at anything.
+    This guards both directions: a picture creeping back onto the shared base class, and
+    a picture removed so thoroughly that no card can be pointed at anything.
     """
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1] / "custom_components" / "mspa"
-    declaring = sorted(
-        path.name
+    counts = {
+        path.name: path.read_text(encoding="utf-8").count("def entity_picture")
         for path in root.glob("*.py")
-        if "def entity_picture" in path.read_text(encoding="utf-8")
-    )
-    assert declaring == ["climate.py"], (
-        f"entity_picture should be declared only in climate.py, found: {declaring}"
+    }
+    declaring = {name: n for name, n in counts.items() if n}
+    assert declaring == {"climate.py": 1, "sensor.py": 1}, (
+        "entity_picture should be declared once in climate.py and once in sensor.py "
+        f"(water temperature), found: {declaring}"
     )
