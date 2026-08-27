@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `physical_model_test` and `mean_abs_error_newton_min`, alongside the shipping model's
   error over the same sessions.
 
+  Because the heater's power is already known — you set it for the energy sensors, and
+  heating rates are only ever learned in full-heat mode, so it is unambiguously the
+  mode-3 figure — the fit also implies your tub's **effective volume in litres** and how
+  fast it loses heat in watts per °C. Both appear under `implied_tub`. The volume is
+  derived and never entered: that is the point of it, because a fit that implies 900
+  litres for a 600-litre spa has something wrong with it that no amount of curve-fitting
+  would reveal.
+
   It needs weeks of heat-ups before it says anything. `sessions_compared_newton` is
   reported next to the error so it is clear how much evidence is behind it.
 

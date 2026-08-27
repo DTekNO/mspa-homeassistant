@@ -23,6 +23,7 @@ from custom_components.mspa.predictor import (
     newton_fit,
     newton_free_fit,
     newton_heating_minutes,
+    physical_constants,
 )
 
 
@@ -225,3 +226,66 @@ class TestTheRetrospectiveIsRecorded:
         assert set(params) == {"tau_h", "asymptote_lift_c", "n"}
         assert params["tau_h"] == pytest.approx(TAU, rel=0.02)
         assert _newton_params(None) is None
+
+
+class TestTheSpecMakesItCheckable:
+    """`P/C` is fitted and `P` is known, so `C` follows — and an equivalent volume that
+    can be held against the nameplate. That is a second falsification test alongside the
+    equal-and-opposite one, and it costs nothing to compute."""
+
+    def test_it_recovers_a_known_tub(self):
+        """A 2 kW heater in 950 litres losing 44 W/K is roughly what this spa's own
+        statistics imply. Shown exactly that, the derivation must return it."""
+        litres, power, loss_w_per_k = 950.0, 2000.0, 44.0
+        heat_capacity = litres * 4186.0                       # J/K
+        tau = heat_capacity / loss_w_per_k / 3600.0           # h
+        lift = power / loss_w_per_k                           # °C above air
+        rows = _traverses(n=60, noise=0.01, tau=tau, lift=lift)
+        phys = physical_constants(newton_fit(rows), power)
+        assert phys["equivalent_litres"] == pytest.approx(litres, rel=0.03)
+        assert phys["loss_w_per_k"] == pytest.approx(loss_w_per_k, rel=0.03)
+        assert phys["standing_loss_w_at_20c_gap"] == pytest.approx(880.0, rel=0.03)
+
+    def test_the_volume_is_derived_and_never_supplied(self):
+        """The whole value of the number is that it is independent. Nothing in the
+        signature accepts a measured volume, so a wrong one cannot reach a prediction."""
+        import inspect
+        assert set(inspect.signature(physical_constants).parameters) == {
+            "fit", "heater_power_w"}
+
+    def test_a_wrong_model_shows_up_as_a_wrong_tub(self):
+        """The point of the check. A spa whose losses are twice what the law assumes
+        fits fine on its own terms, and gives itself away on the volume."""
+        rows = _traverses(n=60, noise=0.01, tau=12.0, lift=LIFT)
+        phys = physical_constants(newton_fit(rows), 2000.0)
+        assert phys["equivalent_litres"] < 600, (
+            "half the time constant at the same lift is half the tub — if this reads "
+            "plausible, the check is not checking anything")
+
+    def test_no_power_means_no_derivation(self):
+        fit = newton_fit(_traverses(noise=0.02))
+        assert physical_constants(fit, None) is None
+        assert physical_constants(fit, 0) is None
+        assert physical_constants(None, 2000) is None
+
+    def test_the_uncertainty_travels_with_it(self):
+        """The intercept is the line extrapolated back to a zero water/air gap, about
+        twenty degrees outside anything ever observed, so it is the worse-determined of
+        the two parameters and the volume inherits that."""
+        noisy = physical_constants(newton_fit(_traverses(n=60, noise=0.08, seed=2)), 2000.0)
+        clean = physical_constants(newton_fit(_traverses(n=60, noise=0.01, seed=2)), 2000.0)
+        assert noisy["equivalent_litres_se"] > 4 * clean["equivalent_litres_se"]
+
+    def test_the_rated_power_is_the_full_heat_figure(self):
+        """Rates are only ever learned while heat_state == 3, so the pre-heat rating
+        never applies. Guarded because the two are separate config options and picking
+        the wrong one would scale every derived volume by 4/3."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.config_entry = type("E", (), {"options": {"heater_power_heat": 1800,
+                                                    "heater_power_preheat": 1500}})()
+        assert c.heater_power_heat_w == 1800
+        c.config_entry = type("E", (), {"options": {}})()
+        assert c.heater_power_heat_w == 2000        # DEFAULT_HEATER_POWER_HEAT
+        c.config_entry = type("E", (), {"options": {"heater_power_heat": 0}})()
+        assert c.heater_power_heat_w == 2000, "a zero rating must not divide by zero"

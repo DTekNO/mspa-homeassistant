@@ -1519,9 +1519,24 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
                 "rate_at_zero_gap": round(fit["rate_at_zero_gap"], 4),
                 "slope_per_deg": round(fit["slope_per_deg"], 5),
                 "slope_se": _r(fit["slope_se"], 5),
+                "rate_at_zero_gap_se": _r(fit["rate_at_zero_gap_se"], 4),
                 "gap_mean": round(fit["gap_mean"], 1),
                 "gap_sd": round(fit["gap_sd"], 2),
                 "rms": _r(fit["rms"], 4),
+            }
+        # What the fit implies about the tub itself, now that the heater's power is
+        # known rather than fitted. The equivalent volume is the check: it is derived
+        # from the fit and never supplied, so holding it against the nameplate is a
+        # second, independent way for the model to be caught being wrong.
+        phys = c.physical_constants()
+        if phys:
+            out["implied_tub"] = {
+                "heater_power_w": round(phys["heater_power_w"]),
+                "equivalent_litres": round(phys["equivalent_litres"]),
+                "equivalent_litres_se": _r(phys["equivalent_litres_se"], 0),
+                "loss_w_per_k": round(phys["loss_w_per_k"], 1),
+                "standing_loss_w_at_20c_gap": round(
+                    phys["standing_loss_w_at_20c_gap"]),
             }
         free = c.newton_free_fit()
         if free:

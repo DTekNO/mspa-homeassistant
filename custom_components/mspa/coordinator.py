@@ -15,6 +15,7 @@ from .predictor import (
     newton_fit,
     newton_free_fit,
     newton_heating_minutes,
+    physical_constants,
 )
 
 from typing import Any, Dict
@@ -33,6 +34,7 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_AMBIENT_CORRECTION,
     DEFAULT_AMBIENT_CORRECTION,
+    DEFAULT_HEATER_POWER_HEAT,
     DOMAIN,
     DEFAULT_SCAN_INTERVAL,
     IDLE_SCAN_INTERVAL,
@@ -1608,6 +1610,24 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     def newton_free_fit(self) -> dict | None:
         """Water and air regressed separately — the coefficients the law constrains."""
         return newton_free_fit(self._band_observations)
+
+    @property
+    def heater_power_heat_w(self) -> int:
+        """Rated heater power in full-heat mode, as configured for the energy sensors.
+
+        Unambiguously the mode-3 figure and not the pre-heat one, because rates are only
+        ever learned while `heat_state == 3` — `_track_heating_rate` samples nothing else.
+        """
+        opts = getattr(getattr(self, "config_entry", None), "options", None) or {}
+        try:
+            value = int(opts.get("heater_power_heat", DEFAULT_HEATER_POWER_HEAT))
+        except (TypeError, ValueError):
+            return DEFAULT_HEATER_POWER_HEAT
+        return value if value > 0 else DEFAULT_HEATER_POWER_HEAT
+
+    def physical_constants(self) -> dict | None:
+        """Thermal mass and loss coefficient implied by the fit and the rated power."""
+        return physical_constants(self.newton_fit(), self.heater_power_heat_w)
 
     def newton_minutes(self, from_temp, to_temp, *, ambient=None) -> float | None:
         """What the physical model would predict for this span, or None if it cannot.

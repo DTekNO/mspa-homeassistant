@@ -734,8 +734,13 @@ def newton_fit(observations):
         resid = [r - (intercept + slope * g) for g, r in zip(gaps, rates)]
         rms = (sum(e * e for e in resid) / (n - 2)) ** 0.5
         se_slope = rms / (sgg ** 0.5)
+        # The intercept carries the thermal mass, so its uncertainty is the one that
+        # matters for the volume check below — and it is the worse of the two, because
+        # the intercept is the line extrapolated back to a zero water/air gap, which is
+        # about twenty degrees outside anything ever observed.
+        se_intercept = rms * ((1.0 / n) + mean_g * mean_g / sgg) ** 0.5
     else:
-        rms = se_slope = None
+        rms = se_slope = se_intercept = None
     return {
         "n": n,
         "tau_h": tau_h,
@@ -743,9 +748,63 @@ def newton_fit(observations):
         "rate_at_zero_gap": intercept,
         "slope_per_deg": slope,
         "slope_se": se_slope,
+        "rate_at_zero_gap_se": se_intercept,
         "gap_mean": mean_g,
         "gap_sd": gap_sd,
         "rms": rms,
+    }
+
+
+# Water, near enough. The spa also has to warm its shell, its liner, the water standing
+# in the pipes and the inner face of the cover, so what the fit measures is an *effective*
+# thermal mass and reads a little above the nameplate volume. That is the expected
+# direction, and it is why the check below is a sanity check rather than a calibration.
+WATER_SPECIFIC_HEAT_J_PER_KG_K = 4186.0
+
+
+def physical_constants(fit, heater_power_w):
+    """Thermal mass and loss coefficient, from the fit and the heater's rated power.
+
+    This is the part the spa spec makes checkable. `P/C` is fitted, `P` is known — it is
+    configured for the energy sensors and, because rates are only ever learned in
+    full-heat mode, it is unambiguously the mode-3 figure rather than the pre-heat one.
+    So `C` follows, and with it an equivalent volume that can be held against the
+    nameplate.
+
+    **The volume is derived, never supplied.** Asking an owner to measure their tub would
+    put a calibration error straight into every prediction, and the whole value of the
+    number is that it is an independent check: a fit that implies 900 litres for a
+    600-litre spa has something wrong with it that no amount of curve-fitting will show.
+    It is a second falsification test alongside the equal-and-opposite one, and it comes
+    free.
+
+    Read it with two systematic effects in mind, both small and pushing opposite ways:
+    the effective mass includes the shell and pipework, so it reads high; and the
+    circulation pump's ~60 W goes into the water but is not counted in `P`, so it reads
+    about 3% low. Tens of percent is a finding; single digits is not.
+    """
+    if not fit or not heater_power_w or heater_power_w <= 0:
+        return None
+    rate = fit.get("rate_at_zero_gap")
+    tau_h = fit.get("tau_h")
+    if not rate or rate <= 0 or not tau_h or tau_h <= 0:
+        return None
+    # rate is °C/h, so the per-second heat capacity needs the 3600.
+    heat_capacity = 3600.0 * float(heater_power_w) / rate          # J/K
+    loss_w_per_k = heat_capacity / (tau_h * 3600.0)                # W/K
+    se = fit.get("rate_at_zero_gap_se")
+    return {
+        "heater_power_w": float(heater_power_w),
+        "thermal_mass_j_per_k": heat_capacity,
+        "equivalent_litres": heat_capacity / WATER_SPECIFIC_HEAT_J_PER_KG_K,
+        # Carried through from the intercept, which is where all of it comes from.
+        "equivalent_litres_se": (
+            None if not se else (heat_capacity / rate) * se
+            / WATER_SPECIFIC_HEAT_J_PER_KG_K),
+        "loss_w_per_k": loss_w_per_k,
+        # What the tub sheds sitting at a 20 °C gap — a January night with the water at
+        # 38. Easier to sanity-check against a power meter than a coefficient is.
+        "standing_loss_w_at_20c_gap": loss_w_per_k * 20.0,
     }
 
 
