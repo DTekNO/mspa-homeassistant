@@ -35,6 +35,7 @@ from .const import (
     CONF_AMBIENT_CORRECTION,
     DEFAULT_AMBIENT_CORRECTION,
     DEFAULT_HEATER_POWER_HEAT,
+    DEFAULT_PUMP_POWER,
     DOMAIN,
     DEFAULT_SCAN_INTERVAL,
     IDLE_SCAN_INTERVAL,
@@ -1625,9 +1626,25 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return DEFAULT_HEATER_POWER_HEAT
         return value if value > 0 else DEFAULT_HEATER_POWER_HEAT
 
+    @property
+    def pump_power_w(self) -> int:
+        """Circulation pump power, as configured for the energy sensors."""
+        opts = getattr(getattr(self, "config_entry", None), "options", None) or {}
+        try:
+            value = int(opts.get("pump_power", DEFAULT_PUMP_POWER))
+        except (TypeError, ValueError):
+            return DEFAULT_PUMP_POWER
+        return value if value >= 0 else DEFAULT_PUMP_POWER
+
     def physical_constants(self) -> dict | None:
-        """Thermal mass and loss coefficient implied by the fit and the rated power."""
-        return physical_constants(self.newton_fit(), self.heater_power_heat_w)
+        """Thermal mass and loss coefficient implied by the fit and the power in.
+
+        Heater plus circulation pump, because the pump runs for the whole of every
+        traverse that can be learned from — `_ensure_pump_running` gates the heater on
+        it, and the probe only reads tub water while it circulates.
+        """
+        return physical_constants(
+            self.newton_fit(), self.heater_power_heat_w + self.pump_power_w)
 
     def newton_minutes(self, from_temp, to_temp, *, ambient=None) -> float | None:
         """What the physical model would predict for this span, or None if it cannot.

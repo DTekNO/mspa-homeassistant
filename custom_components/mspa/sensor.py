@@ -1531,7 +1531,7 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
         phys = c.physical_constants()
         if phys:
             out["implied_tub"] = {
-                "heater_power_w": round(phys["heater_power_w"]),
+                "heat_input_w": round(phys["heat_input_w"]),
                 "equivalent_litres": round(phys["equivalent_litres"]),
                 "equivalent_litres_se": _r(phys["equivalent_litres_se"], 0),
                 "loss_w_per_k": round(phys["loss_w_per_k"], 1),

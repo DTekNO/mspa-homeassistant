@@ -234,9 +234,10 @@ class TestTheSpecMakesItCheckable:
     equal-and-opposite one, and it costs nothing to compute."""
 
     def test_it_recovers_a_known_tub(self):
-        """A 2 kW heater in 950 litres losing 44 W/K is roughly what this spa's own
-        statistics imply. Shown exactly that, the derivation must return it."""
-        litres, power, loss_w_per_k = 950.0, 2000.0, 44.0
+        """2260 W into 950 litres losing 44 W/K is close to this spa: a 2200 W element
+        measured against its spec, plus the 60 W pump that runs throughout. Shown exactly
+        that, the derivation must return it."""
+        litres, power, loss_w_per_k = 950.0, 2260.0, 44.0
         heat_capacity = litres * 4186.0                       # J/K
         tau = heat_capacity / loss_w_per_k / 3600.0           # h
         lift = power / loss_w_per_k                           # °C above air
@@ -251,14 +252,14 @@ class TestTheSpecMakesItCheckable:
         signature accepts a measured volume, so a wrong one cannot reach a prediction."""
         import inspect
         assert set(inspect.signature(physical_constants).parameters) == {
-            "fit", "heater_power_w"}
+            "fit", "heat_input_w"}
 
     def test_a_wrong_model_shows_up_as_a_wrong_tub(self):
         """The point of the check. A spa whose losses are twice what the law assumes
         fits fine on its own terms, and gives itself away on the volume."""
         rows = _traverses(n=60, noise=0.01, tau=12.0, lift=LIFT)
-        phys = physical_constants(newton_fit(rows), 2000.0)
-        assert phys["equivalent_litres"] < 600, (
+        phys = physical_constants(newton_fit(rows), 2260.0)
+        assert phys["equivalent_litres"] < 700, (
             "half the time constant at the same lift is half the tub — if this reads "
             "plausible, the check is not checking anything")
 
@@ -266,14 +267,14 @@ class TestTheSpecMakesItCheckable:
         fit = newton_fit(_traverses(noise=0.02))
         assert physical_constants(fit, None) is None
         assert physical_constants(fit, 0) is None
-        assert physical_constants(None, 2000) is None
+        assert physical_constants(None, 2260) is None
 
     def test_the_uncertainty_travels_with_it(self):
         """The intercept is the line extrapolated back to a zero water/air gap, about
         twenty degrees outside anything ever observed, so it is the worse-determined of
         the two parameters and the volume inherits that."""
-        noisy = physical_constants(newton_fit(_traverses(n=60, noise=0.08, seed=2)), 2000.0)
-        clean = physical_constants(newton_fit(_traverses(n=60, noise=0.01, seed=2)), 2000.0)
+        noisy = physical_constants(newton_fit(_traverses(n=60, noise=0.08, seed=2)), 2260.0)
+        clean = physical_constants(newton_fit(_traverses(n=60, noise=0.01, seed=2)), 2260.0)
         assert noisy["equivalent_litres_se"] > 4 * clean["equivalent_litres_se"]
 
     def test_the_rated_power_is_the_full_heat_figure(self):
@@ -282,10 +283,27 @@ class TestTheSpecMakesItCheckable:
         the wrong one would scale every derived volume by 4/3."""
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         c = object.__new__(MSpaUpdateCoordinator)
-        c.config_entry = type("E", (), {"options": {"heater_power_heat": 1800,
+        c.config_entry = type("E", (), {"options": {"heater_power_heat": 2200,
                                                     "heater_power_preheat": 1500}})()
-        assert c.heater_power_heat_w == 1800
+        assert c.heater_power_heat_w == 2200
         c.config_entry = type("E", (), {"options": {}})()
         assert c.heater_power_heat_w == 2000        # DEFAULT_HEATER_POWER_HEAT
         c.config_entry = type("E", (), {"options": {"heater_power_heat": 0}})()
         assert c.heater_power_heat_w == 2000, "a zero rating must not divide by zero"
+
+    def test_the_pump_counts_because_it_runs_for_every_traverse(self):
+        """The heater is never commanded until the pump is running, and the probe only
+        reads tub water while it circulates — so no learnable traverse exists without it.
+        Its power goes into the water it is pushing: this spa's total_power sensor reads
+        2260 W while heating and never 2200."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.config_entry = type("E", (), {"options": {"heater_power_heat": 2200,
+                                                    "pump_power": 60}})()
+        c._band_observations = _traverses(n=40, noise=0.02)
+        heater_only = physical_constants(c.newton_fit(), c.heater_power_heat_w)
+        both = c.physical_constants()
+        assert both["heat_input_w"] == 2260
+        # Omitting the pump understates the input, so the tub reads about 3% small.
+        assert both["equivalent_litres"] == pytest.approx(
+            heater_only["equivalent_litres"] * 2260 / 2200, rel=1e-6)

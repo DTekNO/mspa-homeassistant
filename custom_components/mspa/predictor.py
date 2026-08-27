@@ -762,14 +762,22 @@ def newton_fit(observations):
 WATER_SPECIFIC_HEAT_J_PER_KG_K = 4186.0
 
 
-def physical_constants(fit, heater_power_w):
-    """Thermal mass and loss coefficient, from the fit and the heater's rated power.
+def physical_constants(fit, heat_input_w):
+    """Thermal mass and loss coefficient, from the fit and the power going into the water.
 
     This is the part the spa spec makes checkable. `P/C` is fitted, `P` is known — it is
     configured for the energy sensors and, because rates are only ever learned in
     full-heat mode, it is unambiguously the mode-3 figure rather than the pre-heat one.
     So `C` follows, and with it an equivalent volume that can be held against the
     nameplate.
+
+    `heat_input_w` is the heater **plus the circulation pump**, not the heater alone. The
+    pump is not incidental: the start sequence refuses to command the heater until it is
+    running, and the temperature probe only reads tub water while it circulates, so every
+    traverse that can be learned from was measured with the pump on. Its power dissipates
+    into the water it is pushing. On this spa the total_power sensor reads 2260 W while
+    heating and never 2200 — the 60 W is in the measurement whether or not it is in the
+    model, and omitting it made the derived volume read ~3% low.
 
     **The volume is derived, never supplied.** Asking an owner to measure their tub would
     put a calibration error straight into every prediction, and the whole value of the
@@ -778,23 +786,22 @@ def physical_constants(fit, heater_power_w):
     It is a second falsification test alongside the equal-and-opposite one, and it comes
     free.
 
-    Read it with two systematic effects in mind, both small and pushing opposite ways:
-    the effective mass includes the shell and pipework, so it reads high; and the
-    circulation pump's ~60 W goes into the water but is not counted in `P`, so it reads
-    about 3% low. Tens of percent is a finding; single digits is not.
+    One systematic remains, and it reads high: effective mass includes the shell, the
+    liner, the water standing in the pipes and the inner face of the cover, none of which
+    the nameplate volume counts. Tens of percent is a finding; single digits is not.
     """
-    if not fit or not heater_power_w or heater_power_w <= 0:
+    if not fit or not heat_input_w or heat_input_w <= 0:
         return None
     rate = fit.get("rate_at_zero_gap")
     tau_h = fit.get("tau_h")
     if not rate or rate <= 0 or not tau_h or tau_h <= 0:
         return None
     # rate is °C/h, so the per-second heat capacity needs the 3600.
-    heat_capacity = 3600.0 * float(heater_power_w) / rate          # J/K
+    heat_capacity = 3600.0 * float(heat_input_w) / rate            # J/K
     loss_w_per_k = heat_capacity / (tau_h * 3600.0)                # W/K
     se = fit.get("rate_at_zero_gap_se")
     return {
-        "heater_power_w": float(heater_power_w),
+        "heat_input_w": float(heat_input_w),
         "thermal_mass_j_per_k": heat_capacity,
         "equivalent_litres": heat_capacity / WATER_SPECIFIC_HEAT_J_PER_KG_K,
         # Carried through from the intercept, which is where all of it comes from.
