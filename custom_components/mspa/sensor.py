@@ -1480,14 +1480,25 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
 
     @property
     def native_value(self):
-        """The factor now applied to the near-target band, or None without a weather
-        source to apply it from."""
+        """The factor now applied to the near-target band.
+
+        1.0 rather than unknown when there is no outdoor reading, because 1.0 is what the
+        model is doing: without an ambient temperature both `ambient_rate_factor` and
+        `learned_ambient_factor` hand the rate back untouched, so no correction is being
+        applied and this can say so exactly. Unknown claimed an ignorance the integration
+        did not have, and tore a hole in a measurement statistic whose whole purpose is to
+        be watched over weeks — a gap in the history is indistinguishable from the spa
+        having been off.
+
+        `ambient_source` in the attributes separates a 1.0 with no reading behind it from
+        a 1.0 because conditions happen to sit on the baseline.
+        """
         from .predictor import ambient_rate_factor, learned_ambient_factor
         c = self.coordinator
         if c.ambient_temp is None or c.ambient_baseline is None:
-            return None
+            return 1.0
         seed = ambient_rate_factor(2, c.ambient_temp, c.ambient_baseline)
-        fits = c.band_fits()                     # empty when the user has it switched off
+        fits = c.band_fits()
         return round(learned_ambient_factor(
             c.ambient_temp, c.ambient_baseline, fits.get(2), seed), 4)
 
@@ -1497,6 +1508,10 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
         c = self.coordinator
         out = {
             "weather_entity": c.weather_entity,
+            # Where the number above came from. "now" is a live reading; anything else
+            # means the factor is 1.0 for want of one rather than by measurement, which
+            # a bare 1.0 cannot tell you.
+            "ambient_source": c.effective_ambient()[1],
             "ambient_temp_deg_c": c.ambient_temp,
             "ambient_baseline_deg_c": c.ambient_baseline,
             "observations_recorded": len(getattr(c, "_band_observations", [])),

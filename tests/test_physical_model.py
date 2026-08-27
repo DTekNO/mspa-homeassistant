@@ -1388,3 +1388,51 @@ class TestTheAmbientFallsBackRatherThanStopping:
         assert c.newton_minutes(24.0, 39.5) is not None
         c.ambient_baseline = None
         assert c.newton_minutes(24.0, 39.5) is None
+
+
+class TestNoReadingIsNotTheSameAsNoAnswer:
+    """The ambient learning sensor reported unknown whenever the weather source was down,
+    while the shadow sensors kept answering from the seasonal average. Disabling met.no
+    to test the repair notice showed the two side by side, and the inconsistency was the
+    sensor's rather than the shadow's.
+    """
+
+    def _sensor(self, *, ambient, baseline=18.41):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        from custom_components.mspa.sensor import MSpaAmbientLearningSensor
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.ambient_temp = ambient
+        c.ambient_baseline = baseline
+        c._band_stats = {}
+        c._band_observations = []
+        c._prediction_history = []
+        c.heat_rate_buckets = None
+        c.config_entry = type("E", (), {"options": {"weather_entity": "weather.home"}})()
+        s = object.__new__(MSpaAmbientLearningSensor)
+        s.coordinator = c
+        return s
+
+    def test_no_reading_reports_the_factor_actually_in_effect(self):
+        """Which is 1.0: without an ambient temperature the rate is handed back
+        untouched, so no correction is being applied and the sensor can say so."""
+        assert self._sensor(ambient=None).native_value == 1.0
+
+    def test_a_reading_still_reports_the_real_factor(self):
+        v = self._sensor(ambient=5.0).native_value
+        assert v is not None and v < 1.0, "colder than baseline must slow the rate"
+
+    def test_the_history_does_not_gain_a_hole(self):
+        """A measurement statistic meant to be watched over weeks. A gap is
+        indistinguishable from the spa having been switched off."""
+        assert self._sensor(ambient=None).native_value is not None
+        assert self._sensor(ambient=None, baseline=None).native_value is not None
+
+    def test_the_source_says_whether_the_one_was_measured(self):
+        """A bare 1.0 cannot distinguish "no reading" from "conditions sit on the
+        baseline", and those are different things to see in a chart."""
+        assert self._sensor(ambient=None).extra_state_attributes[
+            "ambient_source"] == "baseline"
+        assert self._sensor(ambient=None, baseline=None).extra_state_attributes[
+            "ambient_source"] == "none"
+        assert self._sensor(ambient=18.41).extra_state_attributes[
+            "ambient_source"] == "now"

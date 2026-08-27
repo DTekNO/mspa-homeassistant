@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Ambient learning sensor no longer goes unknown when the weather source is
+  down.** It reports 1.0, which is what is actually happening — with no outdoor reading
+  no correction is applied — and a new `ambient_source` attribute says whether that 1.0
+  was measured or is standing in for a missing reading. Going unknown claimed an
+  ignorance the integration did not have, and left a hole in a statistic meant to be
+  charted over weeks, where a gap looks the same as the spa being switched off.
+
 - **The "Adjust estimates for the outdoor temperature" option is gone.** Configuring a
   weather entity is now the whole of the decision: set one and estimates are corrected
   for the weather, leave it empty and they are not. The option was a second way of saying
