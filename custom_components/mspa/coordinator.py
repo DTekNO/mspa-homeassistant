@@ -527,6 +527,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
         if (target - start) < BIAS_MIN_DELTA_C:
             return None
+        # A session starting below the bucket learning range is not evidence about the
+        # bucket model's bias, because most of it was never priced by a bucket. The cold
+        # bucket is a chord over 20-30; a fill from 8 °C is that chord extrapolated
+        # twelve degrees past its evidence, and the ratio that comes back measures how
+        # wrong the extrapolation was, not how wrong the model is.
+        #
+        # It matters because the bias outlives the session. Folding a fill in transfers
+        # its extrapolation error to every ordinary heat-up afterwards, and the effect is
+        # one-sided in a way that depends on a bucket nobody has measured down there:
+        # across plausible cold-bucket rates the fill's ratio diverges from an ordinary
+        # cold start's by -2% to +11%, growing as the bucket rate does.
+        #
+        # This is the same idea as BIAS_MIN_DELTA_C at the other end — a session has to
+        # be one the model actually described before its error means anything.
+        if start < HEAT_BUCKET_LEARN_MIN:
+            return None
         if est <= 0 or actual <= 0:
             return None
         ratio = actual / est

@@ -578,3 +578,44 @@ class TestAFreshFillIsNotThrownAway:
         assert at_zero_gap < _MAX_HEAT_RATE
         # Water colder than the air — a real possibility for a tank filled in autumn.
         assert (lift + 6.0) / tau < _MAX_HEAT_RATE
+
+
+class TestAFillDoesNotPoisonTheBias:
+    """A fill's own prediction being wrong does not matter — nobody is watching Ready at
+    on a freshly filled spa. What would matter is the fill teaching `prediction_bias`
+    something, because the bias outlives the session and is applied to every ordinary
+    heat-up afterwards.
+    """
+
+    def _record(self, start, target=39.5, est=1800.0, actual=1530.0):
+        return {"start_temp": start, "target_temp": target,
+                "estimated_minutes": est, "actual_minutes": actual}
+
+    def test_an_ordinary_cold_start_still_teaches_the_bias(self):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        assert MSpaUpdateCoordinator._bias_ratio(self._record(22.0)) == pytest.approx(0.85)
+
+    def test_a_fill_teaches_it_nothing(self):
+        """Most of a fill was never priced by a bucket: the cold bucket is a chord over
+        20-30, and from 8 °C that chord is extrapolated twelve degrees past its evidence.
+        The ratio measures the extrapolation, not the model."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        for start in (2.0, 8.0, 15.0, 19.9):
+            assert MSpaUpdateCoordinator._bias_ratio(self._record(start)) is None
+
+    def test_the_boundary_is_the_bucket_learning_floor(self):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        from custom_components.mspa.predictor import HEAT_BUCKET_LEARN_MIN
+        assert MSpaUpdateCoordinator._bias_ratio(
+            self._record(HEAT_BUCKET_LEARN_MIN)) is not None
+        assert MSpaUpdateCoordinator._bias_ratio(
+            self._record(HEAT_BUCKET_LEARN_MIN - 0.1)) is None
+
+    def test_the_fill_is_still_recorded_and_still_scored(self):
+        """Excluded from the bias, not from the record. The session still reaches
+        prediction_history with its errors under both models, which is the comparison the
+        whole exercise exists for — and the traverses still reach the physical fit."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._bias_ratio)
+        assert "_prediction_history" not in src and "_band_observations" not in src
