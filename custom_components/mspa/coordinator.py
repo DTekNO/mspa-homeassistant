@@ -1813,7 +1813,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._window_disturbed = self._window_disturbed or self._tub_is_disturbed()
 
     def _record_band_observation(self, band, from_temp, to_temp, hours, rate,
-                                 *, usable: bool = True):
+                                 *, usable: bool = True,
+                                 bucket_learnable: bool = True):
         """Record one full band traverse, with the weather that prevailed across it.
 
         Each of these is a single clean point for the question the model currently
@@ -1846,6 +1847,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # what happened, and a run of them is how a fault shows itself — an empty
             # record would look like a spa that simply was not used.
             "usable": bool(usable),
+            # Whether a bucket was allowed to learn from it. False for a span outside
+            # 20-39 °C, which the physical model still uses — see the call site.
+            "bucket_learnable": bool(bucket_learnable),
             "disturbed": bool(self._window_disturbed),
             "band": int(band),
             "from_temp": round(float(from_temp), 2),
@@ -1862,7 +1866,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         })
         self._band_observations = (
             self._band_observations[-self._BAND_OBSERVATIONS_MAX:])
-        if usable:
+        # The per-band running fit is the *bucket* model's weather response, so it takes
+        # only spans a bucket could have learned from. A 6→20 chord belongs in the record
+        # and in the physical fit, and would misdescribe the cold bucket's sensitivity.
+        if usable and bucket_learnable:
             self._accumulate_band_stats(
                 band, float(rate), amb if amb is None else float(amb),
                 None if amb is None else water_mean - float(amb))
@@ -2100,7 +2107,23 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # Re-anchoring at 20 turns it back into an ordinary chord.
                 _left_the_band = (learning_anchor_zone(curr_temp)
                                   != learning_anchor_zone(self._rate_last_temp))
-                if _left_the_band and _in_learn_range and elapsed_hours > 0:
+                # Recorded whether or not a bucket may learn from it, and that split is
+                # deliberate. The 20 °C floor is a *bucket* constraint: the cold bucket
+                # is a flat chord over 20-30 and a span from well below it describes
+                # something else, so letting one in would distort the rate other sessions
+                # depend on. The physical model has no such problem — it regresses rate
+                # against the water/air gap, and a span starting at 6 °C is simply a
+                # measurement at a large gap, which is the observation it most wants and
+                # is least likely to get.
+                #
+                # This costs one fresh fill to get wrong. Groundwater comes in around
+                # 6 °C, so a refill climbs 14 °C below anything the archive contains, in
+                # one run, at close to constant outdoor temperature — precisely the water
+                # variation that pins `tau` and separates it from the air term. Discarding
+                # it because a bucket could not use it would throw away the best evidence
+                # this integration will ever see, and there is no second chance until the
+                # next refill.
+                if _left_the_band and elapsed_hours > 0:
                     # A whole band, entered and left at its edges, measured against the
                     # weather that prevailed while it was crossed. That is the observation
                     # a per-band ambient sensitivity has to be fitted from, and until now
@@ -2109,7 +2132,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     # start, which describes a five-hour band not at all.
                     self._record_band_observation(
                         _bi, self._rate_last_temp, curr_temp, elapsed_hours, rate,
-                        usable=bool(accepted) and not self._window_disturbed)
+                        usable=bool(accepted) and not self._window_disturbed,
+                        bucket_learnable=bool(_in_learn_range))
                 if not accepted or _left_the_band:
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono

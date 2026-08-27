@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target is unreachable — and that blank is deliberate, since a filled-in fallback would
   hide the answer. The same figures are written to the integration's storage file.
 
+  Heating stretches below 20 °C are now kept for the physical model. They are still not
+  learned from as rate buckets — that range is outside what a bucket describes — but they
+  are the most informative measurement the physical model can get, and a fresh fill from
+  groundwater is the only time most spas produce one.
+
   Internally, Ready at and the Heat schedule can now be switched between the two models
   without moving an entity: same sensors, same ids, same meaning, so nothing on a
   dashboard or in an automation would need changing if the physical model is ever

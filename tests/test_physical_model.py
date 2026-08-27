@@ -24,6 +24,7 @@ from custom_components.mspa.predictor import (
     newton_free_fit,
     newton_heating_minutes,
     physical_constants,
+    _usable_rows,
 )
 
 
@@ -493,3 +494,66 @@ class TestTheModelCanBeSwitchedWithoutMovingAnything:
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         trigger = inspect.getsource(MSpaUpdateCoordinator._check_schedule_trigger)
         assert "_compute_heating_minutes" in trigger
+
+
+class TestAFreshFillIsNotThrownAway:
+    """Groundwater comes in around 6 °C, so a refill climbs from far below anything the
+    archive holds. That run is the best evidence the physical model will ever get — a
+    large water variation at close to constant outdoor temperature, which is exactly what
+    separates `tau` from the air term — and it happens perhaps once a year.
+
+    Until 2026-08-27 it was discarded, because band observations were gated on the
+    *bucket* learning range and `in_learning_range(6, 20)` is False.
+    """
+
+    def _coord(self):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = []
+        c._band_stats = {}
+        c._window_disturbed = False
+        c._window_amb_sum = c._window_amb_n = 0
+        c._window_wind_sum = c._window_wind_n = 0
+        c.ambient_temp = 8.0
+        c.ambient_wind = 2.0
+        return c
+
+    def test_a_sub_twenty_traverse_is_recorded(self):
+        c = self._coord()
+        c._record_band_observation(0, 6.0, 20.0, 9.0, 1.55, bucket_learnable=False)
+        assert len(c._band_observations) == 1
+        row = c._band_observations[0]
+        assert row["from_temp"] == 6.0 and row["bucket_learnable"] is False
+        assert row["water_mean"] == 13.0
+        assert row["delta_mean"] == pytest.approx(5.0), "water 13 against air 8"
+
+    def test_and_the_physical_model_uses_it(self):
+        c = self._coord()
+        c._record_band_observation(0, 6.0, 20.0, 9.0, 1.55, bucket_learnable=False)
+        assert len(_usable_rows(c._band_observations)) == 1
+
+    def test_but_no_bucket_learns_from_it(self):
+        """The 20 °C floor is a bucket constraint and stays one. The cold bucket is a
+        flat chord over 20-30; a span from 6 describes something else, and letting it in
+        would distort the rate other sessions depend on."""
+        c = self._coord()
+        c._record_band_observation(0, 6.0, 20.0, 9.0, 1.55, bucket_learnable=False)
+        assert c._band_stats == {}, "the per-band weather fit must not see it"
+        c._record_band_observation(0, 20.0, 30.0, 8.0, 1.25, bucket_learnable=True)
+        assert c._band_stats, "an in-range traverse still accumulates as before"
+
+    def test_a_refill_gives_the_fit_the_spread_routine_runs_cannot(self):
+        """The point of keeping it. Band-2-only traverses all sit at water ~38, so the
+        gap varies through the weather alone and `tau` rests on the ambient moving. One
+        refill varies the water by 14 °C in a single run."""
+        routine = [{"usable": True, "rate": _rate(38.25, a), "water_mean": 38.25,
+                    "ambient_mean": a} for a in (11.0, 12.0, 13.0, 12.5, 11.5,
+                                                 13.5, 12.0, 11.0, 12.5, 13.0)]
+        assert newton_fit(routine) is None, (
+            "ten routine top-ups in settled weather determine nothing")
+        refill = routine + [
+            {"usable": True, "rate": _rate(w, 12.0), "water_mean": w,
+             "ambient_mean": 12.0}
+            for w in (13.0, 25.0, 33.5)]
+        fit = newton_fit(refill)
+        assert fit is not None and fit["tau_h"] == pytest.approx(TAU, rel=0.05)
