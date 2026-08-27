@@ -1,0 +1,6 @@
+# Everything the test suite needs. `pytest` alone is not enough: the static guard in
+# tests/test_no_undefined_names.py runs pyflakes, and without it that test used to skip
+# silently — which is how the single check protecting against a whole-platform startup
+# failure spent an entire development session switched off without anyone noticing.
+pytest>=8
+pyflakes>=3
