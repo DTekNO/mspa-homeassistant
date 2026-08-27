@@ -24,12 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `physical_model_test` and `mean_abs_error_newton_min`, alongside the shipping model's
   error over the same sessions.
 
-  Because the power going into the water is already known — you set the heater and pump
-  ratings for the energy sensors, heating rates are only ever learned in full-heat mode,
-  and the pump runs throughout every one of them — the fit also implies your tub's
+  Because the heater's power is already known — you set it for the energy sensors, and
+  heating rates are only ever learned in full-heat mode, so it is unambiguously the
+  active-heating figure rather than the pre-heat one — the fit also implies your tub's
   **effective volume in litres** and how fast it loses heat in watts per °C. Both appear
-  under `implied_tub`, and both are only as good as those ratings, so it is worth setting
-  them from your model's spec rather than leaving the defaults. The volume is
+  under `implied_tub`, and both are only as good as that rating: it passes straight
+  through, so a default left at 2000 W where the element is really 2200 W makes the tub
+  read 10% small. Worth setting from your model's spec. The volume is
   derived and never entered: that is the point of it, because a fit that implies 900
   litres for a 600-litre spa has something wrong with it that no amount of curve-fitting
   would reveal.
