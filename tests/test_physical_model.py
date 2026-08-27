@@ -1219,3 +1219,142 @@ class TestTheForecastFetchIsHardened:
         rows = c._forecast_rows_from(
             [{"datetime": "2099-01-01T02:00:00+02:00", "temperature": 5.0}], "w.x")
         assert rows[0][0].hour == 0, "must be comparable with every other row"
+
+
+class TestTheDegradedModeIsVisible:
+    """Borrowed from Better Thermostat, which flags a missing outside-temperature sensor
+    as a repair. What makes it worth having is that a degraded mode becomes visible
+    rather than silently worse.
+
+    Predictions go on working either way — the current reading, then the seasonal
+    average — so this is a warning about accuracy and never an error about function.
+    """
+
+    def _coord(self, *, weather="weather.home", entity_state="sunny", raises=False):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        created, deleted = [], []
+        state = (None if entity_state is None
+                 else type("S", (), {"state": entity_state, "attributes": {}})())
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._forecast_failed = False
+        c._forecast_failures = 0
+        c.config_entry = type("E", (), {
+            "options": {"weather_entity": weather} if weather else {},
+            "entry_id": "abc"})()
+        c.hass = type("H", (), {
+            "states": type("St", (), {"get": staticmethod(lambda e: state)})()})()
+        c._created, c._deleted = created, deleted
+
+        def fake(available, detail=""):
+            if raises:
+                raise RuntimeError("issue registry exploded")
+            (deleted if available else created).append(detail)
+        c._async_update_forecast_repair = fake
+        return c
+
+    def test_one_failure_is_not_reported(self):
+        """A weather integration is briefly unavailable at every restart. A notice that
+        appears on every reboot and clears a minute later is one people learn to
+        ignore."""
+        c = self._coord()
+        c._note_forecast_failure("weather.home", "hiccup")
+        assert c._created == []
+        assert c._forecast_failed is True, "but it is logged straight away"
+
+    def test_a_persistent_failure_is(self):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = self._coord()
+        for _ in range(MSpaUpdateCoordinator._FORECAST_FAILURES_BEFORE_REPAIR):
+            c._note_forecast_failure("weather.home", "still nothing")
+        assert len(c._created) == 1
+
+    def test_the_reason_distinguishes_the_ways_it_breaks(self):
+        """A missing entity, an unavailable one and one that simply offers no forecast
+        need different fixes, so the notice must not flatten them into one."""
+        gone = self._coord(entity_state=None)
+        for _ in range(3):
+            gone._note_forecast_failure("weather.home", "x")
+        assert "missing" in gone._created[0]
+
+        down = self._coord(entity_state="unavailable")
+        for _ in range(3):
+            down._note_forecast_failure("weather.home", "x")
+        assert "unavailable" in down._created[0]
+
+        bare = self._coord()
+        for _ in range(3):
+            bare._note_forecast_failure("weather.home", "it offers no usable forecast")
+        assert "no usable forecast" in bare._created[0]
+
+    def test_recovery_clears_it(self):
+        c = self._coord()
+        for _ in range(3):
+            c._note_forecast_failure("weather.home", "x")
+        assert c._created and not c._deleted
+        c._forecast_failures = 0
+        c._async_update_forecast_repair(True)
+        assert c._deleted, "the notice must not outlive the condition"
+
+    def test_a_broken_repair_registry_does_not_take_out_the_poll(self):
+        """The notice is the least important thing happening on this poll."""
+        c = self._coord(raises=True)
+        for _ in range(4):
+            c._note_forecast_failure("weather.home", "x")   # must not raise
+
+    def test_the_issue_is_not_offered_as_fixable(self):
+        """The fix is in the weather integration or in this integration's options. A
+        repair flow that could do neither would be worse than a plain explanation."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._async_update_forecast_repair)
+        assert "is_fixable=False" in src
+        assert "IssueSeverity.WARNING" in src, "a warning, not an error"
+
+    def test_it_is_translated_rather_than_hardcoded_english(self):
+        import json
+        from pathlib import Path
+        root = Path(__file__).parent.parent / "custom_components" / "mspa"
+        for name in ("strings.json", "translations/en.json"):
+            d = json.loads((root / name).read_text())
+            issue = d["issues"]["weather_forecast_unavailable"]
+            assert "{entity_id}" in issue["description"]
+            assert "{detail}" in issue["description"]
+            # It must say that nothing is broken, because nothing is.
+            assert "carry on working" in issue["description"]
+
+
+class TestTheAmbientFallsBackRatherThanStopping:
+    """The chain below the forecast. Each rung fails differently and the rung under it
+    is always better than nothing."""
+
+    def _coord(self, *, now=None, baseline=None):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.ambient_temp = now
+        c.ambient_baseline = baseline
+        return c
+
+    def test_the_reading_is_preferred(self):
+        assert self._coord(now=4.0, baseline=15.0).effective_ambient() == (4.0, "now")
+
+    def test_the_seasonal_average_catches_it(self):
+        assert self._coord(baseline=15.0).effective_ambient() == (15.0, "baseline")
+
+    def test_nothing_at_all_says_so(self):
+        assert self._coord().effective_ambient() == (None, "none")
+
+    def test_the_baseline_rung_exists_for_the_physical_model(self):
+        """The bucket correction works on the *deviation* from the baseline, so falling
+        back to the baseline gives a factor of exactly 1.0 — the same as no reading.
+        Newton's law needs an absolute air temperature, and with none it stops answering
+        entirely: the shadow blanks and a spa running on it falls back to buckets. This
+        is the difference between degraded and off."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = _traverses(n=40, noise=0.02)
+        c.ambient_temp = None
+        c.ambient_baseline = 12.0
+        c.heat_rate_buckets = None
+        assert c.newton_minutes(24.0, 39.5) is not None
+        c.ambient_baseline = None
+        assert c.newton_minutes(24.0, 39.5) is None

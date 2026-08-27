@@ -487,6 +487,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._forecast_rows: list = []
         self._forecast_fetched_at: float | None = None
         self._forecast_failed = False
+        self._forecast_failures = 0
         self.schedule_ambient: float | None = None
         self.schedule_ambient_kind: str | None = None
         # Which ambient the last shadow was priced with. Recorded because it changes
@@ -1737,7 +1738,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         fit = self.newton_fit()
         if fit is None:
             return None
-        amb = self.ambient_temp if ambient is None else ambient
+        # Falls back down the chain rather than to None: the physical model needs an
+        # absolute air temperature, so with none it stops answering altogether. A
+        # seasonal average keeps it roughly right instead of switching it off.
+        amb = ambient if ambient is not None else self.effective_ambient()[0]
         return newton_heating_minutes(
             from_temp, to_temp, amb, fit["tau_h"], fit["asymptote_lift_c"])
 
@@ -1779,10 +1783,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.newton_ambient_source = "now"
         if target is not None:
             live = self.live_ambient_for(plan_temp, target)
-            ambient = None
             if live is not None:
                 ambient, kind = live
                 self.newton_ambient_source = f"forecast_{kind}"
+            else:
+                ambient, self.newton_ambient_source = self.effective_ambient()
             minutes = self.newton_minutes(plan_temp, target, ambient=ambient)
             if minutes is not None:
                 self.newton_ready_at = (
@@ -1853,23 +1858,92 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._forecast_rows = rows
             self.forecast_resolution = resolution
             if rows:
+                self._forecast_failures = 0
                 if self._forecast_failed:
                     self._forecast_failed = False
                     _LOGGER.info("Forecast available again from %s (%d %s entries)",
                                  entity_id, len(rows), resolution)
-            elif not self._forecast_failed:
-                self._forecast_failed = True
-                _LOGGER.info(
-                    "No usable forecast from %s — planning from the current outdoor "
-                    "temperature instead", entity_id)
+                self._async_update_forecast_repair(True)
+            else:
+                self._note_forecast_failure(
+                    entity_id, "it offers no usable forecast")
         except Exception as err:                              # noqa: BLE001
             # Deliberately broad: this is an optional refinement, and no failure of it
             # may take out a schedule that worked perfectly well without it.
-            if not self._forecast_failed:
-                self._forecast_failed = True
-                _LOGGER.info(
-                    "Forecast unavailable from %s (%s) — planning from the current "
-                    "outdoor temperature instead", entity_id, err)
+            self._note_forecast_failure(entity_id, str(err))
+
+    # How many consecutive failures before the user is told.
+    #
+    # Not one. A weather integration is briefly unavailable at every Home Assistant
+    # restart, and a repair notice that appears on every reboot and clears a minute
+    # later is one people learn to ignore — which costs more than it saves, because the
+    # notice only matters when the condition persists. At a half-hour refresh this is an
+    # hour and a half of genuinely missing weather.
+    _FORECAST_FAILURES_BEFORE_REPAIR = 3
+    _REPAIR_FORECAST = "weather_forecast_unavailable"
+
+    def _note_forecast_failure(self, entity_id, detail) -> None:
+        """One failed refresh: log the first, raise the repair once it persists."""
+        self._forecast_failures = getattr(self, "_forecast_failures", 0) + 1
+        if not self._forecast_failed:
+            self._forecast_failed = True
+            _LOGGER.info(
+                "No usable forecast from %s (%s) — planning from the current outdoor "
+                "temperature instead", entity_id, detail)
+        if self._forecast_failures < self._FORECAST_FAILURES_BEFORE_REPAIR:
+            return
+        # Guarded here as well as inside the repair call, and for a specific reason:
+        # this method is invoked from `_refresh_forecast`'s own except handler, so an
+        # exception raised here escapes into `_async_update_data`, becomes an update
+        # failure, and takes every entity of this integration unavailable at once. A
+        # repair notice is the least important thing happening on the poll.
+        try:
+            state = self.hass.states.get(entity_id) if entity_id else None
+            self._async_update_forecast_repair(
+                False,
+                "no weather entity is configured" if not entity_id
+                else "the entity is missing" if state is None
+                else f"the entity is {state.state}"
+                if state.state in ("unknown", "unavailable") else detail)
+        except Exception as err:                              # noqa: BLE001
+            _LOGGER.debug("Could not raise the forecast repair issue: %s", err)
+
+    def _async_update_forecast_repair(self, available: bool, detail: str = "") -> None:
+        """Raise or clear a repair issue about the weather source.
+
+        The idea is borrowed from Better Thermostat, which flags a missing outside
+        temperature sensor the same way. What makes it worth having is that a degraded
+        mode becomes *visible*: predictions go on working here either way — from the
+        current reading, and then from the seasonal average — so this is a warning about
+        accuracy and never an error about function.
+
+        Not fixable in place. The fix is in the weather integration or in this
+        integration's own options, and offering a repair flow that could do neither
+        would be worse than a plain explanation.
+        """
+        try:
+            from homeassistant.helpers import issue_registry as ir
+        except ImportError:                                   # pragma: no cover
+            return
+        entry = getattr(self, "config_entry", None)
+        issue_id = f"{self._REPAIR_FORECAST}_{getattr(entry, 'entry_id', 'mspa')}"
+        try:
+            if available:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+                return
+            ir.async_create_issue(
+                self.hass, DOMAIN, issue_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=self._REPAIR_FORECAST,
+                translation_placeholders={
+                    "entity_id": self.weather_entity or "unknown",
+                    "detail": detail or "no forecast data",
+                },
+            )
+        except Exception as err:                              # noqa: BLE001
+            # A repair notice failing must never take out a poll.
+            _LOGGER.debug("Could not update the forecast repair issue: %s", err)
 
     # Preference order. Hourly is what the maths wants; the others are what some
     # integrations have. A daily entry still says more about tomorrow morning than this
@@ -1986,6 +2060,31 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             result = (mean, kind)
             minutes = self.heating_minutes(from_temp, to_temp, ambient=mean)
         return result
+
+    def effective_ambient(self):
+        """The best outdoor temperature available, and where it came from.
+
+        A chain rather than a single reading, because each rung fails differently and
+        the rung below is always better than nothing:
+
+        1. the forecast mean, handled by the callers that know their own window;
+        2. the current reading, which is what everything used before;
+        3. `ambient_baseline`, the slow seasonal EMA of the conditions this spa has
+           actually learned its rates under.
+
+        Three is worth more than it looks, and only for the physical model. The bucket
+        correction works on the *deviation* from the baseline, so falling back to the
+        baseline gives a factor of exactly 1.0 — the same as having no reading at all.
+        Newton's law needs an absolute air temperature, and with none it declines
+        entirely: the shadow goes blank and a spa running on the physical model falls
+        back to buckets. A seasonal average lets it keep answering, roughly, instead of
+        stopping. That is the difference between degraded and off.
+        """
+        if self.ambient_temp is not None:
+            return self.ambient_temp, "now"
+        if self.ambient_baseline is not None:
+            return self.ambient_baseline, "baseline"
+        return None, "none"
 
     def live_ambient_for(self, from_temp, to_temp):
         """The rolling version, for a heat-up happening now.

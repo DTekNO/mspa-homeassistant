@@ -65,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the established model holds the plan it opened with, by design, so this helps free
   heating and the experimental model rather than a schedule already running.
 
+  **A repair notice appears when the weather source stops providing what is needed.**
+  Home Assistant's Repairs page will tell you if the weather entity is missing,
+  unavailable, or offers no forecast, and say what to check. It waits for three
+  consecutive failed reads before saying anything, so a brief outage at a restart does
+  not raise one, and it clears itself when the forecast comes back. Nothing is broken
+  while it is showing: estimates fall back to the current outdoor temperature, and then
+  to the seasonal average this spa has learned its heating rates under, so they stay
+  usable and become less accurate. Borrowed from Better Thermostat, which flags a
+  missing outside-temperature sensor the same way.
+
   Heating stretches below 20 °C are now kept for the physical model. They are still not
   learned from as rate buckets — that range is outside what a bucket describes — but they
   are the most informative measurement the physical model can get, and a fresh fill from

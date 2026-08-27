@@ -65,5 +65,11 @@
         }
       }
     }
+  },
+  "issues": {
+    "weather_forecast_unavailable": {
+      "title": "MSpa cannot read a weather forecast",
+      "description": "MSpa uses the hourly forecast from `{entity_id}` to work out when to start heating for a scheduled ready time, and how long a heat-up under way still needs. Right now it cannot: {detail}.\n\nHeating and scheduling carry on working. Estimates fall back to the current outdoor temperature, and then to the seasonal average this spa has learned its heating rates under, so they stay usable but become less accurate — most noticeably for a long overnight heat-up, where the temperature at the moment of planning describes neither end of the run.\n\nTo fix it, check that the weather integration providing `{entity_id}` is working and that the entity offers a forecast. You can also choose a different weather entity, or clear it entirely, in the MSpa options. This notice clears itself once a forecast is readable again."
+    }
   }
 }
