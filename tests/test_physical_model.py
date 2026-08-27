@@ -1310,6 +1310,36 @@ class TestTheDegradedModeIsVisible:
         assert "is_fixable=False" in src
         assert "IssueSeverity.WARNING" in src, "a warning, not an error"
 
+    def test_a_failure_retries_sooner_than_a_success_refreshes(self):
+        """The two intervals answer different questions and were briefly the same one.
+        The success interval exists to avoid asking a working API more often than its
+        data changes; it has nothing to say about how soon to retry a broken one.
+
+        While a failure consumed the full half hour, three consecutive failures — the
+        point at which the user is told — took an hour and a half. Disabling a weather
+        integration therefore produced no repair notice for most of the afternoon, which
+        is how this was found.
+        """
+        import time
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator as K
+        c = self._coord()
+        c._forecast_next_at = None
+        before = time.time()
+        c._note_forecast_failure("weather.home", "down")
+        wait = c._forecast_next_at - before
+        assert wait == pytest.approx(K._FORECAST_RETRY_S, abs=2)
+        assert K._FORECAST_RETRY_S < K._FORECAST_TTL_S
+
+    def test_the_user_is_told_within_a_useful_time(self):
+        """A repair nobody sees until an hour and a half later is one they conclude is
+        broken. Three retries at the failure interval is the whole delay."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator as K
+        worst_case_s = K._FORECAST_FAILURES_BEFORE_REPAIR * K._FORECAST_RETRY_S
+        assert worst_case_s <= 20 * 60, f"{worst_case_s / 60:.0f} min is too long to wait"
+        # But not so eager that a restart blip raises one: a weather integration that is
+        # back within a couple of minutes never reaches the third attempt.
+        assert K._FORECAST_RETRY_S >= 120
+
     def test_it_is_translated_rather_than_hardcoded_english(self):
         import json
         from pathlib import Path

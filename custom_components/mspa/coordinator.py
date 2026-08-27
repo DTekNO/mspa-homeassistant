@@ -486,6 +486,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # _refresh_forecast for why this is fetched rather than read off an attribute.
         self._forecast_rows: list = []
         self._forecast_fetched_at: float | None = None
+        self._forecast_next_at: float | None = None
         self._forecast_failed = False
         self._forecast_failures = 0
         self.schedule_ambient: float | None = None
@@ -1803,9 +1804,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     dt_util.as_utc(self.scheduled_ready_at)
                     - timedelta(minutes=minutes))
 
-    # How often the forecast is re-read. The call itself is cheap — see below — but it
-    # crosses the service bus, and the data behind it only changes hourly.
+    # How often the forecast is re-read after a success. The call itself is cheap — see
+    # below — but it crosses the service bus, and the data behind it only changes hourly.
     _FORECAST_TTL_S = 1800
+    # And how soon after a *failure*, which is a different question and was briefly the
+    # same one. The success interval exists to avoid asking a working API more often than
+    # its data changes; it has nothing to say about how soon to retry a broken one. While
+    # a failure consumed the full half hour, three consecutive failures — the point at
+    # which the user is told — took an hour and a half, so disabling a weather
+    # integration produced no repair notice for most of the afternoon. Found by doing
+    # exactly that and waiting.
+    _FORECAST_RETRY_S = 300
 
     async def _refresh_forecast(self) -> None:
         """Re-read the hourly forecast from the configured weather entity.
@@ -1833,9 +1842,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self.forecast_resolution = None
             return
         now = time.time()
-        if (self._forecast_fetched_at is not None
-                and now - self._forecast_fetched_at < self._FORECAST_TTL_S):
+        if self._forecast_next_at is not None and now < self._forecast_next_at:
             return
+        # Assume success; the failure paths pull it back in to the retry interval.
+        self._forecast_next_at = now + self._FORECAST_TTL_S
         self._forecast_fetched_at = now
         try:
             rows, resolution = [], None
@@ -1885,6 +1895,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     def _note_forecast_failure(self, entity_id, detail) -> None:
         """One failed refresh: log the first, raise the repair once it persists."""
         self._forecast_failures = getattr(self, "_forecast_failures", 0) + 1
+        # Retry sooner than the success interval. See _FORECAST_RETRY_S.
+        self._forecast_next_at = time.time() + self._FORECAST_RETRY_S
         if not self._forecast_failed:
             self._forecast_failed = True
             _LOGGER.info(

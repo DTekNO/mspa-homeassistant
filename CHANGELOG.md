@@ -68,8 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **A repair notice appears when the weather source stops providing what is needed.**
   Home Assistant's Repairs page will tell you if the weather entity is missing,
   unavailable, or offers no forecast, and say what to check. It waits for three
-  consecutive failed reads before saying anything, so a brief outage at a restart does
-  not raise one, and it clears itself when the forecast comes back. Nothing is broken
+  consecutive failed reads, five minutes apart, before saying anything — so a brief
+  outage at a restart does not raise one, but a weather source that is genuinely gone is
+  reported within about a quarter of an hour. It clears itself when the forecast comes
+  back. Nothing is broken
   while it is showing: estimates fall back to the current outdoor temperature, and then
   to the seasonal average this spa has learned its heating rates under, so they stay
   usable and become less accurate. Borrowed from Better Thermostat, which flags a
