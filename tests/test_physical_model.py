@@ -772,3 +772,84 @@ class TestTheSolarConfoundIsRecorded:
         assert "condition" not in inspect.getsource(predictor.newton_fit)
         assert "condition" not in inspect.getsource(predictor.newton_free_fit)
         assert "condition" not in inspect.getsource(predictor._usable_rows)
+
+
+class TestTheTwoNumbersAreComparable:
+    """`Newton start at` is a true shadow: same question, same scheduled time, both
+    timestamps, so the pair differences directly. `Newton ready at` is not — the shipping
+    Ready at shows the *scheduled time verbatim* while a schedule is pending, and shows
+    a string like "Ready" or "11:00 +2d" rather than an estimate at all.
+
+    That asymmetry is accepted rather than fixed: the raw estimate is the useful thing to
+    watch, and dressing it up as the display sensor would hide the wandering the shadow
+    exists to expose. What is not acceptable is a side-by-side number that answers a
+    different question, which is what shipped first.
+    """
+
+    def _coord(self, *, scheduled=True):
+        from datetime import datetime, timedelta, timezone
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = []
+        c._band_stats = {}
+        c.heat_rate_buckets = [1.24, 1.095, 0.878]
+        c.ambient_baseline = 18.41
+        c.ambient_temp = 15.0
+        c.computed_heat_rate = 0.972
+        c.prediction_bias = 1.0
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c._last_data = {}
+        c.newton_ready_at = c.newton_start_at = None
+        c.newton_target_temp = c.newton_plan_temp = None
+        c.scheduled_ready_at = (datetime.now(timezone.utc) + timedelta(hours=40)
+                                if scheduled else None)
+        c.schedule_target_temp = 39.5 if scheduled else None
+        c._schedule_triggered = False
+        c.scheduling_temp = lambda: 33.5
+        return c
+
+    def test_the_span_it_aimed_at_is_recorded(self):
+        """Otherwise a Ready-at row is unreadable: the target switches between the
+        thermostat's and the schedule's depending on whether a schedule is pending."""
+        c = self._coord()
+        c._update_newton_shadow(33.5, 34.0)
+        assert c.newton_target_temp == 39.5, "a pending schedule outranks the thermostat"
+        assert c.newton_plan_temp == 33.5
+
+    def test_the_side_by_side_number_answers_the_same_question(self):
+        """The bug this replaces. `_minutes_to_target` aims at the *thermostat*, so a spa
+        holding at temperature with a schedule set for the day after reported 0 against a
+        Newton estimate of five and a half hours — and the obvious reading of that pair
+        is that the physical model is broken."""
+        from custom_components.mspa.sensor import MSpaNewtonReadyAtSensor
+        c = self._coord()
+        c._update_newton_shadow(33.5, 34.0)
+        s = object.__new__(MSpaNewtonReadyAtSensor)
+        s.coordinator = c
+        shipping = s._shipping_equivalent()
+        buckets = c._predictor().heating_minutes(33.5, 39.5)
+        assert shipping == pytest.approx(buckets, abs=0.1)
+        assert shipping > 60, "a six-degree climb is hours, not zero"
+
+    def test_it_is_absent_rather_than_wrong_when_there_is_no_span(self):
+        from custom_components.mspa.sensor import MSpaNewtonReadyAtSensor
+        c = self._coord(scheduled=False)
+        c.newton_target_temp = c.newton_plan_temp = None
+        s = object.__new__(MSpaNewtonReadyAtSensor)
+        s.coordinator = c
+        assert s._shipping_equivalent() is None
+
+    def test_the_start_times_remain_directly_differenceable(self):
+        """The half that always was comparable, and the one that scores the planner."""
+        from custom_components.mspa.sensor import MSpaNewtonStartAtSensor
+        from datetime import timezone
+        from custom_components.mspa import coordinator as mod
+        c = self._coord()
+        mod.dt_util.as_utc = lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        c._last_computed_start_at = c.scheduled_ready_at
+        c._update_newton_shadow(33.5, 34.0)
+        s = object.__new__(MSpaNewtonStartAtSensor)
+        s.coordinator = c
+        assert c.newton_start_at is not None
+        assert s._shipping_equivalent() is not None, "both are timestamps on one axis"

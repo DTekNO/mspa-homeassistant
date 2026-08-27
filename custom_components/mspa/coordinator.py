@@ -479,6 +479,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._newton_fallback_active = False
         self.newton_ready_at: datetime | None = None
         self.newton_start_at: datetime | None = None
+        self.newton_target_temp: float | None = None
+        self.newton_plan_temp: float | None = None
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.
@@ -1735,6 +1737,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         self.newton_ready_at = None
         self.newton_start_at = None
+        # The target the shadow was aiming at, and the temperature it planned from.
+        # Recorded because without them a Ready-at row cannot be read: the shipping
+        # sensor shows the *scheduled time verbatim* while a schedule is pending, so the
+        # two are not answering the same question and a reader has to be told which one
+        # this is. See _MSpaNewtonShadowSensor.
+        self.newton_target_temp = None
+        self.newton_plan_temp = None
         plan_temp = self.scheduling_temp()
         if plan_temp is None:
             plan_temp = current_temp
@@ -1747,6 +1756,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         target = current_target
         if self.scheduled_ready_at is not None and self.schedule_target_temp is not None:
             target = self.schedule_target_temp
+        self.newton_target_temp = target
+        self.newton_plan_temp = plan_temp
         if target is not None:
             minutes = self.newton_minutes(plan_temp, target)
             if minutes is not None:

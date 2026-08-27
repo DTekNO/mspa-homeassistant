@@ -1642,6 +1642,13 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
             "ambient_temp_deg_c": c.ambient_temp,
             # The asymptote in absolute terms is what decides reachability, so it is the
             # number that explains a None.
+            # What this row aimed at, and from where. A Ready-at row cannot be read
+            # without them: the target switches between the thermostat's and the
+            # schedule's depending on whether a schedule is pending, and the shipping
+            # sensor shows the scheduled time verbatim rather than an estimate — so the
+            # two are not always answering the same question.
+            "target_temp_c": c.newton_target_temp,
+            "plan_temp_c": c.newton_plan_temp,
             "asymptote_deg_c": (
                 round(c.ambient_temp + fit["asymptote_lift_c"], 1)
                 if fit and c.ambient_temp is not None else None),
@@ -1674,8 +1681,23 @@ class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
         return self.coordinator.newton_ready_at
 
     def _shipping_equivalent(self):
-        """What the bucket model says, for the same moment, in minutes from now."""
-        return _minutes_to_target(self.coordinator)
+        """The bucket model's answer to *this sensor's* question, in minutes.
+
+        Not `_minutes_to_target`, which was here first and was actively misleading: it
+        aims at the thermostat setpoint, while this sensor aims at the schedule target
+        whenever a schedule is pending. On a spa sitting at its holding temperature with
+        a schedule set for the day after, that reported 0 against a Newton estimate of
+        five and a half hours — two different questions, and the obvious reading of the
+        pair is that the physical model is broken.
+
+        Same span, same target, buckets rather than Newton. That is the only form in
+        which the two numbers may be differenced.
+        """
+        c = self.coordinator
+        from_temp, to_temp = c.newton_plan_temp, c.newton_target_temp
+        if from_temp is None or to_temp is None:
+            return None
+        return _r(c._predictor().heating_minutes(from_temp, to_temp), 1)
 
 
 class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
