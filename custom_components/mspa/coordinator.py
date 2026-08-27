@@ -2116,13 +2116,25 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # measurement at a large gap, which is the observation it most wants and
                 # is least likely to get.
                 #
-                # This costs one fresh fill to get wrong. Groundwater comes in around
-                # 6 °C, so a refill climbs 14 °C below anything the archive contains, in
-                # one run, at close to constant outdoor temperature — precisely the water
-                # variation that pins `tau` and separates it from the air term. Discarding
-                # it because a bucket could not use it would throw away the best evidence
-                # this integration will ever see, and there is no second chance until the
-                # next refill.
+                # This costs one fresh fill to get wrong, and a fill is rare — twice a
+                # year by plan on the installation this was written for, occasionally
+                # once more for water quality, and reluctantly, because it is work and it
+                # strains the well.
+                #
+                # Do not assume a fill temperature. Groundwater arrives near 6 °C, but
+                # water buffered in an uninsulated outdoor tank for a week or two
+                # equilibrates towards the air instead, so a fill can start anywhere from
+                # a couple of degrees to the middle teens — and in late autumn it may be
+                # *colder* than the well. Nothing here depends on the number; what it
+                # depends on is that the span is recorded at all.
+                #
+                # Two things make it the best evidence this integration will ever get.
+                # It varies the *water* by ten degrees or more in a single run at close
+                # to constant outdoor temperature, which is what pins `tau` and separates
+                # it from the air term. And it starts near a zero water/air gap, which is
+                # where `rate_at_zero_gap` is measured directly rather than extrapolated
+                # twenty-odd degrees beyond the data — that intercept is what carries the
+                # thermal mass, so it is also what the implied volume rests on.
                 if _left_the_band and elapsed_hours > 0:
                     # A whole band, entered and left at its edges, measured against the
                     # weather that prevailed while it was crossed. That is the observation

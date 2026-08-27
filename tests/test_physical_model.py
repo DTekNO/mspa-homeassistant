@@ -497,10 +497,17 @@ class TestTheModelCanBeSwitchedWithoutMovingAnything:
 
 
 class TestAFreshFillIsNotThrownAway:
-    """Groundwater comes in around 6 °C, so a refill climbs from far below anything the
-    archive holds. That run is the best evidence the physical model will ever get — a
-    large water variation at close to constant outdoor temperature, which is exactly what
-    separates `tau` from the air term — and it happens perhaps once a year.
+    """A refill climbs from far below anything the archive holds. That run is the best
+    evidence the physical model will ever get — a large water variation at close to
+    constant outdoor temperature, which is what separates `tau` from the air term — and
+    it happens twice a year at best, reluctantly, because it is work and it strains the
+    well.
+
+    No fill temperature is assumed anywhere. Groundwater arrives near 6 °C, but water
+    buffered in an uninsulated outdoor tank equilibrates towards the air, so a fill can
+    start anywhere from a couple of degrees to the middle teens, and in late autumn it
+    may be colder than the well. What matters is that the span is kept, not where it
+    began.
 
     Until 2026-08-27 it was discarded, because band observations were gated on the
     *bucket* learning range and `in_learning_range(6, 20)` is False.
@@ -557,3 +564,17 @@ class TestAFreshFillIsNotThrownAway:
             for w in (13.0, 25.0, 33.5)]
         fit = newton_fit(refill)
         assert fit is not None and fit["tau_h"] == pytest.approx(TAU, rel=0.05)
+
+    def test_a_fill_starting_near_air_temperature_is_still_a_plausible_rate(self):
+        """Buffered water starts near the air temperature, so the water/air gap is near
+        zero — and under the law that is where the rate is *fastest*. Worth pinning,
+        because the sampler rejects anything above _MAX_HEAT_RATE and silently dropping
+        the fastest hours of the one run that matters would be the same bug in a new
+        place. For this spa the law predicts about 2.0 °C/h at zero gap against a ceiling
+        of 3.0, and it would take water eighteen degrees *below* the air to breach it."""
+        from custom_components.mspa.coordinator import _MAX_HEAT_RATE
+        tau, lift = 25.6, 51.0
+        at_zero_gap = lift / tau
+        assert at_zero_gap < _MAX_HEAT_RATE
+        # Water colder than the air — a real possibility for a tank filled in autumn.
+        assert (lift + 6.0) / tau < _MAX_HEAT_RATE
