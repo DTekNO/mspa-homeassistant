@@ -12,6 +12,9 @@ from .predictor import (
     ambient_rate_factor,
     bucket_index,
     extrapolate_within_band,
+    newton_fit,
+    newton_free_fit,
+    newton_heating_minutes,
 )
 
 from typing import Any, Dict
@@ -230,6 +233,22 @@ def _read_weather_entity(hass: HomeAssistant, entity_id: str | None) -> tuple[fl
 def _round_or_none(value, digits: int = 1):
     """Round where there is something to round. Estimates are legitimately absent."""
     return None if value is None else round(float(value), digits)
+
+
+def _newton_params(fit):
+    """The two parameters an estimate was made with, rounded for a stored record.
+
+    Kept with the session rather than only on the sensor because the fit moves: a
+    retrospective run months later would otherwise score every past session against
+    today's parameters and learn nothing about how the model behaved at the time.
+    """
+    if not fit:
+        return None
+    return {
+        "tau_h": round(fit["tau_h"], 2),
+        "asymptote_lift_c": round(fit["asymptote_lift_c"], 2),
+        "n": fit["n"],
+    }
 
 
 def _error_against(estimate, actual_minutes):
@@ -630,6 +649,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         "estimated_minutes_learned": _round_or_none(
                             self._heating_minutes_variant(
                                 new_temp, new_target, use_fits=True)),
+                        # And the same session priced by the physical model, from the
+                        # fit as it stands before this session contributes anything to
+                        # it. None until enough traverses exist to fit, and None again
+                        # whenever the model says the target is out of reach — both are
+                        # findings, so neither is filled in with a substitute.
+                        "estimated_minutes_newton": _round_or_none(
+                            self.newton_minutes(new_temp, new_target)),
+                        # The parameters that estimate was made with, so a retrospective
+                        # can tell a model that was wrong from one that had not yet
+                        # learned anything.
+                        "newton_params": _newton_params(self.newton_fit()),
                         "ambient_correction_applied": self.ambient_correction_enabled,
                         "prediction_bias": round(self.prediction_bias, 3),
                         "session_scalar": self._session_scalar,
@@ -742,6 +772,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         actual_minutes),
                     "error_minutes_learned": _error_against(
                         self._prediction.get("estimated_minutes_learned"),
+                        actual_minutes),
+                    "error_minutes_newton": _error_against(
+                        self._prediction.get("estimated_minutes_newton"),
                         actual_minutes),
                     "end_time": datetime.now(timezone.utc).isoformat(),
                 }
@@ -1557,6 +1590,38 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Kept for reading a log by eye. Deliberately not the gate: these do not fade.
             "ambient_seen": (st["min_amb"], st["max_amb"]),
         }
+
+    # ── The physical model, measured alongside the one that ships ────────────
+    #
+    # Fitted from `_band_observations` rather than from running sums, deliberately.
+    # The rows are already persisted with everything the fit needs — water mean, ambient
+    # mean and rate per traverse — so this adds no state, no migration and no second
+    # fading scheme, and a later analysis can refit them differently without having had
+    # to decide the form in advance. Two hundred traverses is roughly a year.
+    #
+    # None of it drives a prediction. See predictor.py.
+
+    def newton_fit(self) -> dict | None:
+        """This spa's `τ` and asymptote, from every traverse recorded."""
+        return newton_fit(self._band_observations)
+
+    def newton_free_fit(self) -> dict | None:
+        """Water and air regressed separately — the coefficients the law constrains."""
+        return newton_free_fit(self._band_observations)
+
+    def newton_minutes(self, from_temp, to_temp, *, ambient=None) -> float | None:
+        """What the physical model would predict for this span, or None if it cannot.
+
+        Uses the fit as it stands *now*, so calling it when a session opens gives a
+        genuinely out-of-sample prediction: the traverses of that session have not been
+        recorded yet and cannot have informed it.
+        """
+        fit = self.newton_fit()
+        if fit is None:
+            return None
+        amb = self.ambient_temp if ambient is None else ambient
+        return newton_heating_minutes(
+            from_temp, to_temp, amb, fit["tau_h"], fit["asymptote_lift_c"])
 
     def _tub_is_disturbed(self) -> bool:
         """Whether the spa is in a state where its heating rate cannot be measured.

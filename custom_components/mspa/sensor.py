@@ -54,6 +54,12 @@ MEASUREMENT_KEYS = frozenset({
 })
 
 
+def _r(value, digits: int):
+    """Round where there is something to round. A standard error is legitimately
+    absent when there are too few observations to have one."""
+    return None if value is None else round(float(value), digits)
+
+
 def _get_option_int(config_entry, key: str, default: int) -> int:
     """Get a non-negative integer option from a config entry."""
     opts = getattr(config_entry, "options", {}) or {}
@@ -1425,6 +1431,14 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
     weather sensitivity, and so the one worth charting — with the per-band fits as
     attributes.
 
+    It also carries the physical model — Newton's law fitted to the same traverses —
+    under `physical_model` and `physical_model_test`, together with how its retrospective
+    predictions scored against the shipping ones on finished sessions. That model drives
+    nothing. It is here so that "would two parameters have beaten three buckets and a
+    weather patch" can be answered from this spa's own record rather than from the
+    statistics of a different one, which needs weeks of sessions before it means
+    anything — hence `sessions_compared_newton` reported next to the error it qualifies.
+
     The finished-session comparison is recorded in prediction_history whether or not
     this is enabled, so nothing depends on having thought to turn it on beforehand.
     """
@@ -1490,6 +1504,60 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
                 sum(abs(a) for a, _ in errs) / len(errs), 1)
             out["mean_abs_error_learned_min"] = round(
                 sum(abs(b) for _, b in errs) / len(errs), 1)
+
+        # ── The physical model, reported for comparison only ─────────────────
+        # Fitted from the same traverses, scored on the same finished sessions, and
+        # driving nothing. The question it answers is whether adopting it would have
+        # done better — which needs weeks of sessions before it means anything, hence
+        # `sessions_compared_newton` sitting next to the error it qualifies.
+        fit = c.newton_fit()
+        if fit:
+            out["physical_model"] = {
+                "n": fit["n"],
+                "tau_h": round(fit["tau_h"], 2),
+                "asymptote_lift_c": round(fit["asymptote_lift_c"], 2),
+                "rate_at_zero_gap": round(fit["rate_at_zero_gap"], 4),
+                "slope_per_deg": round(fit["slope_per_deg"], 5),
+                "slope_se": _r(fit["slope_se"], 5),
+                "gap_mean": round(fit["gap_mean"], 1),
+                "gap_sd": round(fit["gap_sd"], 2),
+                "rms": _r(fit["rms"], 4),
+            }
+        free = c.newton_free_fit()
+        if free:
+            # The falsifiable part: Newton's law requires these two to be equal and
+            # opposite. A ratio near 1.0 is the model holding; anything else is it
+            # failing, unless corr_water_air is near +/-1, in which case the split is
+            # not identified and the ratio means nothing either way.
+            out["physical_model_test"] = {
+                "n": free["n"],
+                "coef_water": round(free["coef_water"], 5),
+                "coef_air": round(free["coef_air"], 5),
+                "se_water": _r(free["se_water"], 5),
+                "se_air": _r(free["se_air"], 5),
+                "ratio": _r(free["ratio"], 3),
+                "corr_water_air": round(free["corr_water_air"], 3),
+                "identified": free["identified"],
+                "tau_from_water_h": _r(free["tau_from_water_h"], 2),
+            }
+        # The baseline is `error_minutes_biased` — what the integration actually
+        # predicted, with the user's own ambient-correction setting and the bias applied.
+        # `error_minutes_learned` would be the wrong comparison: it forces the learned
+        # weather response on regardless of the setting, so it answers a question about a
+        # variant rather than about the estimate anyone was shown.
+        nerrs = [(r.get("error_minutes_biased"), r.get("error_minutes_newton"))
+                 for r in getattr(c, "_prediction_history", [])]
+        nerrs = [(a, b) for a, b in nerrs if a is not None and b is not None]
+        if nerrs:
+            out["sessions_compared_newton"] = len(nerrs)
+            out["mean_abs_error_newton_min"] = round(
+                sum(abs(b) for _, b in nerrs) / len(nerrs), 1)
+            # Restated over the same sessions, because the two error means above are
+            # computed over different sets: a session that finished before the fit
+            # existed has a shipping error and no Newton one, and averaging across the
+            # difference would flatter whichever model joined later.
+            out["mean_abs_error_shipping_min_same_sessions"] = round(
+                sum(abs(a) for a, _ in nerrs) / len(nerrs), 1)
         return out
 
 

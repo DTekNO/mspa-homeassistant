@@ -406,6 +406,28 @@ sample-size problem, not a model problem: 34 steps over a 17 °C span with 0.1 �
 per-step noise cannot resolve the curvature, and 639 hours across a 29 °C outdoor
 range resolves it easily.
 
+### It is now instrumented on this spa
+
+Since 2026-08-27 the model is fitted live from the recorded band traverses and every
+heat-up is priced by it as well as by the buckets, so this stops being a question about
+another spa's statistics. `predictor.newton_fit` reports `tau` and the asymptotic lift,
+`predictor.newton_free_fit` runs the equal-and-opposite test with standard errors and a
+collinearity flag, and `prediction_history` carries `error_minutes_newton` beside
+`error_minutes_learned` for each finished session. All of it surfaces on the **Ambient
+learning** diagnostic sensor. Nothing drives a prediction.
+
+Two things to watch when reading it:
+
+- **`tau` will look confident long before it should.** The constrained fit regresses on
+  the water/air gap, which varies through the *water* as well as the air — three band
+  midpoints give it a 13 °C spread on a single still day. So `tau` converges early while
+  the split between the water and air terms does not. `identified` on the free fit is the
+  number that says whether the split means anything.
+- **The retrospective is out of sample by construction.** The Newton estimate is taken as
+  a session opens, from a fit that cannot yet contain that session's traverses, and the
+  parameters used are stored with the record so a later analysis can tell a model that was
+  wrong from one that had not yet learned anything.
+
 ### What is not yet settled
 
 The **current** spa gives water −0.0390 ±0.0034 against air +0.0214 ±0.0045 — a ratio

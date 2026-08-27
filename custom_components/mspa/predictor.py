@@ -645,3 +645,197 @@ class ShadowPlan:
                 revised = True
         return revised
 
+
+
+# ── The physical model, reported but not applied ─────────────────────────────
+#
+# Newton's law for a heated body losing heat in proportion to the water/air gap:
+#
+#     dT/dt = P/C − (T_water − T_air)/τ
+#
+# Two components, and they are the two things actually happening: a constant heater
+# term set by element power against thermal mass, and a loss term that grows with the
+# gap. Two *parameters* — τ and the asymptotic lift P/k = τ·P/C, which is how far above
+# air temperature this heater can hold the water. That is one fewer than the three
+# bucket constants, and rate falls linearly with water temperature, so the buckets are a
+# piecewise-constant approximation of a straight line.
+#
+# **Air temperature is not learned here, it is an input.** The law fixes its coefficient
+# at exactly minus the water coefficient, so there is no sensitivity to calibrate and no
+# reference conditions to pin. That is the whole argument for the model: it deletes
+# `AMBIENT_SENSITIVITY`, `ambient_baseline` and `learned_ambient_factor` rather than
+# fixing them. See ROADMAP, *Alternative: a physical heating model instead of buckets*.
+#
+# Nothing below drives a prediction. It is fitted from the traverses already recorded
+# and scored alongside the shipping estimate, so that "would the physical model have
+# done better" is answered by finished sessions rather than by argument. Adopting it is
+# a separate decision that this evidence is meant to inform.
+
+# The constrained fit needs enough traverses to place a line; the free fit adds a third
+# parameter and a collinearity problem, so it needs more before it says anything.
+NEWTON_MIN_N = 8
+NEWTON_FREE_MIN_N = 12
+# Below this spread in the water/air gap the slope is not determined — every observation
+# sits at effectively the same gap and the line is fitted to noise.
+NEWTON_MIN_GAP_SD = 1.0
+# Above this correlation between water and air, the free fit's two coefficients are not
+# separately determined. Reported rather than enforced — see `identified`.
+NEWTON_MAX_CORR = 0.95
+
+
+def _usable_rows(observations):
+    """Traverses that can be regressed: learned from, positive rate, weather known."""
+    rows = []
+    for r in observations or ():
+        if not r.get("usable"):
+            continue
+        rate = r.get("rate")
+        water = r.get("water_mean")
+        air = r.get("ambient_mean")
+        if rate is None or water is None or air is None or rate <= 0:
+            continue
+        rows.append((float(water), float(air), float(rate)))
+    return rows
+
+
+def newton_fit(observations):
+    """Fit `rate = P/C − gap/τ` over recorded traverses, gap being water minus air.
+
+    This is the *constrained* form: it assumes the law and reads off its parameters.
+    It cannot test itself — collapsing water and air into one regressor presupposes the
+    equal-and-opposite coefficients that `newton_free_fit` exists to check.
+
+    Returns None where the fit would be meaningless rather than returning a number
+    nobody should use: too few traverses, no spread in the gap, or a slope of the wrong
+    sign (rate rising with the gap is not a spa, it is a measurement problem).
+    """
+    rows = _usable_rows(observations)
+    n = len(rows)
+    if n < NEWTON_MIN_N:
+        return None
+    gaps = [w - a for w, a, _ in rows]
+    rates = [r for _, _, r in rows]
+    mean_g = sum(gaps) / n
+    mean_r = sum(rates) / n
+    sgg = sum((g - mean_g) ** 2 for g in gaps)
+    sgr = sum((g - mean_g) * (r - mean_r) for g, r in zip(gaps, rates))
+    gap_sd = (sgg / n) ** 0.5
+    if sgg <= 0 or gap_sd < NEWTON_MIN_GAP_SD:
+        return None
+    slope = sgr / sgg
+    if slope >= 0:
+        return None
+    intercept = mean_r - slope * mean_g
+    tau_h = -1.0 / slope
+    lift = intercept * tau_h          # P/k: the asymptote, above air temperature
+    # Residual spread, so a reader can see whether the line is describing the data or
+    # merely passing through it. Two parameters consumed.
+    if n > 2:
+        resid = [r - (intercept + slope * g) for g, r in zip(gaps, rates)]
+        rms = (sum(e * e for e in resid) / (n - 2)) ** 0.5
+        se_slope = rms / (sgg ** 0.5)
+    else:
+        rms = se_slope = None
+    return {
+        "n": n,
+        "tau_h": tau_h,
+        "asymptote_lift_c": lift,
+        "rate_at_zero_gap": intercept,
+        "slope_per_deg": slope,
+        "slope_se": se_slope,
+        "gap_mean": mean_g,
+        "gap_sd": gap_sd,
+        "rms": rms,
+    }
+
+
+def newton_free_fit(observations):
+    """Regress rate on water *and* air separately — the test the law can fail.
+
+    Newton's law predicts the two coefficients come out equal and opposite, both equal
+    to `−1/τ` and `+1/τ`. Nothing about a curve fit forces that; it either happens or the
+    model is wrong. On 639 hours from the previous spa it came out −0.0161 against
+    +0.0167, a ratio of 1.04.
+
+    The catch is collinearity: over a single heat-up the water climbs while the air does
+    whatever the afternoon does, and if they happen to move together the split between
+    the two coefficients is not identified. `corr_water_air` is reported for exactly that
+    reason — near ±1 it means the ratio is arithmetic, not evidence, however tight the
+    standard errors look.
+    """
+    rows = _usable_rows(observations)
+    n = len(rows)
+    if n < NEWTON_FREE_MIN_N:
+        return None
+    mw = sum(w for w, _, _ in rows) / n
+    ma = sum(a for _, a, _ in rows) / n
+    mr = sum(r for _, _, r in rows) / n
+    sww = saa = swa = swr = sar = 0.0
+    for w, a, r in rows:
+        dw, da, dr = w - mw, a - ma, r - mr
+        sww += dw * dw
+        saa += da * da
+        swa += dw * da
+        swr += dw * dr
+        sar += da * dr
+    det = sww * saa - swa * swa
+    # The guard has to be *relative*. Perfectly collinear water and air give a
+    # determinant that is zero in exact arithmetic and roughly 1e-9 in floating point,
+    # because it is the difference of two large products — an absolute threshold sails
+    # straight past it and returns coefficients of 1e-18 with complex standard errors.
+    if sww <= 0 or saa <= 0 or det <= 1e-9 * sww * saa:
+        return None
+    corr = swa / ((sww * saa) ** 0.5)
+    b_water = (saa * swr - swa * sar) / det
+    b_air = (sww * sar - swa * swr) / det
+    b0 = mr - b_water * mw - b_air * ma
+    resid = [r - (b0 + b_water * w + b_air * a) for w, a, r in rows]
+    dof = n - 3
+    s2 = sum(e * e for e in resid) / dof if dof > 0 else None
+    se_w = (s2 * saa / det) ** 0.5 if s2 and s2 > 0 else None
+    se_a = (s2 * sww / det) ** 0.5 if s2 and s2 > 0 else None
+    return {
+        "n": n,
+        "coef_water": b_water,
+        "coef_air": b_air,
+        "se_water": se_w,
+        "se_air": se_a,
+        # 1.0 is the law holding. Undefined rather than infinite where water has no
+        # measured effect at all, which would itself be the finding.
+        "ratio": (-b_air / b_water) if b_water < 0 else None,
+        "corr_water_air": corr,
+        # Whether the split between the two coefficients is determined at all. Past this
+        # correlation the variance inflation is an order of magnitude and the ratio is
+        # arithmetic rather than evidence, however tight the standard errors look — so it
+        # is reported as unidentified rather than withheld, because a run of unidentified
+        # fits is itself the finding that the traverses are not varied enough.
+        "identified": abs(corr) <= NEWTON_MAX_CORR,
+        "tau_from_water_h": (-1.0 / b_water) if b_water < 0 else None,
+        "rms": (s2 ** 0.5) if s2 and s2 > 0 else None,
+    }
+
+
+def newton_heating_minutes(from_temp, to_temp, ambient, tau_h, asymptote_lift_c):
+    """Minutes from `from_temp` to `to_temp` under the physical model.
+
+    Newton's law integrates in closed form — no segmentation, no buckets, no bias:
+
+        t = τ · ln((A − T_start) / (A − T_end)),   A = T_air + P/k
+
+    Returns None when the model says the target is unreachable (`A` at or below it),
+    which is a real answer and must not be silently turned into a large number: a spa
+    that cannot reach 40 °C on a January night should decline to predict rather than
+    promise a time it will miss.
+    """
+    if None in (from_temp, to_temp, ambient, tau_h, asymptote_lift_c):
+        return None
+    if tau_h <= 0 or from_temp >= to_temp:
+        return None
+    if (to_temp - from_temp) < NEAR_TARGET_BAND:
+        return 0.0
+    asymptote = ambient + asymptote_lift_c
+    if asymptote <= to_temp:
+        return None
+    from math import log
+    return 60.0 * tau_h * log(
+        (asymptote - from_temp) / (asymptote - to_temp))

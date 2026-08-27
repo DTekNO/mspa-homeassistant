@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **The physical heating model is now measured alongside the one that ships.** Newton's
+  law describes a heated spa with two parameters — a time constant and how far above air
+  temperature the heater can hold the water — where the integration currently uses three
+  learned rate buckets plus a separate correction for the weather. The physical model has
+  one useful property the bucket model cannot have: outdoor temperature is an *input* to
+  it rather than something to be learned, so adopting it would delete the weather
+  correction rather than improve it.
+
+  Nothing about your predictions changes. The model is fitted from heating stretches
+  already being recorded, and every heat-up is now priced by it as well, so the two can
+  be compared on real finished sessions. The comparison appears on the **Ambient
+  learning** diagnostic sensor (disabled by default) as `physical_model`,
+  `physical_model_test` and `mean_abs_error_newton_min`, alongside the shipping model's
+  error over the same sessions.
+
+  It needs weeks of heat-ups before it says anything. `sessions_compared_newton` is
+  reported next to the error so it is clear how much evidence is behind it.
+
 ## [2026.8.2]
 
 Everything here is new since **2026.8.1**, the last full release. This release is focussed on
