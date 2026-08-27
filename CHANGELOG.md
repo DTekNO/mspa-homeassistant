@@ -18,7 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The physical model now shadows Ready at and the schedule.** Two diagnostic sensors,
+- **The physical model now shadows Ready at and the schedule — experimental, for
+  observation only.** Please don't build automations or dashboard cards on these two
+  sensors yet: they are unproven, they go blank whenever the model has too little data or
+  says the target is out of reach, and they may change or disappear without notice. If
+  the model proves out, the improvement will arrive in the existing Ready at and Heat
+  schedule sensors, so there will be nothing to rewire. Two diagnostic sensors,
   **Newton ready at** and **Newton start at**, report what the physical model would have
   said, recomputed on every poll. Your schedule and your Ready at are unchanged and still
   come from the learned buckets; these two decide nothing. They exist as sensors rather
@@ -27,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declines — too few heating stretches recorded, or a night cold enough that it says the
   target is unreachable — and that blank is deliberate, since a filled-in fallback would
   hide the answer. The same figures are written to the integration's storage file.
+
+  Internally, Ready at and the Heat schedule can now be switched between the two models
+  without moving an entity: same sensors, same ids, same meaning, so nothing on a
+  dashboard or in an automation would need changing if the physical model is ever
+  adopted. There is deliberately no setting for it — the switch is not offered while the
+  model is still being evaluated.
 
 - **The physical heating model is now measured alongside the one that ships.** Newton's
   law describes a heated spa with two parameters — a time constant and how far above air

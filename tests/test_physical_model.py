@@ -396,3 +396,100 @@ class TestTheShadowRunsInParallel:
         from custom_components.mspa import sensor as sensor_mod
         assert "newton" not in inspect.getsource(
             sensor_mod._compute_ready_at).lower()
+
+
+class TestTheModelCanBeSwitchedWithoutMovingAnything:
+    """The seam that lets Ready at and the Heat schedule run on either model.
+
+    The property being protected is that switching changes arithmetic and nothing else:
+    same entities, same ids, same meaning, so no dashboard or automation has to be
+    touched to try the physical model or to go back. It is deliberately not in the config
+    flow — see CONF_PREDICTION_MODEL — but the seam has to work, or turning it on later
+    is a rewrite rather than a decision.
+    """
+
+    def _coord(self, model=None, *, fitted=True, ambient=12.0):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = _traverses(n=40, noise=0.02) if fitted else []
+        c.ambient_temp = ambient
+        c.ambient_baseline = 15.0
+        c.heat_rate_buckets = [1.2, 1.0, 0.8]
+        c.computed_heat_rate = 1.0
+        c.prediction_bias = 1.0
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c._band_stats = {}
+        c._last_data = {}
+        c._newton_fallback_active = False
+        c.config_entry = type("E", (), {
+            "options": {} if model is None else {"prediction_model": model}})()
+        return c
+
+    def test_buckets_are_the_default(self):
+        c = self._coord()
+        assert c.prediction_model == "buckets"
+        assert c.uses_frozen_plan is True
+        assert c.heating_minutes(24.0, 39.5) == pytest.approx(
+            c._predictor().heating_minutes(24.0, 39.5))
+
+    def test_selecting_newton_changes_the_answer(self):
+        buckets, newton = self._coord(), self._coord("newton")
+        assert newton.heating_minutes(24.0, 39.5) == pytest.approx(
+            newton.newton_minutes(24.0, 39.5))
+        assert newton.heating_minutes(24.0, 39.5) != pytest.approx(
+            buckets.heating_minutes(24.0, 39.5), rel=1e-3)
+
+    def test_newton_drops_the_frozen_plan(self):
+        """The frozen plan and its band-edge revisions exist because a bucket rate is
+        weeks old. The physical model re-derives from the current water and outdoor
+        temperature every poll, so there is nothing to freeze and nothing to revise
+        towards."""
+        assert self._coord("newton").uses_frozen_plan is False
+
+    def test_it_never_leaves_a_time_blank(self):
+        """The diagnostic shadow sensors leave a gap when the model declines, because
+        the gap is the finding. This path must not: a blank Ready at is a broken
+        dashboard, so it falls back to buckets."""
+        no_fit = self._coord("newton", fitted=False)
+        assert no_fit.newton_minutes(24.0, 39.5) is None
+        assert no_fit.heating_minutes(24.0, 39.5) is not None
+
+        unreachable = self._coord("newton", ambient=-40.0)
+        assert unreachable.newton_minutes(24.0, 39.5) is None
+        assert unreachable.heating_minutes(24.0, 39.5) is not None
+
+    def test_the_fallback_is_logged_on_the_edges_only(self):
+        """Every poll would be thousands of identical lines a day, and the transition is
+        the only part that is news."""
+        c = self._coord("newton", fitted=False)
+        c.heating_minutes(24.0, 39.5)
+        assert c._newton_fallback_active is True
+        c.heating_minutes(24.0, 39.5)
+        assert c._newton_fallback_active is True, "still down, still not re-announced"
+        c._band_observations = _traverses(n=40, noise=0.02)
+        c.heating_minutes(24.0, 39.5)
+        assert c._newton_fallback_active is False, "recovery must clear the latch"
+
+    def test_the_option_is_not_offered_in_the_config_flow(self):
+        """Being evaluated, not offered. A switch in the options dialog would invite
+        people to adopt a model no spa has yet shown to work."""
+        from pathlib import Path
+        root = Path(__file__).parent.parent / "custom_components" / "mspa"
+        # Read rather than import, as test_config_flow_translations does: config_flow
+        # pulls in homeassistant.helpers.selector, which the stubs do not provide.
+        for name in ("config_flow.py", "strings.json", "translations/en.json"):
+            assert "prediction_model" not in (root / name).read_text(), (
+                f"{name} must not offer the model switch")
+
+    def test_every_production_path_goes_through_the_seam(self):
+        """The whole switch rests on there being exactly one entry point. A second
+        caller building its own HeatPredictor would silently keep using buckets."""
+        import inspect
+        from custom_components.mspa import sensor as sensor_mod
+        src = inspect.getsource(sensor_mod._segmented_heating_minutes)
+        assert "coordinator.heating_minutes" in src
+        assert "HeatPredictor.from_coordinator" not in src
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        trigger = inspect.getsource(MSpaUpdateCoordinator._check_schedule_trigger)
+        assert "_compute_heating_minutes" in trigger

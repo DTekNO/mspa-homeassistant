@@ -93,6 +93,35 @@ CONF_WEATHER_ENTITY = "weather_entity"
 # correction. A separate boolean only added a second way to express the same intent, and
 # a state — weather entity set, correction off — that nothing wanted.
 
+# Which model computes the times the user actually sees and the scheduler acts on:
+# Ready at, Heat schedule, and when a scheduled heat-up starts.
+#
+# The point of the option is that switching does not move any entity. The same sensors
+# keep the same entity ids and the same meaning, so a dashboard or automation built on
+# them needs no change — only the arithmetic behind them differs.
+#
+# "buckets" is the shipped model: three learned rates plus a correction for the weather.
+# "newton" is the physical model, `dT/dt = P/C - (T_water - T_air)/tau`, fitted from the
+# same recorded traverses. Newton falls back to buckets whenever it cannot answer, so
+# selecting it can leave a time missing but never leaves one blank.
+# **Deliberately absent from the config flow.** The physical model is being evaluated,
+# not offered: the diagnostic shadow sensors are how it is watched, and putting a switch
+# in the options dialog would invite people to adopt a model that has not yet been shown
+# to work on a single spa. The seam exists so that switching is a one-line change when
+# the evidence is in — and so it can be flipped now, by hand, on an installation whose
+# owner knows what they are testing:
+#
+#     .storage/core.config_entries → the mspa entry → "options": {"prediction_model":
+#     "newton"}, then restart.
+#
+# Nothing else moves when it is flipped. That is the property worth protecting: the same
+# sensors keep the same entity ids and the same meaning, so no dashboard or automation
+# has to change to try the other model, or to go back.
+CONF_PREDICTION_MODEL = "prediction_model"
+PREDICTION_MODEL_BUCKETS = "buckets"
+PREDICTION_MODEL_NEWTON = "newton"
+DEFAULT_PREDICTION_MODEL = PREDICTION_MODEL_BUCKETS
+
 # Optional heat-schedule: calendar-driven automatic preheat scheduling.
 CONF_SCHEDULE_TARGET_TEMP = "schedule_target_temp"
 CONF_SCHEDULE_LOOKAHEAD_DAYS = "schedule_lookahead_days"

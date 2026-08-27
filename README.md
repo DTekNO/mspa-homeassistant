@@ -189,6 +189,10 @@ On a brand-new installation the integration has no observed heating or cooling r
 
 It updates continuously from observed data and corrects for changing conditions — season, ambient temperature, cover on or off, water fill level — without any configuration required.
 
+> **Experimental: the Newton diagnostic sensors.** Two diagnostic entities, **Newton ready at** and **Newton start at**, show what an alternative physical heating model would have predicted. They are there so the alternative can be watched against the model that actually runs your spa, and they decide nothing — your Ready at, your Heat schedule and when heating starts all come from the learned rates described above, exactly as before.
+>
+> **Please don't build automations or dashboard cards on them yet.** They are unproven, they go blank whenever the model has too little data or says the target is out of reach, and they may change or disappear without notice. Once there is evidence they work, the improvement will arrive in the existing Ready at and Heat schedule sensors — so there will be nothing to rewire.
+
 #### Online learning with exponential smoothing
 
 Heating and cooling rates are sampled from actual temperature changes observed during operation:

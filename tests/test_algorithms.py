@@ -34,6 +34,10 @@ class _Coord:
     session_settled = MSpaUpdateCoordinator.session_settled
     session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
     shadow_eta = MSpaUpdateCoordinator.shadow_eta
+    prediction_model = MSpaUpdateCoordinator.prediction_model
+    uses_frozen_plan = MSpaUpdateCoordinator.uses_frozen_plan
+    heating_minutes = MSpaUpdateCoordinator.heating_minutes
+    _predictor = MSpaUpdateCoordinator._predictor
 
     def __init__(
         self,

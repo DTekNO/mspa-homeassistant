@@ -115,6 +115,12 @@ class MockCoordinator:
     session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
     session_progress_deviation = MSpaUpdateCoordinator.session_progress_deviation
     shadow_eta = MSpaUpdateCoordinator.shadow_eta
+    # The model seam, borrowed for the same reason as the rest: these scenarios are
+    # about what the *selected* model produces, and a mock that answered with its own
+    # arithmetic would agree with itself while the integration did something else.
+    prediction_model = MSpaUpdateCoordinator.prediction_model
+    uses_frozen_plan = MSpaUpdateCoordinator.uses_frozen_plan
+    heating_minutes = MSpaUpdateCoordinator.heating_minutes
 
     def _predictor(self):
         return HeatPredictor(

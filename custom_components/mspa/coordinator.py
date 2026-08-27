@@ -46,6 +46,9 @@ from .const import (
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_WEATHER_ENTITY,
+    CONF_PREDICTION_MODEL,
+    DEFAULT_PREDICTION_MODEL,
+    PREDICTION_MODEL_NEWTON,
     CONF_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_TARGET_TEMP,
     AMBIENT_BASELINE_ALPHA,
@@ -456,6 +459,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # every poll, used for nothing, and exposed as sensor *states* rather than
         # attributes so the recorder keeps their history — attribute history cannot be
         # charted in the UI, and the whole point of these is to be reviewed after a run.
+        self._newton_fallback_active = False
         self.newton_ready_at: datetime | None = None
         self.newton_start_at: datetime | None = None
 
@@ -2314,14 +2318,73 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """The shared prediction model, built from current learned state."""
         return HeatPredictor.from_coordinator(self)
 
+    @property
+    def prediction_model(self) -> str:
+        """Which model answers the questions the user sees. See CONF_PREDICTION_MODEL."""
+        entry = getattr(self, "config_entry", None)
+        opts = (getattr(entry, "options", None) or {}) if entry is not None else {}
+        return opts.get(CONF_PREDICTION_MODEL, DEFAULT_PREDICTION_MODEL)
+
+    @property
+    def uses_frozen_plan(self) -> bool:
+        """Whether a session's rates are frozen at the start and revised at band edges.
+
+        True for buckets, and the mechanism exists because a bucket rate is stale by
+        construction: it was learned weeks ago under other weather, so the plan is held
+        and corrected at the few points where a complete traverse has been measured.
+
+        False for the physical model, which has nothing to freeze. It re-derives from the
+        current water temperature and the current outdoor temperature on every poll, so a
+        frozen plan would be holding it back rather than steadying it, and a revision
+        mechanism would be revising towards what it already says.
+        """
+        return self.prediction_model != PREDICTION_MODEL_NEWTON
+
+    def heating_minutes(self, from_temp: float, to_temp: float) -> float | None:
+        """Minutes to heat between two temperatures, under the selected model.
+
+        **The one production entry point.** Ready at, the Heat schedule sensor and the
+        autonomous trigger all arrive here, which is what lets the model be switched
+        without moving an entity: the sensors keep their ids and their meaning and only
+        the arithmetic changes.
+
+        Newton falls back to buckets whenever it declines — no fit yet, or an asymptote
+        at or below the target. The diagnostic shadow sensors deliberately leave a gap in
+        that case because the gap is the finding; this path must not, because a blank
+        Ready at is a broken dashboard. The fallback is logged on the way in and on the
+        way out, never per poll.
+        """
+        if self.prediction_model == PREDICTION_MODEL_NEWTON:
+            minutes = self.newton_minutes(from_temp, to_temp)
+            if minutes is not None:
+                if self._newton_fallback_active:
+                    self._newton_fallback_active = False
+                    _LOGGER.info(
+                        "Prediction model: the physical model can answer again "
+                        "(%.1f→%.1f °C) — no longer falling back to buckets",
+                        from_temp or 0.0, to_temp or 0.0)
+                return minutes
+            if not self._newton_fallback_active:
+                self._newton_fallback_active = True
+                fit = self.newton_fit()
+                _LOGGER.info(
+                    "Prediction model: the physical model declines %.1f→%.1f °C "
+                    "(%s) — falling back to buckets",
+                    from_temp or 0.0, to_temp or 0.0,
+                    "no fit yet" if fit is None else
+                    f"asymptote {(self.ambient_temp or 0.0) + fit['asymptote_lift_c']:.1f} °C "
+                    f"at outdoor {self.ambient_temp}",
+                )
+        return self._predictor().heating_minutes(from_temp, to_temp)
+
     def _compute_heating_minutes(self, from_temp: float, to_temp: float) -> float | None:
-        """Heating time (minutes) — delegates to the shared model.
+        """Heating time (minutes) — delegates to the selected model.
 
         Was a second implementation of the sensor's calculation, kept in sync by
         hand and documented as mirroring it "to avoid a circular import" that did
         not exist.  They had drifted; see predictor.py.
         """
-        return self._predictor().heating_minutes(from_temp, to_temp)
+        return self.heating_minutes(from_temp, to_temp)
 
     def _heating_minutes_variant(self, from_temp, to_temp, *, use_fits: bool):
         """The same estimate, with the learned weather response forced on or off.

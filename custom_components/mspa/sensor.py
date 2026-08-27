@@ -300,7 +300,10 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
     Single implementation, shared with the coordinator's trigger. These used to be
     two separate copies that had drifted apart; see predictor.py.
     """
-    return HeatPredictor.from_coordinator(coordinator).heating_minutes(from_temp, to_temp)
+    # Through the coordinator, not straight to a HeatPredictor, so that the selected
+    # model applies here too. This is the sensor half of the single seam that lets Ready
+    # at and the Heat schedule switch models without changing entity id or meaning.
+    return coordinator.heating_minutes(from_temp, to_temp)
 
 
 def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | None":
@@ -361,14 +364,22 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
     # Recomputing with rates that move as they are learned was the shipped behaviour and
     # was worse than either alternative — 21 min mean against 10 for holding, over the
     # four recorded sessions in analysis/settle_time.py.
-    shadow = coordinator.shadow_eta()
-    if shadow is not None:
-        return shadow
+    # Both the frozen plan and its shadow revisions are bucket machinery: they exist
+    # because a bucket rate is weeks old and needs holding steady, then correcting at the
+    # few points a full traverse has been measured. The physical model re-derives from
+    # the current water and outdoor temperatures every poll, so freezing it would hold it
+    # back and revising it would revise towards what it already says. Skipped wholesale
+    # rather than adapted, and the anchor bookkeeping below is kept because that part is
+    # about when the reading was taken, not about which model reads it.
+    if coordinator.uses_frozen_plan:
+        shadow = coordinator.shadow_eta()
+        if shadow is not None:
+            return shadow
 
     # No shadow curve: the session's plan was cancelled, most often because the setpoint
     # moved. Here the settle guard is still doing its original job, because this path
     # does recompute from the anchor.
-    plan = coordinator.session_plan()
+    plan = coordinator.session_plan() if coordinator.uses_frozen_plan else None
     if plan is not None and not coordinator.session_settled(anc_temp, now_utc):
         opening = coordinator.session_opening_eta()
         if opening is not None:
