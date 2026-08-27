@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the previous behaviour whenever one is missing, unavailable, or does not reach far
   enough ahead.
 
+  **The same applies to a heat-up already under way**, where it matters more rather than
+  less. Mid-run before dawn the thermometer is reading the coldest hour of the night
+  while every remaining hour is warmer — on an autumn night that makes the estimate
+  around 40% too long at 04:00, and it is what makes a Ready at time sit still all night
+  and then race forward once the sun comes up. The window now covers the rest of the run
+  and shrinks as the run proceeds. One exception worth knowing: a scheduled heat-up under
+  the established model holds the plan it opened with, by design, so this helps free
+  heating and the experimental model rather than a schedule already running.
+
   Heating stretches below 20 °C are now kept for the physical model. They are still not
   learned from as rate buckets — that range is outside what a bucket describes — but they
   are the most informative measurement the physical model can get, and a fresh fill from

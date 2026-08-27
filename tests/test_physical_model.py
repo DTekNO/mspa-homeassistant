@@ -968,3 +968,91 @@ class TestPlanningUsesTheForecast:
         c = self._coord()
         c.heating_minutes(33.5, 39.5, ambient=-30.0)
         assert c.ambient_temp == 15.0
+
+
+class TestTheLiveEtaUsesTheRestOfTheRun:
+    """The rolling version, and it is worth more than the schedule case rather than less.
+
+    Mid-run at the pre-dawn minimum the instantaneous reading is the coldest hour of the
+    night while every remaining hour is warmer. On an autumn profile that reads 40% long
+    at 04:00 — nearly five hours — against 1% for the rolling mean. It is also exactly
+    when someone looks at Ready at, and it is what makes an estimate sit still all night
+    and then race forward after dawn.
+    """
+
+    def _rows(self, start, temps):
+        from datetime import timedelta
+        return [(start + timedelta(hours=i), t) for i, t in enumerate(temps)]
+
+    def _coord(self, rows, ambient):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = []
+        c._band_stats = {}
+        c.heat_rate_buckets = [1.24, 1.095, 0.878]
+        c.ambient_baseline = 18.41
+        c.ambient_temp = ambient
+        c.computed_heat_rate = 0.972
+        c.prediction_bias = 1.0
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c._last_data = {}
+        c._newton_fallback_active = False
+        c._forecast_rows = rows
+        c.config_entry = type("E", (), {"options": {}})()
+        return c
+
+    def test_the_window_is_the_rest_of_the_run(self):
+        """Same mechanism as the schedule, anchored at a derived finish instead of a
+        given one — so the window is the remainder either way."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        c = self._coord(self._rows(now, [3.0] + [9.0] * 30), ambient=3.0)
+        got = c.live_ambient_for(30.0, 39.5)
+        assert got is not None
+        mean, kind = got
+        assert kind == "window"
+        assert mean > 8.0, (
+            "the run happens through the warming morning, not in the one cold hour "
+            "it starts in")
+
+    def test_it_beats_the_instant_where_the_instant_is_worst(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        c = self._coord(self._rows(now, [3.0] + [9.0] * 30), ambient=3.0)
+        cold_instant = c.heating_minutes(30.0, 39.5)
+        mean, _ = c.live_ambient_for(30.0, 39.5)
+        rolling = c.heating_minutes(30.0, 39.5, ambient=mean)
+        assert rolling < cold_instant, (
+            "planning the whole run at the night minimum is pessimistic")
+
+    def test_the_window_shrinks_as_the_run_proceeds(self):
+        """So the mean converges on the near-term forecast of its own accord, rather
+        than needing to be told to."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        rows = self._rows(now, [0.0] * 4 + [20.0] * 30)
+        early = self._coord(rows, ambient=0.0).live_ambient_for(30.0, 39.5)
+        late = self._coord(rows, ambient=0.0).live_ambient_for(39.0, 39.5)
+        assert late[0] <= early[0] + 1e-9, (
+            "a nearly-finished run must weigh the next hour, not the whole day")
+
+    def test_the_source_is_recorded_on_the_shadow(self):
+        """It changes what a row means, so it has to be in the history rather than
+        inferred from a date. Rows from before this existed, or from a spell when the
+        forecast was unavailable, were priced from a single instant."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        c = self._coord(self._rows(now, [9.0] * 30), ambient=3.0)
+        c.scheduled_ready_at = None
+        c.schedule_target_temp = None
+        c._schedule_triggered = False
+        c.newton_ready_at = c.newton_start_at = None
+        c.newton_target_temp = c.newton_plan_temp = None
+        c.newton_ambient_source = "now"
+        c.scheduling_temp = lambda: 30.0
+        c._update_newton_shadow(30.0, 39.5)
+        assert c.newton_ambient_source == "forecast_window"
+        c._forecast_rows = []
+        c._update_newton_shadow(30.0, 39.5)
+        assert c.newton_ambient_source == "now", "no forecast must say so, not pretend"

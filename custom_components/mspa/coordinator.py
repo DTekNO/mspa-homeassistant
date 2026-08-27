@@ -489,6 +489,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._forecast_failed = False
         self.schedule_ambient: float | None = None
         self.schedule_ambient_kind: str | None = None
+        # Which ambient the last shadow was priced with. Recorded because it changes
+        # what the history means: rows from before the forecast was wired in, or from a
+        # spell when it was unavailable, were priced from a single instant.
+        self.newton_ambient_source: str = "now"
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.
@@ -1769,8 +1773,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             target = self.schedule_target_temp
         self.newton_target_temp = target
         self.newton_plan_temp = plan_temp
+        self.newton_ambient_source = "now"
         if target is not None:
-            minutes = self.newton_minutes(plan_temp, target)
+            live = self.live_ambient_for(plan_temp, target)
+            ambient = None
+            if live is not None:
+                ambient, kind = live
+                self.newton_ambient_source = f"forecast_{kind}"
+            minutes = self.newton_minutes(plan_temp, target, ambient=ambient)
             if minutes is not None:
                 self.newton_ready_at = (
                     datetime.now(timezone.utc) + timedelta(minutes=minutes))
@@ -1852,31 +1862,53 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     "outdoor temperature instead", entity_id, err)
 
     def forecast_ambient_for(self, finish_utc, from_temp, to_temp):
-        """Mean outdoor temperature to plan a heat-up finishing at `finish_utc` with.
+        """Mean outdoor temperature to price a heat-up with.
+
+        Two callers, one mechanism. Pass `finish_utc` to plan a schedule, where the
+        finish is fixed and the start is what has to be worked out. Pass None for a run
+        already under way, where the start is now and the finish is derived — the window
+        is the remainder of the run either way, so the same average answers both.
 
         The duration and the window it averages over each depend on the other, so this
         iterates: estimate with what it has, take the mean over the window that implies,
-        re-estimate. Two rounds is enough — the second moves the answer by well under a
-        minute — and it is a contraction, because a warmer mean shortens the run, which
-        pulls the window later into weather that is warmer still only by a fraction.
+        re-estimate. Two rounds is enough, the second moving the answer by well under a
+        minute, and it is a contraction — a warmer mean shortens the run, which pulls the
+        window back into weather that is warmer again only by a fraction.
 
         Returns (mean_c, kind) or None when there is no forecast to work from.
         """
         rows = getattr(self, "_forecast_rows", None)
-        if not rows or finish_utc is None:
+        if not rows:
             return None
         minutes = self.heating_minutes(from_temp, to_temp)
         result = None
         for _ in range(2):
             if minutes is None or minutes <= 0:
                 return None
-            got = forecast_window_mean(rows, finish_utc, minutes / 60.0)
+            end = finish_utc if finish_utc is not None else (
+                datetime.now(timezone.utc) + timedelta(minutes=minutes))
+            got = forecast_window_mean(rows, end, minutes / 60.0)
             if got is None:
                 return None
             mean, _n, kind = got
             result = (mean, kind)
             minutes = self.heating_minutes(from_temp, to_temp, ambient=mean)
         return result
+
+    def live_ambient_for(self, from_temp, to_temp):
+        """The rolling version, for a heat-up happening now.
+
+        Worth more than the schedule case, not less. Mid-run at the pre-dawn minimum the
+        instantaneous reading is the coldest hour of the night while every remaining hour
+        is warmer: on an autumn profile that reads 40% long at 04:00, nearly five hours,
+        against 1% for the rolling mean. It is also exactly when someone looks at Ready
+        at, and it is what makes an estimate sit still all night and then race forward
+        after dawn.
+
+        The window shrinks as the run proceeds, so the mean converges on the near-term
+        forecast of its own accord rather than needing to be told to.
+        """
+        return self.forecast_ambient_for(None, from_temp, to_temp)
 
     def _tub_is_disturbed(self) -> bool:
         """Whether the spa is in a state where its heating rate cannot be measured.

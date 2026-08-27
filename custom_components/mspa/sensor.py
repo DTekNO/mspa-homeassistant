@@ -303,7 +303,16 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
     # Through the coordinator, not straight to a HeatPredictor, so that the selected
     # model applies here too. This is the sensor half of the single seam that lets Ready
     # at and the Heat schedule switch models without changing entity id or meaning.
-    return coordinator.heating_minutes(from_temp, to_temp)
+    #
+    # Priced with the weather expected across the rest of the run where there is a
+    # forecast. Note what this does *not* reach: a session in flight under the bucket
+    # model is answered from the frozen plan rather than from here, so its ambient stays
+    # the one assumed when the session opened. That freezing is deliberate — it is what
+    # stops the ETA chasing every sample — but it does mean the live forecast only helps
+    # the paths that recompute, which are free heating and the physical model.
+    live = coordinator.live_ambient_for(from_temp, to_temp)
+    return coordinator.heating_minutes(
+        from_temp, to_temp, ambient=(live[0] if live else None))
 
 
 def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | None":
@@ -1640,6 +1649,9 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
             "tau_h": round(fit["tau_h"], 2) if fit else None,
             "asymptote_lift_c": round(fit["asymptote_lift_c"], 2) if fit else None,
             "ambient_temp_deg_c": c.ambient_temp,
+            # Which ambient priced this row: the instant, or a forecast mean over the
+            # rest of the run. It changes what the number means, so it travels with it.
+            "ambient_source": getattr(c, "newton_ambient_source", "now"),
             # The asymptote in absolute terms is what decides reachability, so it is the
             # number that explains a None.
             # What this row aimed at, and from where. A Ready-at row cannot be read
