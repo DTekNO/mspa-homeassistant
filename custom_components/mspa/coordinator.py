@@ -32,8 +32,6 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    CONF_AMBIENT_CORRECTION,
-    DEFAULT_AMBIENT_CORRECTION,
     DEFAULT_HEATER_POWER_HEAT,
     DOMAIN,
     DEFAULT_SCAN_INTERVAL,
@@ -453,6 +451,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Last computed autonomous start time, tracked only to log meaningful shifts
         # in the planned start as outdoor conditions change while waiting.
         self._last_computed_start_at: datetime | None = None
+        # The physical model's shadow of the two things the bucket model decides: when
+        # the water will be ready, and when a scheduled heat-up has to start. Computed
+        # every poll, used for nothing, and exposed as sensor *states* rather than
+        # attributes so the recorder keeps their history — attribute history cannot be
+        # charted in the UI, and the whole point of these is to be reviewed after a run.
+        self.newton_ready_at: datetime | None = None
+        self.newton_start_at: datetime | None = None
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.
@@ -662,7 +667,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # can tell a model that was wrong from one that had not yet
                         # learned anything.
                         "newton_params": _newton_params(self.newton_fit()),
-                        "ambient_correction_applied": self.ambient_correction_enabled,
+                        "weather_entity": self.weather_entity,
                         "prediction_bias": round(self.prediction_bias, 3),
                         "session_scalar": self._session_scalar,
                         "ambient_temp": self.ambient_temp,
@@ -1006,6 +1011,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # "Heating" instead of dropping back to pending and re-firing.
                 "schedule_triggered": self._schedule_triggered,
                 "ambient_baseline": self.ambient_baseline,
+                # Written so the shadow is legible in the storage file itself, not only
+                # through the sensors — the whole comparison should survive a restart and
+                # be readable without Home Assistant running.
+                "newton_ready_at": (
+                    self.newton_ready_at.isoformat()
+                    if self.newton_ready_at is not None else None
+                ),
+                "newton_start_at": (
+                    self.newton_start_at.isoformat()
+                    if self.newton_start_at is not None else None
+                ),
+                "newton_fit": self.newton_fit(),
+                "newton_implied_tub": self.physical_constants(),
                 "temp_anchor_time": (
                     self.temp_anchor_time.isoformat()
                     if self.temp_anchor_time is not None else None
@@ -1019,6 +1037,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "temp_anchor_temp": self.temp_anchor_temp,
                 "temp_anchor_target": self.temp_anchor_target,
             })
+
+            # The physical model's shadow of the same two decisions, recomputed from
+            # the same inputs and driving nothing. Before the trigger so that a poll
+            # which fires the schedule still leaves a shadow of the plan it fired on.
+            self._update_newton_shadow(new_temp, new_target)
 
             # Trigger heating autonomously when the schedule window opens.
             # Must run BEFORE the auto-clear so the trigger fires even when the
@@ -1533,24 +1556,23 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         st["max_amb"] = ambient if st["max_amb"] is None else max(st["max_amb"], ambient)
 
     @property
-    def ambient_correction_enabled(self) -> bool:
-        """Whether learned weather response is applied. Learning happens regardless."""
+    def weather_entity(self) -> str | None:
+        """The configured weather entity, which is what decides whether estimates are
+        corrected for the outdoor temperature. There is no separate switch: without a
+        weather entity `ambient_temp` is None and every correction already returns 1.0."""
         entry = getattr(self, "config_entry", None)
         if entry is None:
-            return DEFAULT_AMBIENT_CORRECTION
-        return bool(entry.options.get(
-            CONF_AMBIENT_CORRECTION, DEFAULT_AMBIENT_CORRECTION))
+            return None
+        return (getattr(entry, "options", None) or {}).get(CONF_WEATHER_ENTITY)
 
     def band_fits(self, *, force: bool = False) -> dict:
         """Every band's fit, keyed by band index, for handing to a HeatPredictor.
 
-        Empty when the user has turned the correction off — the fits go on being
-        learned either way, so switching it back on finds the evidence waiting.
-        `force` returns them regardless, for the side-by-side comparison that is
-        recorded whether or not the correction is in use.
+        `force` is kept for the side-by-side comparison, which is recorded whether or not
+        a weather entity is configured — a spa with no weather source still learns
+        nothing useful here (its observations carry no ambient), but the argument is part
+        of the seam and removing it would only move the decision somewhere less obvious.
         """
-        if not force and not self.ambient_correction_enabled:
-            return {}
         return {i: self.band_rate_fit(i) for i in (0, 1, 2)
                 if self.band_rate_fit(i) is not None}
 
@@ -1646,6 +1668,48 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         amb = self.ambient_temp if ambient is None else ambient
         return newton_heating_minutes(
             from_temp, to_temp, amb, fit["tau_h"], fit["asymptote_lift_c"])
+
+    def _update_newton_shadow(self, current_temp, current_target) -> None:
+        """Recompute the physical model's shadow of Ready at and of the planned start.
+
+        Deliberately raw. The shipping Ready at slews its display so corrections land as
+        bounded ramps, and latches once the water arrives; neither is a property of the
+        model, and reproducing them here would hide exactly the wandering this is meant
+        to expose. What is compared is the estimate, not the presentation of it.
+
+        Both go to None whenever the model declines — too few traverses to fit, or an
+        asymptote at or below the target, which on a cold night is a real answer. A gap
+        in the history is the finding; a fallback would erase it.
+        """
+        self.newton_ready_at = None
+        self.newton_start_at = None
+        plan_temp = self.scheduling_temp()
+        if plan_temp is None:
+            plan_temp = current_temp
+        if plan_temp is None:
+            return
+
+        # Ready at: to whichever target is actually being heated towards — the schedule's
+        # while one is pending, the thermostat's otherwise. Mirrors the shipping sensor's
+        # choice of target so the two series are answering the same question.
+        target = current_target
+        if self.scheduled_ready_at is not None and self.schedule_target_temp is not None:
+            target = self.schedule_target_temp
+        if target is not None:
+            minutes = self.newton_minutes(plan_temp, target)
+            if minutes is not None:
+                self.newton_ready_at = (
+                    datetime.now(timezone.utc) + timedelta(minutes=minutes))
+
+        # Planned start: the same subtraction `_check_schedule_trigger` makes, against
+        # the same scheduled time, so the two start times are directly comparable.
+        if (self.scheduled_ready_at is not None and not self._schedule_triggered
+                and self.schedule_target_temp is not None):
+            minutes = self.newton_minutes(plan_temp, self.schedule_target_temp)
+            if minutes is not None:
+                self.newton_start_at = (
+                    dt_util.as_utc(self.scheduled_ready_at)
+                    - timedelta(minutes=minutes))
 
     def _tub_is_disturbed(self) -> bool:
         """Whether the spa is in a state where its heating rate cannot be measured.

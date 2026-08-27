@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The "Adjust estimates for the outdoor temperature" option is gone.** Configuring a
+  weather entity is now the whole of the decision: set one and estimates are corrected
+  for the weather, leave it empty and they are not. The option was a second way of saying
+  the same thing, and its only distinct state — a weather entity configured but the
+  correction switched off — was one nobody wanted. Nothing changes for anyone who had it
+  on, which was the default.
+
 ### Added
+
+- **The physical model now shadows Ready at and the schedule.** Two diagnostic sensors,
+  **Newton ready at** and **Newton start at**, report what the physical model would have
+  said, recomputed on every poll. Your schedule and your Ready at are unchanged and still
+  come from the learned buckets; these two decide nothing. They exist as sensors rather
+  than attributes so their history is recorded and can be charted, which is the only way
+  to see whether the model wanders during a long heat-up. Both are blank when the model
+  declines — too few heating stretches recorded, or a night cold enough that it says the
+  target is unreachable — and that blank is deliberate, since a filled-in fallback would
+  hide the answer. The same figures are written to the integration's storage file.
 
 - **The physical heating model is now measured alongside the one that ships.** Newton's
   law describes a heated spa with two parameters — a time constant and how far above air

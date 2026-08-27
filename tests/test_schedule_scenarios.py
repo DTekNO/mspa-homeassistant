@@ -1801,25 +1801,24 @@ class TestManualHeatUnderAPendingSchedule:
         assert _ready_at(c) == "Ready"
 
 
-class TestAmbientCorrectionOptOut:
-    """Turning the correction off stops it being *used*, never stops it being learned.
-
-    Someone who switches it off and later back on should find the evidence waiting, not
-    have to start over — and the side-by-side comparison is recorded either way, so the
-    question "would it have helped?" can be answered afterwards rather than only by
-    people who thought to enable something in advance.
+class TestTheWeatherEntityIsTheSwitch:
+    """There is no separate "adjust for the outdoor temperature" option, and there was
+    one until 2026-08-27. Configuring a weather entity is the whole of the intent:
+    without one there is no ambient reading, so every correction already returns 1.0 and
+    a boolean could only ever express the same thing a second way — or express the state
+    nobody wanted, which was a weather entity configured and the correction switched off.
     """
 
-    def _coord(self, enabled):
+    def _coord(self, weather_entity):
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         c = object.__new__(MSpaUpdateCoordinator)
         c._band_stats = {}
         c._band_observations = []
-        c.ambient_temp = 5.0
-        c.ambient_baseline = 15.0
+        c.ambient_temp = 5.0 if weather_entity else None
+        c.ambient_baseline = 15.0 if weather_entity else None
 
         class _Entry:
-            options = {"ambient_correction": enabled}
+            options = ({"weather_entity": weather_entity} if weather_entity else {})
         c.config_entry = _Entry()
         # A fit the hot band has genuinely earned.
         for amb in (0.0, 5.0, 10.0, 15.0, 20.0):
@@ -1827,27 +1826,27 @@ class TestAmbientCorrectionOptOut:
                 c._accumulate_band_stats(2, 0.8 + 0.01 * amb, amb, 38.0 - amb)
         return c
 
-    def test_off_means_the_estimate_does_not_use_it(self):
-        assert self._coord(False).band_fits() == {}
+    def test_with_a_weather_entity_the_fit_is_used(self):
+        assert 2 in self._coord("weather.home").band_fits()
 
-    def test_but_the_fit_is_still_there(self):
-        c = self._coord(False)
-        assert c.band_rate_fit(2) is not None, "learning must not stop"
-        assert c.band_fits(force=True), "and must be reachable for the comparison"
+    def test_without_one_there_is_nothing_to_correct_from(self):
+        """Not because the fit is withheld — it is right there — but because there is no
+        ambient reading to apply it to. That is the whole argument for deleting the
+        option: the degradation is already correct without one."""
+        from custom_components.mspa.predictor import (
+            ambient_rate_factor, learned_ambient_factor)
+        c = self._coord(None)
+        assert c.weather_entity is None
+        fit = c.band_rate_fit(2)
+        assert fit is not None, "learning is unaffected by having no weather source"
+        assert ambient_rate_factor(2, c.ambient_temp, c.ambient_baseline) == 1.0
+        assert learned_ambient_factor(
+            c.ambient_temp, c.ambient_baseline, fit, 1.0) == 1.0
 
-    def test_on_means_it_is_used(self):
-        assert 2 in self._coord(True).band_fits()
-
-    def test_switching_back_on_finds_the_evidence_waiting(self):
-        off = self._coord(False)
-        stats = off._band_stats
-        on = self._coord(True)
-        on._band_stats = stats
-        assert on.band_fits()[2]["n"] == pytest.approx(off.band_rate_fit(2)["n"])
-
-    def test_the_default_is_on(self):
-        from custom_components.mspa.const import DEFAULT_AMBIENT_CORRECTION
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        c = object.__new__(MSpaUpdateCoordinator)
-        c.config_entry = None
-        assert c.ambient_correction_enabled is DEFAULT_AMBIENT_CORRECTION is True
+    def test_the_predictor_leaves_the_rate_alone_without_a_weather_source(self):
+        """End to end, because the two factors above are only half the path."""
+        from custom_components.mspa.predictor import HeatPredictor
+        c = self._coord(None)
+        p = HeatPredictor(buckets=[1.0, 1.0, 1.0], ambient_temp=None,
+                          ambient_baseline=None, band_fits=c.band_fits())
+        assert p.bucket_rate(38.0) == pytest.approx(1.0)

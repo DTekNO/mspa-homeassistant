@@ -304,3 +304,95 @@ class TestTheSpecMakesItCheckable:
                                                     "pump_power": 60}})()
         c._band_observations = _traverses(n=40, noise=0.02)
         assert c.physical_constants()["heater_power_w"] == 2200
+
+
+class TestTheShadowRunsInParallel:
+    """The physical model computes the same two things the bucket model decides — when
+    the water is ready, and when a scheduled run must start — and decides neither. What
+    these protect is that it stays a shadow, and that a gap in the record is readable.
+    """
+
+    def _coord(self, *, fitted=True, target=39.5, scheduled=None, triggered=False,
+               ambient=12.0):
+        from datetime import datetime, timedelta, timezone
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = _traverses(n=40, noise=0.02) if fitted else []
+        c.ambient_temp = ambient
+        c.scheduled_ready_at = scheduled
+        c.schedule_target_temp = target if scheduled else None
+        c._schedule_triggered = triggered
+        c.newton_ready_at = c.newton_start_at = None
+        c.scheduling_temp = lambda: 24.0
+        return c
+
+    def test_it_shadows_ready_at(self):
+        c = self._coord()
+        c._update_newton_shadow(24.0, 39.5)
+        assert c.newton_ready_at is not None
+        assert c.newton_start_at is None, "no schedule pending, so nothing to plan"
+
+    def test_it_shadows_the_planned_start_against_the_scheduled_time(self, monkeypatch):
+        """The same subtraction the trigger makes, so the two are differenceable.
+
+        `dt_util.as_utc` is stubbed out by conftest, so it is given a real one here — the
+        coordinator deliberately routes through it exactly as `_check_schedule_trigger`
+        does, rather than taking a shortcut that would drift from the code it shadows.
+        """
+        from datetime import datetime, timedelta, timezone
+        from custom_components.mspa import coordinator as mod
+        monkeypatch.setattr(mod.dt_util, "as_utc",
+                            lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc))
+        due = datetime.now(timezone.utc) + timedelta(hours=20)
+        c = self._coord(scheduled=due)
+        c._update_newton_shadow(24.0, 39.5)
+        minutes = c.newton_minutes(24.0, 39.5)
+        assert (due - c.newton_start_at).total_seconds() / 60 == pytest.approx(
+            minutes, rel=1e-6)
+
+    def test_a_fired_schedule_has_no_planned_start_left(self):
+        from datetime import datetime, timedelta, timezone
+        due = datetime.now(timezone.utc) + timedelta(hours=2)
+        c = self._coord(scheduled=due, triggered=True)
+        c._update_newton_shadow(24.0, 39.5)
+        assert c.newton_start_at is None
+        assert c.newton_ready_at is not None, "but it is still heating towards something"
+
+    def test_no_fit_leaves_a_gap_rather_than_a_guess(self):
+        c = self._coord(fitted=False)
+        c._update_newton_shadow(24.0, 39.5)
+        assert c.newton_ready_at is None and c.newton_start_at is None
+
+    def test_an_unreachable_target_leaves_a_gap_too(self):
+        """A cold enough night puts the asymptote below the setpoint. That is a real
+        answer from the model and the history should show it as absence, not as a
+        substituted number from somewhere else."""
+        c = self._coord(ambient=-40.0)
+        c._update_newton_shadow(24.0, 39.5)
+        assert c.newton_ready_at is None
+
+    def test_a_pending_schedule_aims_at_the_schedule_target(self):
+        """Mirroring the shipping sensor's choice of target, so the two series are
+        answering the same question rather than two different ones."""
+        from datetime import datetime, timedelta, timezone
+        due = datetime.now(timezone.utc) + timedelta(hours=20)
+        hot = self._coord(scheduled=due, target=40.0)
+        hot._update_newton_shadow(24.0, 30.0)          # thermostat much lower
+        cool = self._coord(scheduled=due, target=32.0)
+        cool._update_newton_shadow(24.0, 30.0)
+        assert hot.newton_ready_at > cool.newton_ready_at
+
+    def test_the_shadow_drives_nothing(self):
+        """The guarantee that matters. `_check_schedule_trigger` computes its own start
+        from `_compute_heating_minutes`; nothing in the trigger or the Ready at path may
+        read the shadow."""
+        import inspect
+        from custom_components.mspa import coordinator as mod
+        for name in ("_check_schedule_trigger", "_compute_heating_minutes",
+                     "_heating_minutes_variant", "scheduling_temp"):
+            src = inspect.getsource(getattr(mod.MSpaUpdateCoordinator, name))
+            assert "newton" not in src.lower(), (
+                f"{name} must not consult the shadow model")
+        from custom_components.mspa import sensor as sensor_mod
+        assert "newton" not in inspect.getsource(
+            sensor_mod._compute_ready_at).lower()

@@ -106,6 +106,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities(entities)
     async_add_entities([MSpaFaultSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaAmbientLearningSensor(coordinator)], update_before_add=True)
+    async_add_entities([MSpaNewtonReadyAtSensor(coordinator),
+                        MSpaNewtonStartAtSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaFilterSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaHeaterTimerBinarySensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaHeaterTimerTimeSensor(coordinator)], update_before_add=True)
@@ -1474,7 +1476,7 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
         from .predictor import ambient_rate_factor
         c = self.coordinator
         out = {
-            "correction_applied": c.ambient_correction_enabled,
+            "weather_entity": c.weather_entity,
             "ambient_temp_deg_c": c.ambient_temp,
             "ambient_baseline_deg_c": c.ambient_baseline,
             "observations_recorded": len(getattr(c, "_band_observations", [])),
@@ -1574,6 +1576,107 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
             out["mean_abs_error_shipping_min_same_sessions"] = round(
                 sum(abs(a) for a, _ in nerrs) / len(nerrs), 1)
         return out
+
+
+class _MSpaNewtonShadowSensor(MSpaSensorEntity):
+    """Base for the physical model's shadow of a decision the bucket model makes.
+
+    These are the observation channel, and they are sensors rather than attributes for
+    one practical reason: Home Assistant's recorder keeps state history and the UI can
+    chart it, while attribute history exists in the database but cannot be got at from
+    the frontend. The whole purpose of these is to be reviewed after a heat run, so the
+    history has to be reachable.
+
+    Diagnostic category, enabled by default. Enabled because a disabled entity records
+    nothing, and a shadow nobody recorded is worth less than no shadow; diagnostic so it
+    sits with the other internals rather than presenting itself as something to act on.
+    Neither drives a prediction, a schedule or a display.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator)
+        self._attr_device_info = self.device_info
+        self.coordinator = coordinator
+        self._attr_name = self._shadow_name
+        self._attr_unique_id = (
+            f"mspa_{self._shadow_slug}_"
+            f"{getattr(coordinator, 'device_id', 'unknown')}")
+
+    @property
+    def extra_state_attributes(self):
+        """The parameters behind the number, so a history row explains itself.
+
+        Without these a gap in the series is unreadable months later — no fit yet, or a
+        target the model said was unreachable, look identical from the outside.
+        """
+        c = self.coordinator
+        fit = c.newton_fit()
+        out = {
+            "traverses_fitted": fit["n"] if fit else 0,
+            "tau_h": round(fit["tau_h"], 2) if fit else None,
+            "asymptote_lift_c": round(fit["asymptote_lift_c"], 2) if fit else None,
+            "ambient_temp_deg_c": c.ambient_temp,
+            # The asymptote in absolute terms is what decides reachability, so it is the
+            # number that explains a None.
+            "asymptote_deg_c": (
+                round(c.ambient_temp + fit["asymptote_lift_c"], 1)
+                if fit and c.ambient_temp is not None else None),
+        }
+        # Guarded, because the comparison reaches into the shipping model's own state
+        # and this sensor's job is to keep recording. A diagnostic that goes unavailable
+        # because the thing it observes threw is a diagnostic that loses exactly the run
+        # worth looking at.
+        try:
+            out["shipping_equivalent"] = self._shipping_equivalent()
+        except Exception:                                    # noqa: BLE001
+            out["shipping_equivalent"] = None
+        return out
+
+
+class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
+    """When the physical model says the water will reach the temperature being aimed at.
+
+    Raw, and deliberately not slewed or latched the way the shipping Ready at is. Those
+    are properties of the display rather than of the model, and reproducing them would
+    smooth away exactly the wandering this exists to expose.
+    """
+
+    _shadow_name = "Newton ready at"
+    _shadow_slug = "newton_ready_at"
+    _attr_icon = "mdi:function-variant"
+
+    @property
+    def native_value(self):
+        return self.coordinator.newton_ready_at
+
+    def _shipping_equivalent(self):
+        """What the bucket model says, for the same moment, in minutes from now."""
+        return _minutes_to_target(self.coordinator)
+
+
+class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
+    """When the physical model says a scheduled heat-up would have to start.
+
+    The same subtraction `_check_schedule_trigger` makes against the same scheduled
+    time, so the two start times answer the same question and can be differenced
+    directly. None whenever no schedule is pending, or once one has fired.
+    """
+
+    _shadow_name = "Newton start at"
+    _shadow_slug = "newton_start_at"
+    _attr_icon = "mdi:function-variant"
+
+    @property
+    def native_value(self):
+        return self.coordinator.newton_start_at
+
+    def _shipping_equivalent(self):
+        """The bucket model's planned start, which is what actually fires the heater."""
+        start = getattr(self.coordinator, "_last_computed_start_at", None)
+        return start.isoformat() if start is not None else None
 
 
 class MSpaFaultSensor(MSpaDiagnosticSensor):

@@ -23,8 +23,6 @@ from .const import (
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
-    CONF_AMBIENT_CORRECTION,
-    DEFAULT_AMBIENT_CORRECTION,
     CONF_WEATHER_ENTITY,
     CONF_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_TARGET_TEMP,
@@ -291,11 +289,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_WEATHER_ENTITY,
                 description={"suggested_value": self.config_entry.options.get(CONF_WEATHER_ENTITY)},
             ): EntitySelector(EntitySelectorConfig(domain="weather")),
-            vol.Optional(
-                CONF_AMBIENT_CORRECTION,
-                default=self.config_entry.options.get(
-                    CONF_AMBIENT_CORRECTION, DEFAULT_AMBIENT_CORRECTION),
-            ): bool,
             vol.Optional(
                 CONF_SCHEDULE_TARGET_TEMP,
                 default=self.config_entry.options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP),
