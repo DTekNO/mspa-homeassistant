@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target is unreachable — and that blank is deliberate, since a filled-in fallback would
   hide the answer. The same figures are written to the integration's storage file.
 
+  The physical model is primed from the learned rate buckets, so it has something to say
+  from the day it is enabled rather than after eight recorded heat-ups. A bucket is
+  physical data already digested — "this spa climbs at this rate across this stretch" —
+  and three of them place the line the model needs. The priming is dropped as soon as
+  real measurements can carry the fit, and is refused outright when the bucket shape
+  implies a spa that sheds almost no heat.
+
+  Each heating stretch now also records the weather condition it happened in. Sun falling
+  on the spa is heat the model knows nothing about, and it is the most likely thing to be
+  mistaken for a result — nothing corrects for it, but it can now be checked for.
+
   Heating stretches below 20 °C are now kept for the physical model. They are still not
   learned from as rate buckets — that range is outside what a bucket describes — but they
   are the most informative measurement the physical model can get, and a fresh fill from

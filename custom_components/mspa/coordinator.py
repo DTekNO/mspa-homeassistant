@@ -14,6 +14,7 @@ from .predictor import (
     extrapolate_within_band,
     newton_fit,
     newton_free_fit,
+    seed_rows_from_buckets,
     newton_heating_minutes,
     physical_constants,
 )
@@ -181,6 +182,22 @@ _STRUCTURED_STATUS_KEYS = frozenset({
     "jet_state", "ozone_state", "uvc_state",
     "bubble_level", "fault",
 })
+
+def _read_weather_condition(hass: HomeAssistant, entity_id: str | None) -> str | None:
+    """The weather entity's own state, e.g. "sunny", "cloudy", "rainy".
+
+    Separate from `_read_weather_entity` rather than a third element of its tuple: that
+    contract is read in two places and asserted in tests, and this is recorded for a
+    question nobody is answering yet. Nothing consumes it — see `_record_band_observation`
+    for why it is kept at all.
+    """
+    if not entity_id:
+        return None
+    state = hass.states.get(entity_id)
+    if state is None or state.state in ("unknown", "unavailable", ""):
+        return None
+    return str(state.state)
+
 
 def _read_weather_entity(hass: HomeAssistant, entity_id: str | None) -> tuple[float | None, float | None]:
     """Read temperature (°C) and wind speed (m/s) from a HA weather entity.
@@ -473,6 +490,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # the ambient correction to know what "normal" outdoor conditions look
         # like for this spa, so colder-than-baseline nights slow the estimate.
         self.ambient_baseline: float | None = None
+        self.ambient_condition: str | None = None
 
         # Prediction accuracy tracker.  Records the initial estimate at the
         # start of a big heating session and compares it to the actual elapsed
@@ -634,6 +652,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             # Read optional weather entity for ambient-condition bias.
             self.ambient_temp, self.ambient_wind = _read_weather_entity(
+                self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
+            )
+            self.ambient_condition = _read_weather_condition(
                 self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
             )
 
@@ -1646,8 +1667,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # None of it drives a prediction. See predictor.py.
 
     def newton_fit(self) -> dict | None:
-        """This spa's `τ` and asymptote, from every traverse recorded."""
-        return newton_fit(self._band_observations)
+        """This spa's `τ` and asymptote, from every traverse recorded.
+
+        Primed from the learned buckets while there are too few traverses to fit from, so
+        a spa that has been learning for months does not start the physical model from
+        nothing — eight traverses is several weeks of ordinary use. The seed is dropped
+        the moment real observations can carry the fit, and is refused outright when the
+        buckets are too flat to imply a plausible spa. See `seed_rows_from_buckets`.
+        """
+        return newton_fit(
+            self._band_observations,
+            seed=seed_rows_from_buckets(
+                getattr(self, "heat_rate_buckets", None), self.ambient_baseline),
+        )
 
     def newton_free_fit(self) -> dict | None:
         """Water and air regressed separately — the coefficients the law constrains."""
@@ -1802,6 +1834,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         return None
 
 
+    @property
+    def _window_condition(self) -> str | None:
+        """The condition that prevailed for most of the traverse, or None.
+
+        Modal rather than first or last: a five-hour band can start overcast and end in
+        sun, and what matters for a solar confound is which it mostly was.
+        """
+        counts = getattr(self, "_window_condition_counts", None)
+        if not counts:
+            return None
+        return max(counts.items(), key=lambda kv: kv[1])[0]
+
     def _seed_window_ambient(self, *, new_band: bool = True) -> None:
         """Start a fresh ambient window at the conditions the band is entered in.
 
@@ -1815,6 +1859,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._window_amb_n = 1 if self.ambient_temp is not None else 0
         self._window_wind_sum = float(self.ambient_wind) if self.ambient_wind is not None else 0.0
         self._window_wind_n = 1 if self.ambient_wind is not None else 0
+        cond = getattr(self, "ambient_condition", None)
+        self._window_condition_counts = {cond: 1} if cond else {}
         # The disturbance survives a mid-band re-anchor.
         #
         # Rejecting a sample re-anchors the window, so a spell with the cover off splits
@@ -1854,6 +1900,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
         amb = (self._window_amb_sum / self._window_amb_n
                if self._window_amb_n else self.ambient_temp)
+        # Sun on the shell is an unmodelled heat input, and it is the confound most
+        # likely to be mistaken for a result. A well-insulated tub can stop cooling
+        # altogether on a bright afternoon, and during a *heating* traverse the same gain
+        # inflates the measured rate — which pushes the fitted air coefficient up, which
+        # is exactly the coefficient `newton_free_fit` tests. A ratio above 1.0 could be
+        # Newton's law failing, or it could be the sun, and nothing recorded so far could
+        # tell the two apart.
+        #
+        # Not modelled and not corrected for: the weather entity's own condition string
+        # is recorded per traverse so the question becomes answerable later, on the same
+        # principle as `delta_mean` — store what a fit might need rather than find out in
+        # spring that it was not kept.
+        condition = self._window_condition or getattr(self, "ambient_condition", None)
         wind = (self._window_wind_sum / self._window_wind_n
                 if self._window_wind_n else self.ambient_wind)
         water_mean = (float(from_temp) + float(to_temp)) / 2.0
@@ -1875,6 +1934,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             "water_mean": round(water_mean, 2),
             "ambient_mean": round(float(amb), 2) if amb is not None else None,
             "wind_mean": round(float(wind), 2) if wind is not None else None,
+            # The condition that prevailed for most of the traverse, e.g. "sunny".
+            "condition": condition,
             # The regressor the physics actually wants, stored so a fit need not
             # reconstruct it and cannot reconstruct it differently.
             "delta_mean": (round(water_mean - float(amb), 2)
@@ -1981,6 +2042,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if self.ambient_temp is not None:
                     self._window_amb_sum += float(self.ambient_temp)
                     self._window_amb_n += 1
+                    _cond = getattr(self, "ambient_condition", None)
+                    if _cond:
+                        counts = getattr(self, "_window_condition_counts", None)
+                        if counts is None:
+                            counts = self._window_condition_counts = {}
+                        counts[_cond] = counts.get(_cond, 0) + 1
                 if self.ambient_wind is not None:
                     self._window_wind_sum += float(self.ambient_wind)
                     self._window_wind_n += 1

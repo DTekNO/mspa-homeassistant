@@ -25,6 +25,7 @@ from custom_components.mspa.predictor import (
     newton_heating_minutes,
     physical_constants,
     _usable_rows,
+    seed_rows_from_buckets,
 )
 
 
@@ -205,6 +206,8 @@ class TestTheRetrospectiveIsRecorded:
         c = object.__new__(MSpaUpdateCoordinator)
         c._band_observations = _traverses(n=40, noise=0.02)
         c.ambient_temp = 12.0
+        c.ambient_baseline = 18.4
+        c.heat_rate_buckets = None
         before = c.newton_minutes(22.0, 39.5)
         assert before is not None
         # A later session's traverses move the fit; the earlier estimate is unaffected
@@ -217,6 +220,8 @@ class TestTheRetrospectiveIsRecorded:
         c = object.__new__(MSpaUpdateCoordinator)
         c._band_observations = []
         c.ambient_temp = 12.0
+        c.ambient_baseline = 18.4
+        c.heat_rate_buckets = None            # nothing recorded and nothing to seed from
         assert c.newton_minutes(22.0, 39.5) is None
 
     def test_the_parameters_used_are_stored_with_the_session(self):
@@ -304,6 +309,8 @@ class TestTheSpecMakesItCheckable:
         c.config_entry = type("E", (), {"options": {"heater_power_heat": 2200,
                                                     "pump_power": 60}})()
         c._band_observations = _traverses(n=40, noise=0.02)
+        c.ambient_baseline = 18.4
+        c.heat_rate_buckets = None
         assert c.physical_constants()["heater_power_w"] == 2200
 
 
@@ -314,11 +321,15 @@ class TestTheShadowRunsInParallel:
     """
 
     def _coord(self, *, fitted=True, target=39.5, scheduled=None, triggered=False,
-               ambient=12.0):
+               ambient=12.0, buckets=None):
         from datetime import datetime, timedelta, timezone
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         c = object.__new__(MSpaUpdateCoordinator)
         c._band_observations = _traverses(n=40, noise=0.02) if fitted else []
+        # No buckets by default, so "not fitted" means nothing to fall back on either.
+        # Seeding is exercised in TestBucketsCanPrimeTheModel.
+        c.heat_rate_buckets = buckets
+        c.ambient_baseline = 18.4
         c.ambient_temp = ambient
         c.scheduled_ready_at = scheduled
         c.schedule_target_temp = target if scheduled else None
@@ -416,6 +427,9 @@ class TestTheModelCanBeSwitchedWithoutMovingAnything:
         c.ambient_temp = ambient
         c.ambient_baseline = 15.0
         c.heat_rate_buckets = [1.2, 1.0, 0.8]
+        # Flat enough that the seed is refused, so "no traverses" still means no fit —
+        # these tests are about the fallback, not about seeding.
+        c.ambient_baseline = None
         c.computed_heat_rate = 1.0
         c.prediction_bias = 1.0
         c._session_scalar = 1.0
@@ -523,6 +537,8 @@ class TestAFreshFillIsNotThrownAway:
         c._window_wind_sum = c._window_wind_n = 0
         c.ambient_temp = 8.0
         c.ambient_wind = 2.0
+        c.ambient_baseline = 8.0
+        c.heat_rate_buckets = None
         return c
 
     def test_a_sub_twenty_traverse_is_recorded(self):
@@ -619,3 +635,140 @@ class TestAFillDoesNotPoisonTheBias:
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         src = inspect.getsource(MSpaUpdateCoordinator._bias_ratio)
         assert "_prediction_history" not in src and "_band_observations" not in src
+
+
+class TestBucketsCanPrimeTheModel:
+    """A bucket *is* physical data already digested — "this spa climbs at r °C/h across
+    this span" is one point on the line the law describes. Three buckets are three
+    points, and a straight line needs two, so a spa that has been learning for months
+    should not have to start the physical model from nothing. Eight traverses is several
+    weeks of ordinary use.
+    """
+
+    TAU, LIFT, AIR = 25.6, 51.0, 18.4
+
+    def _chords(self, tau=None, lift=None):
+        """What a bucket would actually learn: the chord rate, span over time, which is a
+        harmonic mean along the span rather than the rate at its middle."""
+        import math
+        tau, lift = tau or self.TAU, lift or self.LIFT
+        A = self.AIR + lift
+        return [(hi - lo) / (tau * math.log((A - lo) / (A - hi)))
+                for lo, hi in ((20, 30), (30, 37), (37, 39))]
+
+    def test_three_buckets_are_enough_to_place_the_line(self):
+        fit = newton_fit([], seed=seed_rows_from_buckets(self._chords(), self.AIR))
+        assert fit["seeded"] is True
+        assert fit["tau_h"] == pytest.approx(self.TAU, rel=0.02)
+        assert fit["asymptote_lift_c"] == pytest.approx(self.LIFT, rel=0.02)
+
+    def test_the_midpoint_approximation_costs_almost_nothing(self):
+        """A bucket learns the chord rate, and the seed places it at the span's midpoint.
+        The two differ, but by well under a percent — small next to the baseline
+        approximation sitting alongside it."""
+        fit = newton_fit([], seed=seed_rows_from_buckets(self._chords(), self.AIR))
+        assert abs(fit["tau_h"] / self.TAU - 1) < 0.02
+        assert abs(fit["asymptote_lift_c"] / self.LIFT - 1) < 0.02
+
+    def test_flat_buckets_are_refused_rather_than_believed(self):
+        """The reason the gate exists. This spa's live buckets have read 1.03/0.99/1.01,
+        and a line through those implies a body that sheds almost no heat — tau 512 h and
+        a lift of 531 °C, water that would never stop rising. Seeding from that would be
+        worse than not seeding at all."""
+        assert newton_fit([], seed=seed_rows_from_buckets(
+            [1.03, 0.99, 1.01], self.AIR)) is None
+
+    def test_a_properly_shaped_bucket_curve_is_accepted(self):
+        """The same spa's statistics-derived shape, which is what the buckets should look
+        like — the contrast is the whole finding."""
+        fit = newton_fit([], seed=seed_rows_from_buckets(
+            [1.263, 1.086, 0.841], self.AIR))
+        assert fit is not None and fit["seeded"] is True
+        assert 10.0 < fit["tau_h"] < 80.0
+        assert 20.0 < fit["asymptote_lift_c"] < 100.0
+
+    def test_real_traverses_replace_the_seed_rather_than_blend_with_it(self):
+        """A blend would go on carrying the bucket model's shape into a fit whose whole
+        purpose is to replace it."""
+        seed = seed_rows_from_buckets(self._chords(), self.AIR)
+        real = _traverses(n=NEWTON_MIN_N, noise=0.02)
+        assert newton_fit(real, seed=seed)["seeded"] is False
+        assert newton_fit(real, seed=seed)["tau_h"] == pytest.approx(
+            newton_fit(real)["tau_h"])
+
+    def test_the_seed_never_reaches_the_falsification_test(self):
+        """`newton_free_fit` exists to test the law against independent evidence. Points
+        manufactured from a three-bucket model cannot test anything, and a ratio of 1.0
+        derived from them would be arithmetic wearing a result."""
+        import inspect
+        assert "seed" not in inspect.signature(newton_free_fit).parameters
+        assert newton_free_fit(seed_rows_from_buckets(self._chords(), self.AIR)) is None
+
+    def test_no_baseline_means_no_seed(self):
+        """Every seeded point is attributed to the baseline, so without one there is no
+        temperature to attribute them to."""
+        assert seed_rows_from_buckets([1.2, 1.0, 0.8], None) == []
+        assert seed_rows_from_buckets(None, 18.4) == []
+
+    def test_unlearned_buckets_are_skipped_not_zeroed(self):
+        rows = seed_rows_from_buckets([1.2, None, 0.8], self.AIR)
+        assert len(rows) == 2
+        assert [r["water_mean"] for r in rows] == [25.0, 38.0]
+
+
+class TestTheSolarConfoundIsRecorded:
+    """Sun on the shell is an unmodelled heat input, and it is the confound most likely
+    to be mistaken for a result.
+
+    A well-insulated tub can stop cooling altogether on a bright afternoon, and during a
+    *heating* traverse the same gain inflates the measured rate. Because sun correlates
+    with warm air and with daytime, that pushes the fitted air coefficient up — which is
+    exactly the coefficient `newton_free_fit` checks. A ratio above 1.0 could be Newton's
+    law failing, or it could be the sun, and nothing recorded before this could separate
+    them.
+
+    Not modelled and not corrected for. Recorded, so the question becomes answerable.
+    """
+
+    def _coord(self, condition=None):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = []
+        c._band_stats = {}
+        c._window_disturbed = False
+        c._window_amb_sum = c._window_amb_n = 0
+        c._window_wind_sum = c._window_wind_n = 0
+        c._window_condition_counts = {}
+        c.ambient_temp = 14.0
+        c.ambient_wind = 2.0
+        c.ambient_condition = condition
+        return c
+
+    def test_the_condition_travels_with_the_traverse(self):
+        c = self._coord("sunny")
+        c._record_band_observation(2, 37.0, 39.0, 2.0, 1.0)
+        assert c._band_observations[0]["condition"] == "sunny"
+
+    def test_it_is_the_modal_condition_not_the_last(self):
+        """A five-hour band can start overcast and end in sun. What matters for a solar
+        confound is which it mostly was."""
+        c = self._coord("cloudy")
+        c._window_condition_counts = {"cloudy": 12, "sunny": 4}
+        c.ambient_condition = "sunny"
+        c._record_band_observation(1, 30.0, 37.0, 5.0, 1.1)
+        assert c._band_observations[0]["condition"] == "cloudy"
+
+    def test_no_weather_entity_means_no_condition_rather_than_a_crash(self):
+        c = self._coord(None)
+        c._record_band_observation(2, 37.0, 39.0, 2.0, 1.0)
+        assert c._band_observations[0]["condition"] is None
+
+    def test_nothing_consumes_it_yet(self):
+        """Recorded for a question nobody is answering. It must not have quietly become
+        an input — correcting for sun on one recorded string would be worse than not
+        correcting at all."""
+        import inspect
+        from custom_components.mspa import predictor
+        assert "condition" not in inspect.getsource(predictor.newton_fit)
+        assert "condition" not in inspect.getsource(predictor.newton_free_fit)
+        assert "condition" not in inspect.getsource(predictor._usable_rows)

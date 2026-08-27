@@ -698,8 +698,73 @@ def _usable_rows(observations):
     return rows
 
 
-def newton_fit(observations):
+# Bounds a *seeded* fit must satisfy to be used at all. Deliberately generous — the
+# previous spa measured tau 62 h and a lift of 68.6 °C, and both sit comfortably inside.
+#
+# These gate the seed and never a fit from real traverses. The asymmetry is the point: a
+# fit from observations is evidence, and evidence that says something surprising is worth
+# seeing. A seed is an inference drawn out of a *different* model, so when it implies a
+# spa that sheds almost no heat it is the inference that is wrong, not the spa.
+NEWTON_SEED_MAX_TAU_H = 120.0
+NEWTON_SEED_MAX_LIFT_C = 150.0
+
+
+def seed_rows_from_buckets(buckets, ambient_baseline):
+    """Turn the learned rate buckets into pseudo-observations for the physical fit.
+
+    A bucket *is* physical data already digested: "this spa climbs at r °C/h across this
+    span", which is one point on the rate-against-temperature line the law describes.
+    Three buckets are three points, and a straight line needs two — so a spa that has
+    been learning for months does not have to start the physical model from nothing.
+
+    Placed at each span's midpoint. The exact quantity a bucket learns is the *chord*
+    rate, span over time, which is a harmonic mean along the span rather than the rate at
+    its middle — so the midpoint is an approximation. It is a very good one: against the
+    law itself the two differ by 0.03% to 0.42% across the three spans, and a fit built
+    from ideal chords recovers tau to 1.3% and the lift to 0.8%.
+
+    All three are attributed to `ambient_baseline`, which is what the buckets were learned
+    under as far as anything here knows. That is the seed's real weakness rather than the
+    midpoint: the baseline is an EMA that follows the season, so it describes recent
+    conditions better than the conditions any particular bucket was learned in.
+
+    Returns [] when there is nothing to seed from, so callers need no special case.
+    """
+    if ambient_baseline is None or not buckets:
+        return []
+    spans = ((HEAT_BUCKET_LEARN_MIN, HEAT_BUCKET_T1),
+             (HEAT_BUCKET_T1, HEAT_BUCKET_T2),
+             (HEAT_BUCKET_T2, HEAT_BUCKET_LEARN_MAX))
+    rows = []
+    for rate, (lo, hi) in zip(buckets, spans):
+        if rate is None or rate <= 0:
+            continue
+        rows.append({
+            "usable": True,
+            "seeded": True,
+            "rate": float(rate),
+            "water_mean": (lo + hi) / 2.0,
+            "ambient_mean": float(ambient_baseline),
+        })
+    return rows
+
+
+def newton_fit(observations, seed=None):
     """Fit `rate = P/C − gap/τ` over recorded traverses, gap being water minus air.
+
+    `seed` is a list of pseudo-observations from the learned buckets, used **only** while
+    there are too few real traverses to fit from. It is a starting point, not evidence:
+    the moment real observations reach `NEWTON_MIN_N` the seed is dropped entirely rather
+    than blended, because a blend would go on carrying the bucket model's shape into a
+    fit whose whole purpose is to replace it.
+
+    A seeded fit is marked `seeded: True` and is checked against
+    `NEWTON_SEED_MAX_TAU_H` / `NEWTON_SEED_MAX_LIFT_C` before being returned. That check
+    is not decoration. Nearly-flat buckets — and this spa's live buckets have been
+    reading 1.03 / 0.99 / 1.01 — imply a body that sheds almost no heat, and the line
+    through them runs its asymptote away to infinity to imitate the flatness: tau 512 h
+    and a lift of 531 °C, a spa whose water would never stop rising. Seeding from that
+    without a gate would be worse than not seeding at all.
 
     This is the *constrained* form: it assumes the law and reads off its parameters.
     It cannot test itself — collapsing water and air into one regressor presupposes the
@@ -710,8 +775,13 @@ def newton_fit(observations):
     sign (rate rising with the gap is not a spa, it is a measurement problem).
     """
     rows = _usable_rows(observations)
+    seeded = False
+    if len(rows) < NEWTON_MIN_N and seed:
+        rows = _usable_rows(seed)
+        seeded = True
     n = len(rows)
-    if n < NEWTON_MIN_N:
+    # Two points place a line, and a seed only ever offers three.
+    if n < (2 if seeded else NEWTON_MIN_N):
         return None
     gaps = [w - a for w, a, _ in rows]
     rates = [r for _, _, r in rows]
@@ -741,8 +811,13 @@ def newton_fit(observations):
         se_intercept = rms * ((1.0 / n) + mean_g * mean_g / sgg) ** 0.5
     else:
         rms = se_slope = se_intercept = None
+    if seeded and (tau_h > NEWTON_SEED_MAX_TAU_H or lift > NEWTON_SEED_MAX_LIFT_C):
+        # The buckets carry no usable shape. Declining is the honest answer: see the
+        # docstring for what accepting one of these looks like.
+        return None
     return {
         "n": n,
+        "seeded": seeded,
         "tau_h": tau_h,
         "asymptote_lift_c": lift,
         "rate_at_zero_gap": intercept,

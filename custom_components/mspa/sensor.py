@@ -1527,6 +1527,9 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
         if fit:
             out["physical_model"] = {
                 "n": fit["n"],
+                # True while the fit is primed from the learned buckets rather than from
+                # recorded traverses. A seeded fit is a starting point, not evidence.
+                "seeded": fit["seeded"],
                 "tau_h": round(fit["tau_h"], 2),
                 "asymptote_lift_c": round(fit["asymptote_lift_c"], 2),
                 "rate_at_zero_gap": round(fit["rate_at_zero_gap"], 4),
@@ -1625,7 +1628,14 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
         """
         c = self.coordinator
         fit = c.newton_fit()
+        real = len([r for r in getattr(c, "_band_observations", []) if r.get("usable")])
         out = {
+            "traverses_recorded": real,
+            # True while the model is primed from the learned buckets. It says a time
+            # here rests on the bucket shape rather than on measured traverses, which is
+            # exactly the thing the shadow exists to test — so it must be visible in the
+            # history rather than inferred from a date.
+            "seeded": bool(fit and fit["seeded"]),
             "traverses_fitted": fit["n"] if fit else 0,
             "tau_h": round(fit["tau_h"], 2) if fit else None,
             "asymptote_lift_c": round(fit["asymptote_lift_c"], 2) if fit else None,
