@@ -122,10 +122,11 @@ class MockCoordinator:
     uses_frozen_plan = MSpaUpdateCoordinator.uses_frozen_plan
     heating_minutes = MSpaUpdateCoordinator.heating_minutes
 
-    def _predictor(self):
+    def _predictor(self, ambient=None):
         return HeatPredictor(
             buckets=tuple(self.heat_rate_buckets),
             prediction_bias=self.prediction_bias,
+            ambient_temp=ambient,
         )
 
 

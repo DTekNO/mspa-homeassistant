@@ -26,6 +26,7 @@ from custom_components.mspa.predictor import (
     physical_constants,
     _usable_rows,
     seed_rows_from_buckets,
+    forecast_window_mean,
 )
 
 
@@ -507,7 +508,9 @@ class TestTheModelCanBeSwitchedWithoutMovingAnything:
         assert "HeatPredictor.from_coordinator" not in src
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         trigger = inspect.getsource(MSpaUpdateCoordinator._check_schedule_trigger)
-        assert "_compute_heating_minutes" in trigger
+        assert "self.heating_minutes(" in trigger, (
+            "the trigger must price its start through the seam, not its own arithmetic")
+        assert "HeatPredictor(" not in trigger
 
 
 class TestAFreshFillIsNotThrownAway:
@@ -853,3 +856,115 @@ class TestTheTwoNumbersAreComparable:
         s.coordinator = c
         assert c.newton_start_at is not None
         assert s._shipping_equivalent() is not None, "both are timestamps on one axis"
+
+
+class TestPlanningUsesTheForecast:
+    """A schedule is committed hours before it runs, in weather that will have changed
+    by the time it does. Planning from the instantaneous reading is out by +14% on an
+    autumn morning and -10% on a winter night, and the sign flips with the time of day —
+    so no scalar correction could absorb it.
+    """
+
+    def _rows(self, start, temps):
+        from datetime import timedelta
+        return [(start + timedelta(hours=i), t) for i, t in enumerate(temps)]
+
+    def _now(self):
+        from datetime import datetime, timezone
+        return datetime(2026, 10, 15, 22, 0, tzinfo=timezone.utc)
+
+    def test_the_window_is_anchored_at_the_finish(self):
+        """Where the law puts the weight: the exact solution weights air temperature by
+        e^-(t-s)/tau, which is largest for the hours nearest the end of the run."""
+        from datetime import timedelta
+        now = self._now()
+        rows = self._rows(now, [0] * 6 + [10] * 6)      # cold first, mild later
+        mean, n, kind = forecast_window_mean(rows, now + timedelta(hours=11), 6.0)
+        # Hours 5..10 inclusive: six of them, for a six-hour span. A stamp marks the
+        # start of its hour, so the one at the finish belongs to the hour after the run.
+        assert kind == "window" and n == 6
+        assert mean == pytest.approx((0.0 + 10.0 * 5) / 6)
+        assert mean > 8.0, "weighted toward the finish, not the start"
+        # And the same run finishing six hours earlier sees the cold half instead.
+        early, n_early, _ = forecast_window_mean(rows, now + timedelta(hours=6), 6.0)
+        assert n_early == 6 and early == pytest.approx(0.0)
+
+    def test_the_span_is_capped(self):
+        from datetime import timedelta
+        from custom_components.mspa.predictor import FORECAST_MAX_SPAN_H
+        now = self._now()
+        rows = self._rows(now, list(range(48)))
+        _mean, n, _k = forecast_window_mean(rows, now + timedelta(hours=47), 40.0)
+        assert n <= FORECAST_MAX_SPAN_H + 1
+
+    def test_a_schedule_beyond_the_forecast_uses_the_nearest_hours(self):
+        """met.no through Home Assistant offers 48 hours and a schedule may be set
+        further out, so this is ordinary rather than an edge case. The last hours
+        available beat an instantaneous reading from a day and a half earlier."""
+        from datetime import timedelta
+        now = self._now()
+        rows = self._rows(now, [5.0] * 48)
+        got = forecast_window_mean(rows, now + timedelta(hours=80), 8.0)
+        assert got is not None
+        mean, _n, kind = got
+        assert kind == "tail" and mean == pytest.approx(5.0)
+
+    def test_no_forecast_means_no_answer_rather_than_a_guess(self):
+        from datetime import timedelta
+        assert forecast_window_mean([], self._now(), 6.0) is None
+        assert forecast_window_mean(self._rows(self._now(), [5, 5]), None, 6.0) is None
+
+    def _coord(self, rows=None, ambient=15.0):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = []
+        c._band_stats = {}
+        c.heat_rate_buckets = [1.24, 1.095, 0.878]
+        c.ambient_baseline = 18.41
+        c.ambient_temp = ambient
+        c.computed_heat_rate = 0.972
+        c.prediction_bias = 1.0
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c._last_data = {}
+        c._newton_fallback_active = False
+        c._forecast_rows = rows or []
+        c.config_entry = type("E", (), {"options": {}})()
+        return c
+
+    def test_the_estimate_moves_when_the_forecast_disagrees_with_now(self):
+        from datetime import timedelta
+        now = self._now()
+        # Mild right now, freezing across the run that finishes in the small hours.
+        c = self._coord(self._rows(now, [-5.0] * 24), ambient=15.0)
+        finish = now + timedelta(hours=12)
+        warm = c.heating_minutes(33.5, 39.5)
+        mean, kind = c.forecast_ambient_for(finish, 33.5, 39.5)
+        cold = c.heating_minutes(33.5, 39.5, ambient=mean)
+        assert mean == pytest.approx(-5.0) and kind == "window"
+        assert cold > warm, "a freezing night must plan a longer run than a mild evening"
+
+    def test_it_falls_back_to_now_when_there_is_no_forecast(self):
+        """The whole feature is optional. No weather entity, an entity without hourly
+        support, or a service that raises all leave planning exactly as it was."""
+        c = self._coord(rows=[])
+        assert c.forecast_ambient_for(self._now(), 33.5, 39.5) is None
+        assert c.heating_minutes(33.5, 39.5) is not None
+
+    def test_the_override_reaches_both_models(self):
+        buckets = self._coord()
+        buckets.config_entry = type("E", (), {"options": {}})()
+        newton = self._coord()
+        newton.config_entry = type("E", (), {
+            "options": {"prediction_model": "newton"}})()
+        for c in (buckets, newton):
+            mild = c.heating_minutes(33.5, 39.5, ambient=20.0)
+            cold = c.heating_minutes(33.5, 39.5, ambient=-5.0)
+            assert cold > mild, f"{c.prediction_model} ignored the ambient override"
+
+    def test_the_override_does_not_leak_into_the_live_model(self):
+        """It prices one question. The coordinator's own ambient_temp is what every
+        other reader sees, and a planning call must not move it."""
+        c = self._coord()
+        c.heating_minutes(33.5, 39.5, ambient=-30.0)
+        assert c.ambient_temp == 15.0

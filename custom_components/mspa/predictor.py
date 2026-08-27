@@ -982,3 +982,65 @@ def newton_heating_minutes(from_temp, to_temp, ambient, tau_h, asymptote_lift_c)
     from math import log
     return 60.0 * tau_h * log(
         (asymptote - from_temp) / (asymptote - to_temp))
+
+
+# ── Forecast-weighted ambient ────────────────────────────────────────────────
+#
+# A heat-up runs for hours and the instantaneous outdoor temperature describes one
+# moment of it. Measured against exact hour-by-hour integration of a forecast, planning
+# from the temperature at the start is out by +14% on an autumn morning and -10% on a
+# winter night — and the sign flips with the time of day, so it is not a bias any scalar
+# correction could absorb.
+#
+# The fix is a mean rather than an integration, and that is a property of the law rather
+# than a shortcut. Newton's law is linear in air temperature, so the exact solution is an
+# *exponentially weighted* average of it with time constant tau:
+#
+#     T(t) = T0·e^(-t/tau) + (1/tau) ∫ A(s)·e^(-(t-s)/tau) ds
+#
+# Two things follow. Where tau is long against the run — 37.8 h against 7-13 h on the spa
+# this was written for — the weights span only about 0.7 to 1.0, and a plain mean lands
+# within 0.2% of piecewise integration across an autumn morning, a winter night and a
+# settled day. And the weight is largest for the hours nearest the *finish*, which is why
+# the window is anchored there and extended backwards rather than centred.
+FORECAST_MAX_SPAN_H = 24.0
+
+
+def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MAX_SPAN_H):
+    """Mean forecast temperature over the hours leading up to `window_end`.
+
+    `rows` is [(datetime, temp)] in any order; `span_hours` is how far back to reach,
+    capped at `max_span_h`. Anchored at the end because that is where the law puts the
+    weight — see above.
+
+    Falls back to the latest hours available when the forecast stops short of the window,
+    which is the ordinary case rather than an edge one: met.no through Home Assistant
+    offers 48 hours and a schedule may be set further out than that. Those hours are the
+    closest thing to an answer that exists, and beat a single instantaneous reading taken
+    a day and a half earlier.
+
+    Returns (mean, n_hours, kind) or None. `kind` distinguishes the two, so a caller can
+    record what it actually used rather than implying a precision it does not have.
+    """
+    if not rows or window_end is None or not span_hours or span_hours <= 0:
+        return None
+    from datetime import timedelta
+    span = min(float(span_hours), max_span_h)
+    ordered = sorted((t, v) for t, v in rows if t is not None and v is not None)
+    if not ordered:
+        return None
+    start = window_end - timedelta(hours=span)
+    # Half-open at the end. A forecast stamp marks the *start* of the hour it describes,
+    # so the hours covering a run of `span` ending at `window_end` are those starting in
+    # [start, window_end) — the stamp at `window_end` belongs to the hour after the run
+    # finishes. Closed at both ends took one sample too many, giving a six-hour window
+    # seven hourly readings and dragging the mean toward whatever preceded the run.
+    inside = [v for t, v in ordered if start <= t < window_end]
+    if inside:
+        return (sum(inside) / len(inside), len(inside), "window")
+    latest = ordered[-1][0]
+    if window_end > latest:
+        tail = [v for t, v in ordered if t > latest - timedelta(hours=span)]
+        if tail:
+            return (sum(tail) / len(tail), len(tail), "tail")
+    return None

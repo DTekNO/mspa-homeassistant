@@ -15,6 +15,7 @@ from .predictor import (
     newton_fit,
     newton_free_fit,
     seed_rows_from_buckets,
+    forecast_window_mean,
     newton_heating_minutes,
     physical_constants,
 )
@@ -481,6 +482,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.newton_start_at: datetime | None = None
         self.newton_target_temp: float | None = None
         self.newton_plan_temp: float | None = None
+        # Hourly forecast as [(utc datetime, °C)], refreshed on a throttle. See
+        # _refresh_forecast for why this is fetched rather than read off an attribute.
+        self._forecast_rows: list = []
+        self._forecast_fetched_at: float | None = None
+        self._forecast_failed = False
+        self.schedule_ambient: float | None = None
+        self.schedule_ambient_kind: str | None = None
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.
@@ -1080,6 +1088,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "temp_anchor_temp": self.temp_anchor_temp,
                 "temp_anchor_target": self.temp_anchor_target,
             })
+
+            # Before the shadow and the trigger, both of which plan with it.
+            await self._refresh_forecast()
 
             # The physical model's shadow of the same two decisions, recomputed from
             # the same inputs and driving nothing. Before the trigger so that a poll
@@ -1774,6 +1785,99 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     dt_util.as_utc(self.scheduled_ready_at)
                     - timedelta(minutes=minutes))
 
+    # How often the forecast is re-read. The call itself is cheap — see below — but it
+    # crosses the service bus, and the data behind it only changes hourly.
+    _FORECAST_TTL_S = 1800
+
+    async def _refresh_forecast(self) -> None:
+        """Re-read the hourly forecast from the configured weather entity.
+
+        Uses the `weather.get_forecasts` action with `return_response`, which is the only
+        public route a custom integration has. The alternatives were both checked and
+        rejected: `weather/subscribe_forecast` is the websocket API and is reachable from
+        the frontend only, and `WeatherEntity.async_subscribe_forecast` — though public —
+        is documented "Called by websocket API", is called from nowhere else in core, and
+        would mean reaching another domain's entity object through the `entity_component`
+        internals that no component touches cross-domain.
+
+        **It cannot cause an upstream fetch.** `met`'s `_async_forecast_hourly` is a
+        `@callback` returning `self._forecast(True)` — data its own coordinator has
+        already retrieved. So this reads met's cache and never met.no, which matters
+        because fetching met.no ahead of its expiry is how an installation gets banned.
+
+        Failure is not an error. No weather entity, an entity without hourly support, or
+        a service that raises all leave the previous rows in place and let planning fall
+        back to the instantaneous reading, which is what it used before any of this.
+        """
+        entity_id = self.weather_entity
+        if not entity_id:
+            self._forecast_rows = []
+            return
+        now = time.time()
+        if (self._forecast_fetched_at is not None
+                and now - self._forecast_fetched_at < self._FORECAST_TTL_S):
+            return
+        self._forecast_fetched_at = now
+        try:
+            response = await self.hass.services.async_call(
+                "weather", "get_forecasts",
+                {"entity_id": entity_id, "type": "hourly"},
+                blocking=True, return_response=True,
+            )
+            raw = ((response or {}).get(entity_id) or {}).get("forecast") or []
+            rows = []
+            for item in raw:
+                when, temp = item.get("datetime"), item.get("temperature")
+                if when is None or temp is None:
+                    continue
+                try:
+                    rows.append((dt_util.as_utc(datetime.fromisoformat(when)),
+                                 float(temp)))
+                except (TypeError, ValueError):
+                    continue
+            self._forecast_rows = rows
+            if self._forecast_failed and rows:
+                self._forecast_failed = False
+                _LOGGER.info("Forecast available again from %s (%d hours)",
+                             entity_id, len(rows))
+            elif not rows:
+                _LOGGER.debug("Forecast from %s was empty", entity_id)
+        except Exception as err:                              # noqa: BLE001
+            # Deliberately broad: this is an optional refinement, and no failure of it
+            # may take out a schedule that worked perfectly well without it.
+            if not self._forecast_failed:
+                self._forecast_failed = True
+                _LOGGER.info(
+                    "Forecast unavailable from %s (%s) — planning from the current "
+                    "outdoor temperature instead", entity_id, err)
+
+    def forecast_ambient_for(self, finish_utc, from_temp, to_temp):
+        """Mean outdoor temperature to plan a heat-up finishing at `finish_utc` with.
+
+        The duration and the window it averages over each depend on the other, so this
+        iterates: estimate with what it has, take the mean over the window that implies,
+        re-estimate. Two rounds is enough — the second moves the answer by well under a
+        minute — and it is a contraction, because a warmer mean shortens the run, which
+        pulls the window later into weather that is warmer still only by a fraction.
+
+        Returns (mean_c, kind) or None when there is no forecast to work from.
+        """
+        rows = getattr(self, "_forecast_rows", None)
+        if not rows or finish_utc is None:
+            return None
+        minutes = self.heating_minutes(from_temp, to_temp)
+        result = None
+        for _ in range(2):
+            if minutes is None or minutes <= 0:
+                return None
+            got = forecast_window_mean(rows, finish_utc, minutes / 60.0)
+            if got is None:
+                return None
+            mean, _n, kind = got
+            result = (mean, kind)
+            minutes = self.heating_minutes(from_temp, to_temp, ambient=mean)
+        return result
+
     def _tub_is_disturbed(self) -> bool:
         """Whether the spa is in a state where its heating rate cannot be measured.
 
@@ -2365,7 +2469,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         plan_temp = self.scheduling_temp()
         if plan_temp is None:
             plan_temp = current_temp
-        minutes_needed = self._compute_heating_minutes(plan_temp, target_temp)
+        # Plan with the weather expected across the run rather than the weather outside
+        # now. A start committed at 22:00 for an 09:00 finish is the case this exists
+        # for: the air falls all night and rises after dawn, and the reading at the
+        # moment of committing describes neither.
+        forecast = self.forecast_ambient_for(target_utc, plan_temp, target_temp)
+        self.schedule_ambient = forecast[0] if forecast else None
+        self.schedule_ambient_kind = forecast[1] if forecast else None
+        minutes_needed = self.heating_minutes(
+            plan_temp, target_temp,
+            ambient=self.schedule_ambient if forecast else None)
         if minutes_needed is None:
             # No learned rate data yet.  If the scheduled time has already arrived,
             # fire immediately with 0 lead time — raising the setpoint now is
@@ -2444,9 +2557,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         else:
             self._last_schedule_failure = None
 
-    def _predictor(self) -> HeatPredictor:
-        """The shared prediction model, built from current learned state."""
-        return HeatPredictor.from_coordinator(self)
+    def _predictor(self, ambient=None) -> HeatPredictor:
+        """The shared prediction model, built from current learned state.
+
+        `ambient` replaces the instantaneous outdoor reading, so a caller planning a run
+        that finishes tomorrow morning can price it with the weather expected then rather
+        than the weather outside now. Nothing else about the model changes.
+        """
+        p = HeatPredictor.from_coordinator(self)
+        if ambient is not None:
+            p.ambient_temp = ambient
+        return p
 
     @property
     def prediction_model(self) -> str:
@@ -2470,7 +2591,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         return self.prediction_model != PREDICTION_MODEL_NEWTON
 
-    def heating_minutes(self, from_temp: float, to_temp: float) -> float | None:
+    def heating_minutes(self, from_temp: float, to_temp: float,
+                        *, ambient=None) -> float | None:
         """Minutes to heat between two temperatures, under the selected model.
 
         **The one production entry point.** Ready at, the Heat schedule sensor and the
@@ -2485,7 +2607,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         way out, never per poll.
         """
         if self.prediction_model == PREDICTION_MODEL_NEWTON:
-            minutes = self.newton_minutes(from_temp, to_temp)
+            minutes = self.newton_minutes(from_temp, to_temp, ambient=ambient)
             if minutes is not None:
                 if self._newton_fallback_active:
                     self._newton_fallback_active = False
@@ -2505,7 +2627,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     f"asymptote {(self.ambient_temp or 0.0) + fit['asymptote_lift_c']:.1f} °C "
                     f"at outdoor {self.ambient_temp}",
                 )
-        return self._predictor().heating_minutes(from_temp, to_temp)
+        return self._predictor(ambient).heating_minutes(from_temp, to_temp)
 
     def _compute_heating_minutes(self, from_temp: float, to_temp: float) -> float | None:
         """Heating time (minutes) — delegates to the selected model.

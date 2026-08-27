@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the spa is heat the model knows nothing about, and it is the most likely thing to be
   mistaken for a result — nothing corrects for it, but it can now be checked for.
 
+  **The heat schedule now plans with the forecast, not just the temperature outside
+  right now.** A schedule is committed hours before it runs — an overnight plan settled
+  at 22:00 for a 09:00 finish is made while the air is still falling and finishes after
+  dawn — so the reading at the moment of committing describes neither end of the run. The
+  integration now averages the hourly forecast over the hours leading up to your ready
+  time and plans with that. Against exact hour-by-hour calculation this lands within
+  0.2%, where the old approach was out by 14% on an autumn morning and 10% the other way
+  on a winter night. In settled weather the difference is a few minutes; it grows as the
+  season turns. Needs a weather entity that offers an hourly forecast, and falls back to
+  the previous behaviour whenever one is missing, unavailable, or does not reach far
+  enough ahead.
+
   Heating stretches below 20 °C are now kept for the physical model. They are still not
   learned from as rate buckets — that range is outside what a bucket describes — but they
   are the most informative measurement the physical model can get, and a fresh fill from
