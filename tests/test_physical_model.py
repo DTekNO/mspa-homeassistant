@@ -1056,3 +1056,166 @@ class TestTheLiveEtaUsesTheRestOfTheRun:
         c._forecast_rows = []
         c._update_newton_shadow(30.0, 39.5)
         assert c.newton_ambient_source == "now", "no forecast must say so, not pretend"
+
+
+class TestTheForecastIsHardenedAgainstWhateverArrives:
+    """Home Assistant guarantees almost nothing about a forecast.
+
+    `datetime` is the only Required key on the Forecast TypedDict; `temperature` is
+    optional and explicitly nullable. `supported_features` may advertise hourly,
+    twice-daily, daily, any combination, or none — a weather entity is not required to
+    offer a forecast at all. met.no offered 24 hours of hourly data, then 48. So nothing
+    may assume a resolution, a horizon, a field, or that a forecast exists.
+    """
+
+    def _rows(self, temps, *, step_h=1, start=None):
+        from datetime import datetime, timedelta, timezone
+        start = start or datetime(2026, 10, 15, 0, 0, tzinfo=timezone.utc)
+        return [(start + timedelta(hours=i * step_h), t) for i, t in enumerate(temps)]
+
+    def _end(self, hours):
+        from datetime import datetime, timedelta, timezone
+        return datetime(2026, 10, 15, 0, 0, tzinfo=timezone.utc) + timedelta(hours=hours)
+
+    def test_a_daily_forecast_still_answers(self):
+        """Entries a day apart contain no sample inside a six-hour window, however good
+        the forecast is. The nearest day beats this evening's thermometer for a run
+        finishing tomorrow morning."""
+        rows = self._rows([5.0, 12.0, 3.0], step_h=24)      # hours 0, 24, 48
+        # A six-hour window ending at hour 20 spans [14, 20) and contains no entry.
+        mean, n, kind = forecast_window_mean(rows, self._end(20), 6.0)
+        assert kind == "nearest" and n == 1
+        assert mean == pytest.approx(12.0), "the nearest day is hour 24, not hour 0"
+        # And where a daily entry does fall inside, it is used as an ordinary sample.
+        _m, _n, kind_in = forecast_window_mean(rows, self._end(30), 6.0)
+        assert kind_in == "window"
+
+    def test_junk_entries_are_dropped_not_averaged_in(self):
+        rows = self._rows([5.0, 5.0, 5.0])
+        rows += [(self._end(3), None), (self._end(4), "not a number"),
+                 (None, 5.0), (self._end(5), float("nan"))]
+        mean, n, _k = forecast_window_mean(rows, self._end(3), 3.0)
+        assert n == 3 and mean == pytest.approx(5.0)
+
+    def test_impossible_temperatures_are_refused(self):
+        """A value outside the range of inhabited weather is a unit mix-up or a
+        sentinel, not a forecast."""
+        rows = self._rows([5.0, 999.0, -999.0, 5.0])
+        mean, n, _k = forecast_window_mean(rows, self._end(4), 4.0)
+        assert n == 2 and mean == pytest.approx(5.0)
+
+    def test_unordered_input_is_sorted(self):
+        rows = list(reversed(self._rows([0.0, 10.0, 20.0])))
+        mean, n, kind = forecast_window_mean(rows, self._end(3), 3.0)
+        assert kind == "window" and n == 3 and mean == pytest.approx(10.0)
+
+    def test_a_window_far_past_the_forecast_is_declined(self):
+        """Borrowing the last known hour is reasonable a day out and absurd a week out."""
+        from custom_components.mspa.predictor import FORECAST_MAX_EXTRAPOLATION_H
+        rows = self._rows([5.0] * 24)
+        assert forecast_window_mean(
+            rows, self._end(23 + FORECAST_MAX_EXTRAPOLATION_H - 1), 6.0) is not None
+        assert forecast_window_mean(
+            rows, self._end(23 + FORECAST_MAX_EXTRAPOLATION_H + 5), 6.0) is None
+
+    def test_degenerate_arguments_do_not_raise(self):
+        rows = self._rows([5.0, 5.0])
+        for span in (0, -1, None, "six"):
+            assert forecast_window_mean(rows, self._end(2), span) is None
+        assert forecast_window_mean(None, self._end(2), 6.0) is None
+        assert forecast_window_mean([], self._end(2), 6.0) is None
+
+
+class TestTheForecastFetchIsHardened:
+    """The other half: what comes back from the service, and which service to call."""
+
+    def _coord(self, *, features=None, unit="°C", exists=True):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        attrs = {"temperature_unit": unit}
+        if features is not None:
+            attrs["supported_features"] = features
+        state = type("S", (), {"attributes": attrs})()
+        c.hass = type("H", (), {
+            "states": type("St", (), {
+                "get": staticmethod(lambda e: state if exists else None)})()})()
+        return c
+
+    def test_the_kinds_tried_follow_what_the_entity_advertises(self):
+        assert self._coord(features=2)._supported_forecast_kinds("w.x") == ["hourly"]
+        assert self._coord(features=1)._supported_forecast_kinds("w.x") == ["daily"]
+        assert self._coord(features=3)._supported_forecast_kinds("w.x") == [
+            "hourly", "daily"], "hourly first — it is what the maths wants"
+        assert self._coord(features=7)._supported_forecast_kinds("w.x") == [
+            "hourly", "twice_daily", "daily"]
+
+    def test_no_advertised_forecast_tries_everything_rather_than_giving_up(self):
+        """Some integrations under-declare, and a refused call costs one debug line."""
+        assert self._coord(features=0)._supported_forecast_kinds("w.x") == [
+            "hourly", "twice_daily", "daily"]
+        assert self._coord(features=None)._supported_forecast_kinds("w.x") == [
+            "hourly", "twice_daily", "daily"]
+        assert self._coord(features="rubbish")._supported_forecast_kinds("w.x") == [
+            "hourly", "twice_daily", "daily"]
+
+    def test_a_missing_entity_yields_nothing_rather_than_raising(self):
+        assert self._coord(exists=False)._supported_forecast_kinds("w.x") == []
+
+    def test_fahrenheit_is_converted(self):
+        """`_convert_forecast` in core converts to the *user's* display unit, not to
+        Celsius. Treating °F as °C is not a small error — it is a spa that never heats."""
+        c = self._coord(unit="°F")
+        rows = c._forecast_rows_from(
+            [{"datetime": "2099-01-01T00:00:00+00:00", "temperature": 32.0}], "w.x")
+        assert rows[0][1] == pytest.approx(0.0)
+
+    def test_a_daily_high_is_averaged_with_its_low(self):
+        """A daily entry's `temperature` is the day's high, with the low in `templow`.
+        Planning a night-time heat-up from the high is wrong in the expensive
+        direction."""
+        c = self._coord()
+        rows = c._forecast_rows_from(
+            [{"datetime": "2099-01-01T00:00:00+00:00",
+              "temperature": 14.0, "templow": 4.0}], "w.x")
+        assert rows[0][1] == pytest.approx(9.0)
+
+    def test_entries_without_any_temperature_are_skipped(self):
+        c = self._coord()
+        rows = c._forecast_rows_from([
+            {"datetime": "2099-01-01T00:00:00+00:00"},
+            {"datetime": "2099-01-01T01:00:00+00:00", "temperature": None},
+            {"temperature": 5.0},
+            "not a dict",
+            {"datetime": "nonsense", "temperature": 5.0},
+            {"datetime": "2099-01-01T02:00:00+00:00", "temperature": 5.0},
+        ], "w.x")
+        assert len(rows) == 1 and rows[0][1] == pytest.approx(5.0)
+
+    def test_a_forecast_entirely_in_the_past_is_discarded(self):
+        """Not the same as a window past the end of a live forecast. This one is a stale
+        response, and the coordinator is the only party that knows what time it is."""
+        c = self._coord()
+        assert c._forecast_rows_from(
+            [{"datetime": "2001-01-01T00:00:00+00:00", "temperature": 5.0}], "w.x") == []
+
+    def test_a_future_forecast_is_kept(self):
+        """Paired with the test above so that one cannot pass vacuously. It did: the
+        timestamps were mocks, every comparison was truthy, and everything looked
+        discarded for the right-looking reason."""
+        c = self._coord()
+        rows = c._forecast_rows_from(
+            [{"datetime": "2099-01-01T00:00:00+00:00", "temperature": 5.0}], "w.x")
+        assert len(rows) == 1
+        assert rows[0][0].year == 2099 and rows[0][0].tzinfo is not None
+
+    def test_a_naive_timestamp_is_taken_as_utc(self):
+        c = self._coord()
+        rows = c._forecast_rows_from(
+            [{"datetime": "2099-01-01T00:00:00", "temperature": 5.0}], "w.x")
+        assert rows[0][0].tzinfo is not None
+
+    def test_a_non_utc_timestamp_is_normalised(self):
+        c = self._coord()
+        rows = c._forecast_rows_from(
+            [{"datetime": "2099-01-01T02:00:00+02:00", "temperature": 5.0}], "w.x")
+        assert rows[0][0].hour == 0, "must be comparable with every other row"

@@ -493,6 +493,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # what the history means: rows from before the forecast was wired in, or from a
         # spell when it was unavailable, were priced from a single instant.
         self.newton_ambient_source: str = "now"
+        # "hourly", "twice_daily", "daily", or None. Recorded because it decides how
+        # much an averaged window can mean.
+        self.forecast_resolution: str | None = None
 
         # Current ambient conditions read from optional weather sensors.
         # None until the first successful sensor read.
@@ -1822,6 +1825,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         entity_id = self.weather_entity
         if not entity_id:
             self._forecast_rows = []
+            self.forecast_resolution = None
             return
         now = time.time()
         if (self._forecast_fetched_at is not None
@@ -1829,29 +1833,35 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
         self._forecast_fetched_at = now
         try:
-            response = await self.hass.services.async_call(
-                "weather", "get_forecasts",
-                {"entity_id": entity_id, "type": "hourly"},
-                blocking=True, return_response=True,
-            )
-            raw = ((response or {}).get(entity_id) or {}).get("forecast") or []
-            rows = []
-            for item in raw:
-                when, temp = item.get("datetime"), item.get("temperature")
-                if when is None or temp is None:
-                    continue
+            rows, resolution = [], None
+            for kind in self._supported_forecast_kinds(entity_id):
                 try:
-                    rows.append((dt_util.as_utc(datetime.fromisoformat(when)),
-                                 float(temp)))
-                except (TypeError, ValueError):
+                    response = await self.hass.services.async_call(
+                        "weather", "get_forecasts",
+                        {"entity_id": entity_id, "type": kind},
+                        blocking=True, return_response=True,
+                    )
+                except Exception as err:                      # noqa: BLE001
+                    # An entity may advertise a kind and still refuse it. Try the next.
+                    _LOGGER.debug("Forecast %s from %s refused: %s", kind, entity_id, err)
                     continue
+                raw = ((response or {}).get(entity_id) or {}).get("forecast") or []
+                rows = self._forecast_rows_from(raw, entity_id)
+                if rows:
+                    resolution = kind
+                    break
             self._forecast_rows = rows
-            if self._forecast_failed and rows:
-                self._forecast_failed = False
-                _LOGGER.info("Forecast available again from %s (%d hours)",
-                             entity_id, len(rows))
-            elif not rows:
-                _LOGGER.debug("Forecast from %s was empty", entity_id)
+            self.forecast_resolution = resolution
+            if rows:
+                if self._forecast_failed:
+                    self._forecast_failed = False
+                    _LOGGER.info("Forecast available again from %s (%d %s entries)",
+                                 entity_id, len(rows), resolution)
+            elif not self._forecast_failed:
+                self._forecast_failed = True
+                _LOGGER.info(
+                    "No usable forecast from %s — planning from the current outdoor "
+                    "temperature instead", entity_id)
         except Exception as err:                              # noqa: BLE001
             # Deliberately broad: this is an optional refinement, and no failure of it
             # may take out a schedule that worked perfectly well without it.
@@ -1860,6 +1870,88 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.info(
                     "Forecast unavailable from %s (%s) — planning from the current "
                     "outdoor temperature instead", entity_id, err)
+
+    # Preference order. Hourly is what the maths wants; the others are what some
+    # integrations have. A daily entry still says more about tomorrow morning than this
+    # evening's thermometer does.
+    _FORECAST_KINDS = (("hourly", 2), ("twice_daily", 4), ("daily", 1))
+
+    def _supported_forecast_kinds(self, entity_id):
+        """Which forecast types this entity advertises, best first.
+
+        `supported_features` is a bitfield of WeatherEntityFeature: DAILY 1, HOURLY 2,
+        TWICE_DAILY 4. An entity may advertise any combination including none — a
+        weather entity is not required to offer a forecast at all — so this can return
+        an empty list, which is a normal outcome and not an error.
+
+        Falls back to trying everything when the attribute is missing or unreadable
+        rather than concluding there is nothing: some integrations under-declare, and a
+        refused call costs one debug line.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return []
+        try:
+            features = int(state.attributes.get("supported_features") or 0)
+        except (TypeError, ValueError):
+            features = 0
+        if features <= 0:
+            return [kind for kind, _bit in self._FORECAST_KINDS]
+        return [kind for kind, bit in self._FORECAST_KINDS if features & bit]
+
+    def _forecast_rows_from(self, raw, entity_id):
+        """Sanitise a forecast response into [(utc datetime, °C)].
+
+        Everything here is a real way this goes wrong rather than defensive padding:
+
+        * **Units.** `_convert_forecast` in core converts to the *user's* display unit,
+          not to Celsius. A °F household would otherwise have had Fahrenheit numbers
+          treated as Celsius, which is not a small error — it is a spa that never heats.
+        * **Missing temperatures.** `datetime` is the only Required key on the Forecast
+          TypedDict; `temperature` is optional and explicitly nullable.
+        * **Daily highs.** A daily entry's `temperature` is the day's *high*, with the
+          low in `templow`. Planning a night-time heat-up from the daily high would be
+          wrong in the expensive direction, so the two are averaged where both exist.
+        * **Unparseable or naive datetimes**, which are skipped and normalised
+          respectively.
+        """
+        state = self.hass.states.get(entity_id)
+        unit = ((state.attributes.get("temperature_unit") if state else None) or "°C")
+        fahrenheit = unit in ("°F", "F")
+        rows = []
+        for item in raw or ():
+            if not isinstance(item, dict):
+                continue
+            when = item.get("datetime")
+            temp = item.get("temperature")
+            low = item.get("templow")
+            if when is None:
+                continue
+            values = [v for v in (temp, low) if v is not None]
+            if not values:
+                continue
+            try:
+                value = sum(float(v) for v in values) / len(values)
+                # Normalised here rather than through dt_util, so the result is a real
+                # datetime under test as well as in production. A naive stamp is taken
+                # as UTC, which is what Home Assistant emits when it emits one at all.
+                moment = datetime.fromisoformat(str(when))
+                moment = (moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None
+                          else moment.astimezone(timezone.utc))
+            except (TypeError, ValueError):
+                continue
+            if fahrenheit:
+                value = (value - 32.0) * 5.0 / 9.0
+            rows.append((moment, value))
+        # A forecast entirely in the past is not a forecast, it is a stale response —
+        # and it is the coordinator that has to notice, because the pure window function
+        # has no clock. Distance past the end of a *live* forecast is a different thing
+        # and is handled there.
+        if rows and max(t for t, _v in rows) < datetime.now(timezone.utc):
+            _LOGGER.debug("Forecast from %s is entirely in the past — discarding",
+                          entity_id)
+            return []
+        return rows
 
     def forecast_ambient_for(self, finish_utc, from_temp, to_temp):
         """Mean outdoor temperature to price a heat-up with.

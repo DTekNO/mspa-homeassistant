@@ -1005,6 +1005,29 @@ def newton_heating_minutes(from_temp, to_temp, ambient, tau_h, asymptote_lift_c)
 # the window is anchored there and extended backwards rather than centred.
 FORECAST_MAX_SPAN_H = 24.0
 
+# Home Assistant guarantees almost nothing about a forecast. `datetime` is the only
+# Required key on the Forecast TypedDict; `temperature` is optional and explicitly
+# nullable. `supported_features` may advertise hourly, twice-daily, daily, any
+# combination, or none at all — met.no offered 24 hours of hourly data, then 48, and
+# another integration may offer neither. So nothing here may assume a resolution, a
+# horizon, a field, or that any forecast exists.
+#
+# Bounds on a plausible outdoor air temperature. Lower than the coldest inhabited place
+# and higher than the hottest, because the purpose is to reject a unit mix-up or a
+# sentinel value, not to second-guess a forecaster.
+FORECAST_MIN_C = -80.0
+FORECAST_MAX_C = 60.0
+
+# How far past the end of a forecast the nearest entry may still be borrowed.
+#
+# This is distance, not staleness, and the two are different failures that were briefly
+# conflated here. A forecast that stops before the window is ordinary — met.no through
+# Home Assistant reaches 48 hours and a schedule can be set further out — and the last
+# hours it does have still beat a reading taken now, which is even further from the run.
+# Genuinely stale data, where the whole forecast is in the past, is the coordinator's to
+# notice, because it is the only one that knows what time it is.
+FORECAST_MAX_EXTRAPOLATION_H = 48.0
+
 
 def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MAX_SPAN_H):
     """Mean forecast temperature over the hours leading up to `window_end`.
@@ -1022,12 +1045,34 @@ def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MA
     Returns (mean, n_hours, kind) or None. `kind` distinguishes the two, so a caller can
     record what it actually used rather than implying a precision it does not have.
     """
-    if not rows or window_end is None or not span_hours or span_hours <= 0:
+    if not rows or window_end is None or span_hours is None:
         return None
     from datetime import timedelta
-    span = min(float(span_hours), max_span_h)
-    ordered = sorted((t, v) for t, v in rows if t is not None and v is not None)
+    # Converted before it is compared: a non-numeric span raised a TypeError on the
+    # comparison rather than being rejected by the conversion below it.
+    try:
+        span = min(float(span_hours), float(max_span_h))
+    except (TypeError, ValueError):
+        return None
+    if span <= 0:
+        return None
+    ordered = []
+    for t, v in rows:
+        if t is None or v is None:
+            continue
+        try:
+            value = float(v)
+        except (TypeError, ValueError):
+            continue
+        # A value outside this is a unit mix-up or a sentinel, not weather.
+        if not (FORECAST_MIN_C <= value <= FORECAST_MAX_C) or value != value:
+            continue
+        ordered.append((t, value))
     if not ordered:
+        return None
+    ordered.sort(key=lambda tv: tv[0])
+    beyond = (window_end - ordered[-1][0]).total_seconds() / 3600
+    if beyond > FORECAST_MAX_EXTRAPOLATION_H:
         return None
     start = window_end - timedelta(hours=span)
     # Half-open at the end. A forecast stamp marks the *start* of the hour it describes,
@@ -1038,9 +1083,13 @@ def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MA
     inside = [v for t, v in ordered if start <= t < window_end]
     if inside:
         return (sum(inside) / len(inside), len(inside), "window")
-    latest = ordered[-1][0]
-    if window_end > latest:
-        tail = [v for t, v in ordered if t > latest - timedelta(hours=span)]
-        if tail:
-            return (sum(tail) / len(tail), len(tail), "tail")
-    return None
+    # Nothing inside the window. Two ways that happens, and both are ordinary.
+    #
+    # The window sits past the end of the forecast — met.no through Home Assistant
+    # reaches 48 hours and a schedule may be set further out. Or the forecast is coarser
+    # than the window: a six-hour run against daily entries contains no sample at all,
+    # however good the forecast is. Either way the nearest entry is the best answer that
+    # exists, and it beats a single instantaneous reading taken a day earlier.
+    nearest = min(ordered, key=lambda tv: abs((tv[0] - window_end).total_seconds()))
+    kind = "tail" if window_end > ordered[-1][0] else "nearest"
+    return (nearest[1], 1, kind)
