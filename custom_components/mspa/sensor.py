@@ -1634,6 +1634,25 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
+    @staticmethod
+    def _to_the_minute(when):
+        """Round an ETA to the nearest minute.
+
+        The shadow is recomputed on every coordinator poll — thirty seconds while the
+        heater runs, and one second during a rapid-poll burst — and the raw value is
+        `now + minutes`, so it shifted by a second or two each time and wrote a recorder
+        row for it. A ten-hour heat-up produced something like twelve hundred rows of a
+        diagnostic whose useful resolution is minutes.
+
+        Rounding collapses that to a row only when the estimate genuinely moves, which is
+        the thing being watched. A model that is holding steady now looks like it is
+        holding steady, instead of like a value that never stops changing.
+        """
+        if when is None:
+            return None
+        from datetime import timedelta
+        return (when + timedelta(seconds=30)).replace(second=0, microsecond=0)
+
     def __init__(self, coordinator):
         super().__init__(coordinator)
         self._attr_device_info = self.device_info
@@ -1675,7 +1694,11 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
             # sensor shows the scheduled time verbatim rather than an estimate — so the
             # two are not always answering the same question.
             "target_temp_c": c.newton_target_temp,
-            "plan_temp_c": c.newton_plan_temp,
+            # Rounded for the same reason as the state. The planned-from temperature is
+            # extrapolated within its band, so it moves continuously; at full precision it
+            # changed on every poll and a changed attribute writes a row whatever the
+            # state does.
+            "plan_temp_c": _r(c.newton_plan_temp, 1),
             "asymptote_deg_c": (
                 round(c.ambient_temp + fit["asymptote_lift_c"], 1)
                 if fit and c.ambient_temp is not None else None),
@@ -1705,7 +1728,7 @@ class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
 
     @property
     def native_value(self):
-        return self.coordinator.newton_ready_at
+        return self._to_the_minute(self.coordinator.newton_ready_at)
 
     def _shipping_equivalent(self):
         """The bucket model's answer to *this sensor's* question, in minutes.
@@ -1724,7 +1747,7 @@ class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
         from_temp, to_temp = c.newton_plan_temp, c.newton_target_temp
         if from_temp is None or to_temp is None:
             return None
-        return _r(c._predictor().heating_minutes(from_temp, to_temp), 1)
+        return _r(c._predictor().heating_minutes(from_temp, to_temp), 0)
 
 
 class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
@@ -1741,7 +1764,7 @@ class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
 
     @property
     def native_value(self):
-        return self.coordinator.newton_start_at
+        return self._to_the_minute(self.coordinator.newton_start_at)
 
     def _shipping_equivalent(self):
         """The bucket model's planned start, which is what actually fires the heater."""

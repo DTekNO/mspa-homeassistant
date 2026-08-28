@@ -832,7 +832,9 @@ class TestTheTwoNumbersAreComparable:
         s.coordinator = c
         shipping = s._shipping_equivalent()
         buckets = c._predictor().heating_minutes(33.5, 39.5)
-        assert shipping == pytest.approx(buckets, abs=0.1)
+        # Whole minutes: the attribute is rounded so it does not churn a recorder row on
+        # every poll, which for a multi-hour estimate costs nothing.
+        assert shipping == pytest.approx(buckets, abs=0.5)
         assert shipping > 60, "a six-degree climb is hours, not zero"
 
     def test_it_is_absent_rather_than_wrong_when_there_is_no_span(self):
@@ -1436,3 +1438,62 @@ class TestNoReadingIsNotTheSameAsNoAnswer:
             "ambient_source"] == "none"
         assert self._sensor(ambient=18.41).extra_state_attributes[
             "ambient_source"] == "now"
+
+
+class TestTheShadowDoesNotChurnTheRecorder:
+    """The shadow is recomputed on every coordinator poll — thirty seconds while the
+    heater runs, one second during a rapid-poll burst — and there is no separate timer.
+    The raw value is `now + minutes`, so it moved a second or two each time and wrote a
+    row for it, which is a lot of history for a diagnostic whose useful resolution is
+    minutes.
+    """
+
+    def _sensor(self, when):
+        from custom_components.mspa.sensor import MSpaNewtonReadyAtSensor
+        s = object.__new__(MSpaNewtonReadyAtSensor)
+        s.coordinator = type("C", (), {"newton_ready_at": when})()
+        return s
+
+    def test_a_steady_estimate_stops_moving(self):
+        """The point of it. A model that is holding steady still jitters a second or two
+        between polls, because the estimate is `now + minutes` and both sides move. Those
+        polls must produce one value, not one apiece."""
+        import random
+        from datetime import datetime, timedelta, timezone
+        rng = random.Random(4)
+        # Away from a rounding boundary, which sits at :30 rather than :00 — the value is
+        # nudged forward half a minute before the seconds are dropped, so a base at :30 is
+        # the one place jitter is *guaranteed* to straddle two minutes. Picked the wrong
+        # one twice writing this.
+        base = datetime(2026, 10, 15, 6, 30, 5, tzinfo=timezone.utc)
+        seen = {self._sensor(base + timedelta(seconds=rng.uniform(-2, 2))).native_value
+                for _ in range(30)}
+        assert len(seen) == 1, f"{len(seen)} distinct values across 30 jittering polls"
+
+    def test_a_drift_across_a_boundary_is_one_step_not_many(self):
+        """Rounding does not hide movement, it quantises it. Twenty-five seconds of
+        genuine drift is one change of state rather than twenty-five."""
+        from datetime import datetime, timedelta, timezone
+        base = datetime(2026, 10, 15, 6, 30, 12, tzinfo=timezone.utc)
+        seen = {self._sensor(base + timedelta(seconds=s)).native_value
+                for s in range(25)}
+        assert len(seen) == 2, "one boundary crossed, so two values"
+
+    def test_it_rounds_rather_than_truncates(self):
+        """Truncating would bias every estimate early by up to a minute, which on a
+        shadow being scored against the real thing is a free half-minute of accuracy
+        thrown away."""
+        from datetime import datetime, timezone
+        up = self._sensor(datetime(2026, 10, 15, 6, 30, 45, tzinfo=timezone.utc))
+        down = self._sensor(datetime(2026, 10, 15, 6, 30, 20, tzinfo=timezone.utc))
+        assert up.native_value.minute == 31
+        assert down.native_value.minute == 30
+
+    def test_a_real_move_still_shows(self):
+        from datetime import datetime, timedelta, timezone
+        base = datetime(2026, 10, 15, 6, 30, 0, tzinfo=timezone.utc)
+        assert (self._sensor(base + timedelta(minutes=7)).native_value
+                != self._sensor(base).native_value)
+
+    def test_nothing_to_round_stays_nothing(self):
+        assert self._sensor(None).native_value is None
