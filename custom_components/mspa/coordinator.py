@@ -727,6 +727,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # can tell a model that was wrong from one that had not yet
                         # learned anything.
                         "newton_params": _newton_params(self.newton_fit()),
+                        # Which ambient priced that estimate: a live reading, a forecast
+                        # mean across the run, or the seasonal baseline standing in for a
+                        # weather source that was down. Without it a session planned
+                        # during an outage is indistinguishable in the file from one
+                        # planned on a good forecast, and the two deserve very different
+                        # weight when the model is finally judged.
+                        "newton_ambient_source": self.newton_ambient_source,
+                        "newton_ambient_c": _round_or_none(
+                            self.effective_ambient()[0], 2),
                         "weather_entity": self.weather_entity,
                         "prediction_bias": round(self.prediction_bias, 3),
                         "session_scalar": self._session_scalar,
@@ -1084,6 +1093,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 ),
                 "newton_fit": self.newton_fit(),
                 "newton_implied_tub": self.physical_constants(),
+                # What the two shadow values above were priced with, so the file explains
+                # itself. The forecast can be absent for reasons that are not faults — no
+                # weather entity, an entity without an hourly forecast — and a reader
+                # months later cannot tell that from an outage without being told.
+                "newton_ambient_source": self.newton_ambient_source,
+                "forecast_resolution": self.forecast_resolution,
+                "forecast_hours": len(getattr(self, "_forecast_rows", []) or []),
+                "schedule_ambient": _round_or_none(self.schedule_ambient, 2),
+                "schedule_ambient_kind": self.schedule_ambient_kind,
                 "temp_anchor_time": (
                     self.temp_anchor_time.isoformat()
                     if self.temp_anchor_time is not None else None

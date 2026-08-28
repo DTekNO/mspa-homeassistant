@@ -1497,3 +1497,58 @@ class TestTheShadowDoesNotChurnTheRecorder:
 
     def test_nothing_to_round_stays_nothing(self):
         assert self._sensor(None).native_value is None
+
+
+class TestTheStorageFileExplainsItself:
+    """The whole retrospective is meant to be readable in .storage without Home Assistant
+    running. A number with no account of how it was made is not evidence.
+
+    The gap this closes: a session planned while the weather source was down looked
+    identical in the file to one planned on a good forecast, and the two deserve very
+    different weight when the model is finally judged.
+    """
+
+    def _saved(self):
+        """The keys the coordinator writes, read out of the source rather than run,
+        because reaching the save call needs a live Home Assistant."""
+        import ast
+        from pathlib import Path
+        src = Path(__file__).parent.parent / "custom_components" / "mspa" / "coordinator.py"
+        tree = ast.parse(src.read_text())
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "async_save"
+                    and node.args and isinstance(node.args[0], ast.Dict)):
+                return {k.value for k in node.args[0].keys
+                        if isinstance(k, ast.Constant)}
+        raise AssertionError("no async_save({...}) found")
+
+    def test_the_shadow_values_are_persisted(self):
+        saved = self._saved()
+        for key in ("newton_ready_at", "newton_start_at", "newton_fit",
+                    "newton_implied_tub"):
+            assert key in saved, key
+
+    def test_and_what_priced_them(self):
+        saved = self._saved()
+        for key in ("newton_ambient_source", "schedule_ambient",
+                    "schedule_ambient_kind", "forecast_resolution", "forecast_hours"):
+            assert key in saved, f"{key} — the file cannot explain itself without it"
+
+    def test_the_history_carries_both_models_error(self):
+        """The comparison the whole exercise exists for, in the file rather than only on
+        a sensor."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
+        for key in ("estimated_minutes_newton", "newton_params",
+                    "newton_ambient_source", "error_minutes_newton",
+                    "error_minutes_biased"):
+            assert f'"{key}"' in src, key
+
+    def test_prediction_history_is_persisted_whole(self):
+        """It is the record; a sensor attribute is only a view of it."""
+        assert "prediction_history" in self._saved()
+        assert "active_prediction" in self._saved(), (
+            "an in-flight session must survive a restart or its estimate is lost")
