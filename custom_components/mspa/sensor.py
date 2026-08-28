@@ -1634,24 +1634,36 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
-    @staticmethod
-    def _to_the_minute(when):
-        """Round an ETA to the nearest minute.
+    # Five minutes, and the arithmetic that settled on it is worth keeping.
+    #
+    # The shadow is recomputed on every coordinator poll — thirty seconds while the
+    # heater runs, one second during a rapid-poll burst — and the raw value is
+    # `now + minutes`, so unrounded it wrote a recorder row on every poll: measured at
+    # 120 an hour, 2880 a day, indefinitely.
+    #
+    # Rounding to the minute only halved it, because of what the sensor does when nothing
+    # is happening. Idle, the water temperature is fixed, so `minutes` is constant and the
+    # estimate slides forward at exactly wall-clock rate — a new minute every minute,
+    # 1440 rows a day, none of them saying anything. The heat-up case reasons the other
+    # way and is what the first attempt was built around: there the estimate holds still
+    # while time passes, so rounding does collapse it. The sensor is idle almost all the
+    # time.
+    #
+    # Five minutes costs nothing where it matters. A nine-hour run still has 108 possible
+    # points, which is ample for seeing whether the estimate wanders, and that is the
+    # whole job.
+    _QUANTUM_S = 300
 
-        The shadow is recomputed on every coordinator poll — thirty seconds while the
-        heater runs, and one second during a rapid-poll burst — and the raw value is
-        `now + minutes`, so it shifted by a second or two each time and wrote a recorder
-        row for it. A ten-hour heat-up produced something like twelve hundred rows of a
-        diagnostic whose useful resolution is minutes.
-
-        Rounding collapses that to a row only when the estimate genuinely moves, which is
-        the thing being watched. A model that is holding steady now looks like it is
-        holding steady, instead of like a value that never stops changing.
-        """
+    @classmethod
+    def _quantised(cls, when):
+        """Round an ETA to the nearest `_QUANTUM_S`. None stays None."""
         if when is None:
             return None
-        from datetime import timedelta
-        return (when + timedelta(seconds=30)).replace(second=0, microsecond=0)
+        from datetime import datetime, timedelta, timezone
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        secs = (when - epoch).total_seconds()
+        return epoch + timedelta(
+            seconds=round(secs / cls._QUANTUM_S) * cls._QUANTUM_S)
 
     def __init__(self, coordinator):
         super().__init__(coordinator)
@@ -1728,7 +1740,7 @@ class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
 
     @property
     def native_value(self):
-        return self._to_the_minute(self.coordinator.newton_ready_at)
+        return self._quantised(self.coordinator.newton_ready_at)
 
     def _shipping_equivalent(self):
         """The bucket model's answer to *this sensor's* question, in minutes.
@@ -1764,7 +1776,7 @@ class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
 
     @property
     def native_value(self):
-        return self._to_the_minute(self.coordinator.newton_start_at)
+        return self._quantised(self.coordinator.newton_start_at)
 
     def _shipping_equivalent(self):
         """The bucket model's planned start, which is what actually fires the heater."""

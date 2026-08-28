@@ -1461,32 +1461,45 @@ class TestTheShadowDoesNotChurnTheRecorder:
         import random
         from datetime import datetime, timedelta, timezone
         rng = random.Random(4)
-        # Away from a rounding boundary, which sits at :30 rather than :00 — the value is
-        # nudged forward half a minute before the seconds are dropped, so a base at :30 is
-        # the one place jitter is *guaranteed* to straddle two minutes. Picked the wrong
-        # one twice writing this.
-        base = datetime(2026, 10, 15, 6, 30, 5, tzinfo=timezone.utc)
+        # Away from a rounding boundary — those sit every five minutes, so :31 is safely
+        # inside one.
+        base = datetime(2026, 10, 15, 6, 31, 0, tzinfo=timezone.utc)
         seen = {self._sensor(base + timedelta(seconds=rng.uniform(-2, 2))).native_value
                 for _ in range(30)}
         assert len(seen) == 1, f"{len(seen)} distinct values across 30 jittering polls"
 
-    def test_a_drift_across_a_boundary_is_one_step_not_many(self):
-        """Rounding does not hide movement, it quantises it. Twenty-five seconds of
-        genuine drift is one change of state rather than twenty-five."""
+    def test_an_idle_spa_is_the_case_that_matters(self):
+        """Idle, the water temperature is fixed, so the remaining time is constant and the
+        estimate slides forward at exactly wall-clock rate. Rounding to the minute halved
+        the churn and no more — measured live at 1440 rows a day, none of them saying
+        anything. This is the case the quantum was chosen for, and the heat-up case
+        reasons the other way, which is how the first attempt got it wrong."""
         from datetime import datetime, timedelta, timezone
-        base = datetime(2026, 10, 15, 6, 30, 12, tzinfo=timezone.utc)
-        seen = {self._sensor(base + timedelta(seconds=s)).native_value
-                for s in range(25)}
-        assert len(seen) == 2, "one boundary crossed, so two values"
+        from custom_components.mspa.sensor import _MSpaNewtonShadowSensor as S
+        base = datetime(2026, 10, 15, 6, 0, 0, tzinfo=timezone.utc)
+        # An hour of polling every 30s on an estimate that only moves because time does.
+        polls = list(range(0, 3600, 30))
+        seen = {self._sensor(base + timedelta(seconds=t)).native_value for t in polls}
+        # An hour spans one more boundary than it contains intervals, so 13 rather than
+        # 12. What matters is the ratio to the polls that produced them.
+        assert len(seen) <= 3600 // S._QUANTUM_S + 1, f"{len(seen)} rows an hour idle"
+        assert len(seen) * 8 < len(polls), (
+            f"{len(seen)} rows from {len(polls)} polls is not a meaningful reduction")
+
+    def test_a_long_heat_up_still_has_ample_resolution(self):
+        """The cost of the quantum, stated rather than assumed."""
+        from custom_components.mspa.sensor import _MSpaNewtonShadowSensor as S
+        points = 9 * 3600 // S._QUANTUM_S
+        assert points >= 100, f"only {points} points across a nine-hour run"
 
     def test_it_rounds_rather_than_truncates(self):
-        """Truncating would bias every estimate early by up to a minute, which on a
-        shadow being scored against the real thing is a free half-minute of accuracy
-        thrown away."""
+        """Truncating would bias every estimate early by up to the whole quantum, which
+        on a shadow being scored against the real thing is accuracy thrown away for
+        nothing."""
         from datetime import datetime, timezone
-        up = self._sensor(datetime(2026, 10, 15, 6, 30, 45, tzinfo=timezone.utc))
-        down = self._sensor(datetime(2026, 10, 15, 6, 30, 20, tzinfo=timezone.utc))
-        assert up.native_value.minute == 31
+        up = self._sensor(datetime(2026, 10, 15, 6, 33, 0, tzinfo=timezone.utc))
+        down = self._sensor(datetime(2026, 10, 15, 6, 32, 0, tzinfo=timezone.utc))
+        assert up.native_value.minute == 35
         assert down.native_value.minute == 30
 
     def test_a_real_move_still_shows(self):

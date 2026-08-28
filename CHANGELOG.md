@@ -33,9 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schedule sensors, so there will be nothing to rewire. Two diagnostic sensors,
   **Newton ready at** and **Newton start at**, report what the physical model would have
   said, recomputed on every poll. Your schedule and your Ready at are unchanged and still
-  come from the learned buckets; these two decide nothing. They report to the nearest minute: they are
-  recomputed on every poll, and at full precision they moved a second or two each time
-  and filled the history with changes that were not changes. They exist as sensors rather
+  come from the learned buckets; these two decide nothing. They report to the nearest five minutes: they
+  are recomputed on every poll, and at full precision they moved a second or two each
+  time and filled the history with changes that were not changes. They exist as sensors rather
   than attributes so their history is recorded and can be charted, which is the only way
   to see whether the model wanders during a long heat-up. Both are blank when the model
   declines — too few heating stretches recorded, or a night cold enough that it says the
