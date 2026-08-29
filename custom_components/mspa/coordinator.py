@@ -696,7 +696,25 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     and transformed_data.get("heat_state") == _HEAT_STATE_FULL
                     and self._prediction is None):
                 # Lazy import to reuse the sensor's segmented calculation.
-                est_minutes = self._compute_heating_minutes(new_temp, new_target)
+                # One ambient for the whole record, and the same one the live paths
+                # use. The scheduler and the Ready at path already price a run with the
+                # forecast averaged across it; this block did not, so the estimate that
+                # got *scored* was made from the instantaneous reading while the estimate
+                # on display was made from the forecast. They were different quantities
+                # wearing the same name, and on the 2026-08-28 session they disagreed by
+                # an hour — the shadow said 744 minutes, the scored figure 684, the truth
+                # 700. Comparing models is meaningless until both are answering the same
+                # question, and so is comparing either against what was shown.
+                #
+                # Applied to every estimate here, not only the physical one. The bucket
+                # correction is the same physics through a coarser model: a rate learned
+                # in other weather, adjusted for the weather expected across this run.
+                _open = self.live_ambient_for(new_temp, new_target)
+                _open_amb, _open_src = (
+                    (_open[0], f"forecast_{_open[1]}") if _open
+                    else self.effective_ambient())
+                est_minutes = self._compute_heating_minutes(
+                    new_temp, new_target, ambient=_open_amb)
                 if est_minutes is not None:
                     # Store the raw estimate (without bias) for history tracking.
                     # The bias is derived from raw vs actual, so storing the biased
@@ -712,17 +730,20 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # response can be scored against the seed on real finishes.
                         "estimated_minutes_seed_only": _round_or_none(
                             self._heating_minutes_variant(
-                                new_temp, new_target, use_fits=False)),
+                                new_temp, new_target, use_fits=False,
+                                ambient=_open_amb)),
                         "estimated_minutes_learned": _round_or_none(
                             self._heating_minutes_variant(
-                                new_temp, new_target, use_fits=True)),
+                                new_temp, new_target, use_fits=True,
+                                ambient=_open_amb)),
                         # And the same session priced by the physical model, from the
                         # fit as it stands before this session contributes anything to
                         # it. None until enough traverses exist to fit, and None again
                         # whenever the model says the target is out of reach — both are
                         # findings, so neither is filled in with a substitute.
                         "estimated_minutes_newton": _round_or_none(
-                            self.newton_minutes(new_temp, new_target)),
+                            self.newton_minutes(new_temp, new_target,
+                                                ambient=_open_amb)),
                         # The parameters that estimate was made with, so a retrospective
                         # can tell a model that was wrong from one that had not yet
                         # learned anything.
@@ -733,9 +754,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # during an outage is indistinguishable in the file from one
                         # planned on a good forecast, and the two deserve very different
                         # weight when the model is finally judged.
-                        "newton_ambient_source": self.newton_ambient_source,
-                        "newton_ambient_c": _round_or_none(
-                            self.effective_ambient()[0], 2),
+                        "ambient_source": _open_src,
+                        "ambient_c": _round_or_none(_open_amb, 2),
                         "weather_entity": self.weather_entity,
                         "prediction_bias": round(self.prediction_bias, 3),
                         "session_scalar": self._session_scalar,
@@ -753,8 +773,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # *this* for the duration, so mid-session learning cannot move
                         # an estimate that is already committed: rates learned today
                         # take effect on the next session, not this one.
+                        # Frozen from the same ambient as the estimates above, or the
+                        # curve the session runs on would disagree with the number it was
+                        # promised.
                         "plan_rates": [
-                            (b * ambient_rate_factor(i, self.ambient_temp,
+                            (b * ambient_rate_factor(i, _open_amb,
                                                      self.ambient_baseline))
                             if b else None
                             for i, b in enumerate(self.heat_rate_buckets)
@@ -2882,16 +2905,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 )
         return self._predictor(ambient).heating_minutes(from_temp, to_temp)
 
-    def _compute_heating_minutes(self, from_temp: float, to_temp: float) -> float | None:
+    def _compute_heating_minutes(self, from_temp: float, to_temp: float,
+                                 *, ambient=None) -> float | None:
         """Heating time (minutes) — delegates to the selected model.
 
         Was a second implementation of the sensor's calculation, kept in sync by
         hand and documented as mirroring it "to avoid a circular import" that did
         not exist.  They had drifted; see predictor.py.
         """
-        return self.heating_minutes(from_temp, to_temp)
+        return self.heating_minutes(from_temp, to_temp, ambient=ambient)
 
-    def _heating_minutes_variant(self, from_temp, to_temp, *, use_fits: bool):
+    def _heating_minutes_variant(self, from_temp, to_temp, *, use_fits: bool,
+                                 ambient=None):
         """The same estimate, with the learned weather response forced on or off.
 
         Both are recorded for every session so the correction can be judged on finished
@@ -2901,6 +2926,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         p = HeatPredictor.from_coordinator(self)
         p.band_fits = self.band_fits(force=True) if use_fits else {}
+        if ambient is not None:
+            p.ambient_temp = ambient
         return p.heating_minutes(from_temp, to_temp)
 
     # Map of features to their respective API methods

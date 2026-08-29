@@ -1565,3 +1565,61 @@ class TestTheStorageFileExplainsItself:
         assert "prediction_history" in self._saved()
         assert "active_prediction" in self._saved(), (
             "an in-flight session must survive a restart or its estimate is lost")
+
+
+class TestBothModelsArePricedTheSameWay:
+    """A comparison between two models is worth nothing until they are answering the same
+    question, and neither is worth anything against what was displayed unless that was
+    the same question too.
+
+    The 2026-08-28 session is what exposed it. The shadow sensor said 744 minutes, priced
+    with the forecast averaged across the run; the figure recorded and scored said 684,
+    priced with the reading taken at the moment the session opened. The truth was 700.
+    Two different quantities, one name, and an hour between them.
+    """
+
+    def test_the_opening_record_prices_everything_from_one_ambient(self):
+        """Every estimate in the session record, both models, from the same reading."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
+        block = src[src.index('"estimated_minutes"'):src.index('"plan_rates"')]
+        for key in ("estimated_minutes_seed_only", "estimated_minutes_learned",
+                    "estimated_minutes_newton"):
+            i = block.index(key)
+            assert "_open_amb" in block[i:i + 400], f"{key} is priced from its own ambient"
+        assert "_open_amb" in src[src.index('"plan_rates"'):
+                                  src.index('"plan_rates"') + 400], (
+            "the frozen curve must agree with the estimate it was promised alongside")
+
+    def test_the_bucket_model_takes_the_override_too(self):
+        """The same physics through a coarser model: a rate learned in other weather,
+        adjusted for the weather expected across this run. Not a Newton-only idea."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = []
+        c._band_stats = {}
+        c.heat_rate_buckets = [1.24, 1.095, 0.878]
+        c.ambient_baseline = 15.94
+        c.ambient_temp = 17.0
+        c.computed_heat_rate = 0.972
+        c.prediction_bias = 1.0
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c.config_entry = type("E", (), {"options": {}})()
+        mild = c._heating_minutes_variant(28.5, 39.5, use_fits=False, ambient=17.0)
+        cold = c._heating_minutes_variant(28.5, 39.5, use_fits=False, ambient=6.0)
+        assert cold > mild, "a cold night must price the bucket run longer too"
+        assert c._compute_heating_minutes(28.5, 39.5, ambient=6.0) == pytest.approx(cold)
+
+    def test_the_live_paths_already_did_this(self):
+        """Recorded so nobody re-derives it: the scheduler and the Ready at path have
+        priced with the forecast since it was added, and they reach both models through
+        the one seam. Only the opening record was left behind."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        from custom_components.mspa import sensor as sensor_mod
+        trigger = inspect.getsource(MSpaUpdateCoordinator._check_schedule_trigger)
+        assert "schedule_ambient" in trigger and "ambient=" in trigger
+        seg = inspect.getsource(sensor_mod._segmented_heating_minutes)
+        assert "live_ambient_for" in seg and "ambient=" in seg
