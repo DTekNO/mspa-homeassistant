@@ -891,13 +891,44 @@ class TestPlanningUsesTheForecast:
         early, n_early, _ = forecast_window_mean(rows, now + timedelta(hours=6), 6.0)
         assert n_early == 6 and early == pytest.approx(0.0)
 
-    def test_the_span_is_capped(self):
+    def test_a_covered_run_averages_the_whole_of_itself(self):
+        """However long it is. Those are the hours the spa will actually be heating
+        through, so two days and one night is the truth rather than a skewed sample."""
         from datetime import timedelta
-        from custom_components.mspa.predictor import FORECAST_MAX_SPAN_H
         now = self._now()
-        rows = self._rows(now, list(range(48)))
-        _mean, n, _k = forecast_window_mean(rows, now + timedelta(hours=47), 40.0)
-        assert n <= FORECAST_MAX_SPAN_H + 1
+        rows = self._rows(now, [10.0] * 48)
+        _mean, n, kind = forecast_window_mean(rows, now + timedelta(hours=40), 40.0)
+        assert kind == "window" and n == 40, f"{n} hours of a 40-hour run"
+
+    def test_an_uncovered_run_falls_back_to_one_whole_cycle(self):
+        """Past the forecast the window is a stand-in rather than the run, and then an
+        unbalanced slice of the diurnal cycle biases the mean by up to two degrees on
+        nothing but where it happened to fall. Twenty-four hours is the only span whose
+        mean does not depend on its anchor."""
+        from datetime import timedelta
+        from custom_components.mspa.predictor import FORECAST_DIURNAL_H
+        now = self._now()
+        rows = self._rows(now, [10.0] * 30)
+        _mean, n, kind = forecast_window_mean(rows, now + timedelta(hours=40), 40.0)
+        assert kind == "partial"
+        assert n <= FORECAST_DIURNAL_H + 1, f"{n} hours; want one cycle"
+
+    def test_the_diurnal_fallback_removes_the_anchor_bias(self):
+        """The measurement the number is chosen from. On a profile swinging 8 to 21 °C a
+        24-hour mean reads the same wherever it starts; 30 hours swings 1.7 °C."""
+        from datetime import timedelta
+        now = self._now()
+        day = [11, 10, 9, 9, 8, 8, 9, 11, 13, 15, 17, 19,
+               20, 21, 21, 20, 19, 18, 16, 15, 14, 13, 12, 11]
+        rows = self._rows(now, day * 3)              # 72 hours, 0..71
+        # Uncovered because a 40-hour window reaches back before the forecast starts,
+        # while the clipped 24 hours are all present. Each is a whole cycle at a
+        # different anchor and they must agree.
+        got = [forecast_window_mean(rows, now + timedelta(hours=e), 40.0)
+               for e in (26, 30, 34)]
+        assert all(k == "partial" and n == 24 for _m, n, k in got), got
+        means = [m for m, _n, _k in got]
+        assert max(means) - min(means) < 0.05, f"anchor still matters: {means}"
 
     def test_a_schedule_beyond_the_forecast_uses_the_nearest_hours(self):
         """met.no through Home Assistant offers 48 hours and a schedule may be set
@@ -943,7 +974,9 @@ class TestPlanningUsesTheForecast:
         warm = c.heating_minutes(33.5, 39.5)
         mean, kind = c.forecast_ambient_for(finish, 33.5, 39.5)
         cold = c.heating_minutes(33.5, 39.5, ambient=mean)
-        assert mean == pytest.approx(-5.0) and kind == "window"
+        # "partial" rather than "window": the run is long enough that its window starts
+        # before the forecast does, so this is the clipped cycle rather than the run.
+        assert mean == pytest.approx(-5.0) and kind in ("window", "partial")
         assert cold > warm, "a freezing night must plan a longer run than a mild evening"
 
     def test_it_falls_back_to_now_when_there_is_no_forecast(self):

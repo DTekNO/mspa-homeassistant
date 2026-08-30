@@ -97,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   usable and become less accurate. Borrowed from Better Thermostat, which flags a
   missing outside-temperature sensor the same way.
 
+  When a heat-up is long enough to run past the end of the forecast, the average is taken
+  over a whole day rather than over whatever part of one the forecast happens to reach.
+  Two days and one night is not a day's weather, and averaging an odd number of daylight
+  and dark hours can shift the figure by a couple of degrees on nothing but where the run
+  falls. Where the forecast does cover the whole run, the whole run is used however long
+  it is — those are the hours the spa will actually be heating through.
+
   Heating stretches below 20 °C are now kept for the physical model. They are still not
   learned from as rate buckets — that range is outside what a bucket describes — but they
   are the most informative measurement the physical model can get, and a fresh fill from

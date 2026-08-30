@@ -1006,7 +1006,20 @@ def newton_heating_minutes(from_temp, to_temp, ambient, tau_h, asymptote_lift_c)
 # within 0.2% of piecewise integration across an autumn morning, a winter night and a
 # settled day. And the weight is largest for the hours nearest the *finish*, which is why
 # the window is anchored there and extended backwards rather than centred.
-FORECAST_MAX_SPAN_H = 24.0
+# One whole diurnal cycle, and the number is not arbitrary.
+#
+# It is the span used when the forecast does not reach across the whole run, and it is 24
+# because that is the only length whose mean does not depend on where it is anchored. On
+# a late-summer profile swinging 8 to 21 °C, a 24-hour window reads 14.1 °C wherever it
+# starts; 26, 30 and 36-hour windows read anywhere from 13.1 to 15.3 depending purely on
+# which incomplete part of the cycle they happen to catch — up to 2.1 °C of pure
+# artefact. Two days and one night is not a day's weather.
+#
+# It is a fallback and not a ceiling. Where the forecast *does* cover the run, the window
+# is the run however long it is, because then the hours averaged are the hours the spa
+# will actually endure and an unbalanced sample is the correct answer rather than a
+# biased one.
+FORECAST_DIURNAL_H = 24.0
 
 # Home Assistant guarantees almost nothing about a forecast. `datetime` is the only
 # Required key on the Forecast TypedDict; `temperature` is optional and explicitly
@@ -1032,12 +1045,19 @@ FORECAST_MAX_C = 60.0
 FORECAST_MAX_EXTRAPOLATION_H = 48.0
 
 
-def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MAX_SPAN_H):
+def forecast_window_mean(rows, window_end, span_hours, *,
+                         diurnal_h=FORECAST_DIURNAL_H):
     """Mean forecast temperature over the hours leading up to `window_end`.
 
-    `rows` is [(datetime, temp)] in any order; `span_hours` is how far back to reach,
-    capped at `max_span_h`. Anchored at the end because that is where the law puts the
-    weight — see above.
+    `rows` is [(datetime, temp)] in any order; `span_hours` is how far back to reach.
+    Anchored at the end because that is where the law puts the weight — see above.
+
+    The span is the run itself wherever the forecast covers it, and one whole diurnal
+    cycle where it does not. Those are different situations and were briefly treated as
+    one. A covered window averages the hours the spa will actually be heating through, so
+    a thirty-hour run spanning two days and one night is measuring the truth. An
+    uncovered one is a stand-in, and then an unbalanced slice of the cycle biases the
+    answer by up to two degrees on nothing but where it fell.
 
     Falls back to the latest hours available when the forecast stops short of the window,
     which is the ordinary case rather than an edge one: met.no through Home Assistant
@@ -1054,7 +1074,7 @@ def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MA
     # Converted before it is compared: a non-numeric span raised a TypeError on the
     # comparison rather than being rejected by the conversion below it.
     try:
-        span = min(float(span_hours), float(max_span_h))
+        span = float(span_hours)
     except (TypeError, ValueError):
         return None
     if span <= 0:
@@ -1077,6 +1097,25 @@ def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MA
     beyond = (window_end - ordered[-1][0]).total_seconds() / 3600
     if beyond > FORECAST_MAX_EXTRAPOLATION_H:
         return None
+    # Covered means the forecast reaches across the whole of the requested window, so
+    # the hours averaged are the hours the run will occupy. Otherwise fall back to a
+    # whole cycle, which is the only span whose mean is independent of its anchor.
+    first, last = ordered[0][0], ordered[-1][0]
+    # A stamp marks the start of the period it describes, so the forecast reaches one
+    # step past its final stamp: hourly rows ending at 23:00 cover up to midnight, and a
+    # daily row covers the whole day after it. Taken as the median gap so a single ragged
+    # entry cannot shrink the horizon, and so this works for daily and twice-daily
+    # forecasts as well as hourly.
+    if len(ordered) >= 2:
+        gaps = sorted((ordered[i + 1][0] - ordered[i][0]).total_seconds()
+                      for i in range(len(ordered) - 1))
+        step_s = gaps[len(gaps) // 2] or 3600.0
+    else:
+        step_s = 3600.0
+    covered = (window_end <= last + timedelta(seconds=step_s)
+               and window_end - timedelta(hours=span) >= first)
+    if not covered:
+        span = min(span, float(diurnal_h))
     start = window_end - timedelta(hours=span)
     # Half-open at the end. A forecast stamp marks the *start* of the hour it describes,
     # so the hours covering a run of `span` ending at `window_end` are those starting in
@@ -1085,7 +1124,8 @@ def forecast_window_mean(rows, window_end, span_hours, *, max_span_h=FORECAST_MA
     # seven hourly readings and dragging the mean toward whatever preceded the run.
     inside = [v for t, v in ordered if start <= t < window_end]
     if inside:
-        return (sum(inside) / len(inside), len(inside), "window")
+        return (sum(inside) / len(inside), len(inside),
+                "window" if covered else "partial")
     # Nothing inside the window. Two ways that happens, and both are ordinary.
     #
     # The window sits past the end of the forecast — met.no through Home Assistant
