@@ -1623,3 +1623,86 @@ class TestBothModelsArePricedTheSameWay:
         assert "schedule_ambient" in trigger and "ambient=" in trigger
         seg = inspect.getsource(sensor_mod._segmented_heating_minutes)
         assert "live_ambient_for" in seg and "ambient=" in seg
+
+
+class TestTheBiasIsMeasuredNotApplied:
+    """prediction_bias predates the per-band correction for outdoor temperature and was
+    the catch-all for the same thing: conditions today differ from the conditions the
+    rates were learned in. The ambient correction now does that explicitly, per band,
+    with a mechanism, so the bias became a second blind correction for a cause already
+    being corrected — and it cannot tell a systematic error from a strange session.
+
+    Across the seven real sessions recorded by 30.08, mean absolute error was 44.2
+    minutes raw and 60.4 with the bias applied.
+    """
+
+    def _coord(self, bias=0.9, history=None):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.prediction_bias = bias
+        c._prediction_history = history or []
+        c._band_observations = []
+        c._band_stats = {}
+        c.heat_rate_buckets = [1.24, 1.095, 0.878]
+        c.ambient_baseline = 15.94
+        c.ambient_temp = 16.0
+        c.computed_heat_rate = 0.972
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c.config_entry = type("E", (), {"options": {}})()
+        return c
+
+    def test_an_estimate_no_longer_carries_it(self):
+        """The change itself. A bias of 0.9 shortened every estimate by a tenth; on the
+        28.08 session that turned a 695-minute prediction into 626 against an actual of
+        701."""
+        assert self._coord(bias=0.9).heating_minutes(28.0, 39.5) == pytest.approx(
+            self._coord(bias=1.0).heating_minutes(28.0, 39.5))
+
+    def test_but_it_is_still_learned(self):
+        """Kept so the decision rests on finished sessions rather than on an argument."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = self._coord(bias=1.0)
+        c._apply_bias_sample(0.8, span_c=11.0)
+        assert c.prediction_bias < 1.0, "the EMA must go on tracking"
+
+    def test_the_store_scores_it_both_ways(self):
+        """`bias_evaluation` is what makes "measured, not applied" mean something."""
+        history = [
+            {"actual_minutes": 700.9, "error_minutes": 5.8,
+             "error_minutes_biased": 75.3, "error_minutes_newton": -16.0,
+             "estimated_minutes_newton": 716.9},
+            {"actual_minutes": 511.9, "error_minutes": -0.3,
+             "error_minutes_biased": 14.5},
+            {"actual_minutes": 3.4, "error_minutes": -679.9,     # cancelled plan
+             "error_minutes_biased": -643.8},
+        ]
+        ev = self._coord(history=history).bias_evaluation()
+        assert ev["all"]["sessions"] == 2, "a 3-minute session is not evidence"
+        assert ev["all"]["mean_abs_error_min"] == pytest.approx(3.05, abs=0.06)
+        assert ev["all"]["mean_abs_error_with_bias_min"] == pytest.approx(44.9)
+
+    def test_the_instrumented_set_is_reported_separately(self):
+        """Runs before the instrumentation was finished are not comparable, so the set
+        that carries a physical-model estimate is scored on its own."""
+        history = [
+            {"actual_minutes": 700.9, "error_minutes": 5.8,
+             "error_minutes_biased": 75.3, "error_minutes_newton": -16.0,
+             "estimated_minutes_newton": 716.9},
+            {"actual_minutes": 712.1, "error_minutes": -243.0,   # the 25.08 anomaly
+             "error_minutes_biased": -204.3},
+        ]
+        ev = self._coord(history=history).bias_evaluation()
+        assert ev["all"]["sessions"] == 2
+        assert ev["instrumented"]["sessions"] == 1
+        assert ev["instrumented"]["mean_abs_error_min"] == pytest.approx(5.8)
+        assert ev["instrumented"]["mean_abs_error_newton_min"] == pytest.approx(16.0)
+
+    def test_the_opening_eta_shows_what_is_predicted(self):
+        """It read estimated_minutes_biased, which is now a counterfactual — displaying
+        it would show a time the integration no longer stands behind."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator.session_opening_eta)
+        assert 'pred["estimated_minutes"]' in src
+        assert "estimated_minutes_biased" not in src.split('"""')[2]

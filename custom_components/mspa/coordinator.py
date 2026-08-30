@@ -256,6 +256,12 @@ def _round_or_none(value, digits: int = 1):
     return None if value is None else round(float(value), digits)
 
 
+# Below this a session is a cancelled plan or a spurious trigger rather than a heat-up,
+# and its error says nothing about any model. The record on 30.08 held three: two of
+# 3.4 and 41.7 minutes against estimates near 680, and one that finished in 0.0.
+_MIN_SCOREABLE_MINUTES = 60.0
+
+
 def _newton_params(fit):
     """The two parameters an estimate was made with, rounded for a stored record.
 
@@ -522,6 +528,27 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Historical bias correction for heating predictions.
         # Derived from average error_percent in prediction_history.
         # A value > 1.0 means predictions have been too optimistic (actual > estimated).
+        # Learned on every finished session and applied to none of them.
+        #
+        # It predates the per-band correction for outdoor temperature and was the
+        # catch-all for the same thing: conditions today differ from the conditions the
+        # rates were learned in. Temperature is most of that, and the ambient correction
+        # now does it explicitly, per band, with a mechanism — so the bias became a
+        # second blind correction for a cause already being corrected.
+        #
+        # It also cannot tell a systematic error from a strange session, and was fed by
+        # exactly the sessions it could not interpret. Across the seven real sessions in
+        # the record on 30.08, mean absolute error was 44.2 minutes raw and 60.4 minutes
+        # with the bias applied: on the four where the raw model was almost exact
+        # (+2.3, -2.1, -0.3, +5.8 minutes) the bias added 60, 25, 15 and 75 minutes of
+        # error. One anomalous run on 25.08 — 1.264 °C/h average, faster than any rate
+        # the spa has ever learned — dragged it from 0.96 to 0.90, and the next accurate
+        # session paid 75 minutes for it.
+        #
+        # Kept and measured rather than deleted, so the decision rests on finished
+        # sessions rather than on this argument. `estimated_minutes_biased` records what
+        # it would have said; `bias_evaluation` in the store scores it. Applying it again
+        # is one line in HeatPredictor.from_coordinator.
         self.prediction_bias: float = 1.0
 
         # Extended device detail fetched once on init from /api/device/detail/
@@ -548,6 +575,45 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return abs(float(new_target) - float(planned)) >= _TEMP_BAND_C
         except (TypeError, ValueError):
             return False
+
+    def bias_evaluation(self) -> dict:
+        """Score the bias against the estimates it is no longer applied to.
+
+        Reported over two sets. `all` is every scoreable session in the record, and
+        `instrumented` is only those carrying a physical-model estimate — which is the
+        set worth trusting, because the runs before that were made while the
+        instrumentation was still being built and their conditions are not comparable.
+        Both are given rather than one, so the choice of set is visible instead of
+        buried here.
+        """
+        out = {"bias": round(self.prediction_bias, 4)}
+        for label, rows in (
+            ("all", [r for r in self._prediction_history
+                     if (r.get("actual_minutes") or 0) >= _MIN_SCOREABLE_MINUTES]),
+            ("instrumented", [r for r in self._prediction_history
+                              if (r.get("actual_minutes") or 0) >= _MIN_SCOREABLE_MINUTES
+                              and r.get("estimated_minutes_newton") is not None]),
+        ):
+            applied, shadow, newton = [], [], []
+            for r in rows:
+                if r.get("error_minutes") is not None:
+                    applied.append(abs(r["error_minutes"]))
+                if r.get("error_minutes_biased") is not None:
+                    shadow.append(abs(r["error_minutes_biased"]))
+                if r.get("error_minutes_newton") is not None:
+                    newton.append(abs(r["error_minutes_newton"]))
+            out[label] = {
+                "sessions": len(rows),
+                # What the integration now ships.
+                "mean_abs_error_min": _round_or_none(
+                    sum(applied) / len(applied) if applied else None, 1),
+                # What it would have shipped with the bias applied.
+                "mean_abs_error_with_bias_min": _round_or_none(
+                    sum(shadow) / len(shadow) if shadow else None, 1),
+                "mean_abs_error_newton_min": _round_or_none(
+                    sum(newton) / len(newton) if newton else None, 1),
+            }
+        return out
 
     @staticmethod
     def _bias_ratio(record: dict) -> float | None:
@@ -719,13 +785,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     # Store the raw estimate (without bias) for history tracking.
                     # The bias is derived from raw vs actual, so storing the biased
                     # value would create a feedback loop that erases the correction.
-                    raw_minutes = est_minutes / self.prediction_bias if self.prediction_bias else est_minutes
+                    # est_minutes is already unbiased — the bias is no longer applied —
+                    # so the counterfactual is the multiplication rather than the
+                    # division this used to be.
+                    raw_minutes = est_minutes
+                    biased_minutes = est_minutes * (self.prediction_bias or 1.0)
                     self._prediction = {
                         "start_time": datetime.now(timezone.utc).isoformat(),
                         "start_temp": new_temp,
                         "target_temp": new_target,
+                        # What the integration actually predicts.
                         "estimated_minutes": round(raw_minutes, 1),
-                        "estimated_minutes_biased": round(est_minutes, 1),
+                        # And what it would have predicted with the bias applied, which
+                        # is a shadow now rather than the shipped figure. Kept under the
+                        # same key so a stored history spanning the change stays readable
+                        # — the meaning moved, the arithmetic behind the name did not.
+                        "estimated_minutes_biased": round(biased_minutes, 1),
                         # The same session priced both ways, so the learned weather
                         # response can be scored against the seed on real finishes.
                         "estimated_minutes_seed_only": _round_or_none(
@@ -1098,6 +1173,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "band_observations": self._band_observations,
                 "band_stats": self._band_stats,
                 "prediction_bias": self.prediction_bias,
+                # Learned, not applied. See MSpaUpdateCoordinator.prediction_bias.
+                "prediction_bias_applied": False,
+                "bias_evaluation": self.bias_evaluation(),
                 "active_prediction": self._prediction,
                 # Persisted so a restart mid-scheduled-heating resumes as
                 # "Heating" instead of dropping back to pending and re-firing.
@@ -1412,13 +1490,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 and (at_temp - start_temp) >= _PLAN_SETTLE_DEGREES)
 
     def session_opening_eta(self):
-        """Finish time implied by the opening estimate, or None outside a session."""
+        """Finish time implied by the opening estimate, or None outside a session.
+
+        From `estimated_minutes`, which is now what the integration predicts.
+        `estimated_minutes_biased` used to be the shipped figure and is a counterfactual
+        since the bias stopped being applied; displaying it here would have shown a time
+        the integration no longer stands behind.
+        """
         pred = self._prediction
         if not pred:
             return None
         try:
             started = datetime.fromisoformat(pred["start_time"])
-            return started + timedelta(minutes=float(pred["estimated_minutes_biased"]))
+            return started + timedelta(minutes=float(pred["estimated_minutes"]))
         except (KeyError, TypeError, ValueError):
             return None
 

@@ -218,7 +218,10 @@ class HeatPredictor:
         flat = getattr(coordinator, "computed_heat_rate", None)
         return cls(
             buckets=getattr(coordinator, "heat_rate_buckets", [None, None, None]),
-            prediction_bias=getattr(coordinator, "prediction_bias", 1.0),
+            # Deliberately not the coordinator's learned bias. It goes on being
+            # learned and recorded; it is no longer applied to an estimate. See
+            # MSpaUpdateCoordinator.prediction_bias for the evidence.
+            prediction_bias=1.0,
             session_scalar=getattr(coordinator, "_session_scalar", 1.0),
             fresh_buckets=getattr(coordinator, "_session_fresh_buckets", frozenset()),
             ambient_temp=getattr(coordinator, "ambient_temp", None),

@@ -1746,13 +1746,23 @@ class TestManualHeatUnderAPendingSchedule:
             **kw,
         )
 
-    def _session(self, c):
-        """Mark a session open, the way the coordinator does when the setpoint jumps."""
+    def _session(self, c, *, started_minutes_ago=300.0):
+        """Mark a session open, the way the coordinator does when the setpoint jumps.
+
+        Started hours ago by default, because that is the only way a session reaches the
+        temperatures these tests use: one opens only when the setpoint is more than
+        _NEW_SESSION_DELTA above the water, so a session whose water is already within a
+        tenth of its target has necessarily been running a long time. Starting it "now"
+        made a state that cannot occur, and the assertion below passed only because the
+        record was missing a key the coordinator always writes.
+        """
         c._prediction = {
-            "start_time": datetime.now(timezone.utc).isoformat(),
+            "start_time": (datetime.now(timezone.utc)
+                           - timedelta(minutes=started_minutes_ago)).isoformat(),
             "start_temp": 24.0,
             "target_temp": 39.5,
             "estimated_minutes": 480.0,
+            "estimated_minutes_biased": 460.0,
             "plan_rates": [1.21, 1.04, 0.86],
         }
         return c

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Estimates no longer carry the prediction bias.** It is still learned from every
+  finished heat-up and still recorded — it is simply not applied. The bias predates the
+  correction for outdoor temperature and was a catch-all for the same thing, so it had
+  become a second, blind correction for a cause already being handled; and because it
+  cannot distinguish a model that is systematically wrong from one odd session, a single
+  strange run could tax every accurate one that followed. Across seven recorded
+  sessions, estimates were out by 44 minutes on average without it and 60 with it. Your
+  Ready at and heat schedule times may shift slightly, generally later. The integration's
+  storage file now records what the bias would have predicted alongside what was
+  predicted, so it can be judged on real sessions and switched back on if it earns it.
+
 - **The Ambient learning sensor no longer goes unknown when the weather source is
   down.** It reports 1.0, which is what is actually happening — with no outdoor reading
   no correction is applied — and a new `ambient_source` attribute says whether that 1.0
