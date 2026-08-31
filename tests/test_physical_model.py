@@ -1927,3 +1927,50 @@ class TestBothStartTimesArePricedTheSameWay:
         c.schedule_target_temp = None
         c._update_newton_shadow(30.0, 39.0)
         assert c.newton_start_at is None
+
+    def test_all_four_paths_use_the_same_temperature_component(self):
+        """Two questions, four answers, and each pair must share an ambient.
+
+        The *schedulers* both ask "when must this start to be ready at the scheduled
+        time", so both price the window ending at that time. The *planners* both ask
+        "when will it be ready if it runs from now", so both price the window ending when
+        heating would finish. Within each pair the ambient must be identical or the two
+        numbers are not differenceable; across the pairs it legitimately differs, because
+        they are different windows describing different runs.
+
+        Every one of these four has been wrong at some point, each found separately.
+        """
+        from datetime import datetime, timezone
+        from custom_components.mspa.sensor import _segmented_heating_minutes
+        c = self._coord(air_now=20.0, forecast_c=5.0, days=1)
+        plan, therm, sched = 30.0, 39.0, 39.0
+        due = c.scheduled_ready_at
+
+        planner_amb = c.live_ambient_for(plan, therm)[0]
+        scheduler_amb = c.forecast_ambient_for(due, plan, sched)[0]
+        assert planner_amb == pytest.approx(5.0), "the forecast, not the 20 C outside"
+        assert scheduler_amb == pytest.approx(5.0)
+
+        c._update_newton_shadow(plan, therm)
+
+        # 1. Newton planner
+        want = c.newton_minutes(plan, sched, ambient=planner_amb)
+        got = (c.newton_ready_at - datetime.now(timezone.utc)).total_seconds() / 60
+        assert got == pytest.approx(want, abs=5.0), "newton ready-at"
+
+        # 2. Newton scheduler
+        want = c.newton_minutes(plan, sched, ambient=scheduler_amb)
+        got = (due - c.newton_start_at).total_seconds() / 60
+        assert got == pytest.approx(want, abs=5.0), "newton start-at"
+
+        # 3. Bucket planner, through the seam the Ready at sensor uses
+        assert _segmented_heating_minutes(plan, therm, c) == pytest.approx(
+            c.heating_minutes(plan, therm, ambient=planner_amb)), "bucket ready-at"
+
+        # 4. Bucket scheduler. Async and side-effecting, so checked at the source: it
+        # must derive schedule_ambient from the scheduled time and pass it on.
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._check_schedule_trigger)
+        assert "self.forecast_ambient_for(target_utc" in src
+        assert "ambient=self.schedule_ambient" in src
