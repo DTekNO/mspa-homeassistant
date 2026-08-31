@@ -1697,7 +1697,7 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
             "ambient_temp_deg_c": c.ambient_temp,
             # Which ambient priced this row: the instant, or a forecast mean over the
             # rest of the run. It changes what the number means, so it travels with it.
-            "ambient_source": getattr(c, "newton_ambient_source", "now"),
+            "ambient_source": getattr(c, self._ambient_source_attr, "now"),
             # The asymptote in absolute terms is what decides reachability, so it is the
             # number that explains a None.
             # What this row aimed at, and from where. A Ready-at row cannot be read
@@ -1736,6 +1736,7 @@ class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
 
     _shadow_name = "Newton ready at"
     _shadow_slug = "newton_ready_at"
+    _ambient_source_attr = "newton_ambient_source"
     _attr_icon = "mdi:function-variant"
 
     @property
@@ -1772,6 +1773,7 @@ class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
 
     _shadow_name = "Newton start at"
     _shadow_slug = "newton_start_at"
+    _ambient_source_attr = "newton_start_ambient_source"
     _attr_icon = "mdi:function-variant"
 
     @property

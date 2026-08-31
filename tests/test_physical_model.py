@@ -1844,3 +1844,86 @@ class TestTheOneShotRecordsWhatItNeedsTo:
                      "newton_minutes"):
             src = inspect.getsource(getattr(MSpaUpdateCoordinator, name))
             assert "read_outdoor_sensor" not in src, f"{name} consults it already"
+
+
+class TestBothStartTimesArePricedTheSameWay:
+    """The start-at shadow priced itself from the instantaneous reading while the shipping
+    planner used the forecast averaged across the run. Two different questions, and far
+    more visible here than anywhere else the same mistake was made: a schedule days out is
+    priced from weather days away, so an afternoon reading against a pre-dawn forecast put
+    the two start times hours apart. Observed at ten.
+    """
+
+    def _coord(self, *, air_now=20.0, forecast_c=5.0, days=1):
+        from datetime import datetime, timedelta, timezone
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        from custom_components.mspa import coordinator as mod
+        mod.dt_util.as_utc = lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._band_observations = []
+        c._band_stats = {}
+        c.heat_rate_buckets = [1.24, 1.095, 0.878]
+        c.ambient_baseline = 15.9
+        c.ambient_temp = air_now
+        c.computed_heat_rate = 0.972
+        c.prediction_bias = 1.0
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c._last_data = {}
+        c._newton_fallback_active = False
+        c.config_entry = type("E", (), {"options": {}})()
+        now = datetime.now(timezone.utc)
+        c.scheduled_ready_at = now + timedelta(days=days)
+        c.schedule_target_temp = 39.0
+        c._schedule_triggered = False
+        c.newton_ready_at = c.newton_start_at = None
+        c.newton_target_temp = c.newton_plan_temp = None
+        c.newton_ambient_source = c.newton_start_ambient_source = "now"
+        c.scheduling_temp = lambda: 30.0
+        # A cold forecast, flat, so the window mean is unambiguous.
+        c._forecast_rows = [(now + timedelta(hours=i), forecast_c) for i in range(48)]
+        return c
+
+    def test_the_planned_start_uses_the_forecast_not_the_thermometer(self):
+        """A warm reading now must not shorten a run planned for a cold night."""
+        c = self._coord(air_now=20.0, forecast_c=5.0)
+        c._update_newton_shadow(30.0, 39.0)
+        cold = c.newton_start_at
+        warm = self._coord(air_now=20.0, forecast_c=20.0)
+        warm._update_newton_shadow(30.0, 39.0)
+        assert cold < warm.newton_start_at, (
+            "a colder forecast must start the heat-up earlier, whatever it is outside now")
+
+    def test_it_matches_what_the_shipping_planner_would_use(self):
+        """Same window, same figure — the two start times are only differenceable if the
+        ambient behind them is the same."""
+        c = self._coord(days=1)          # inside the 48-hour forecast
+        c._update_newton_shadow(30.0, 39.0)
+        due = c.scheduled_ready_at
+        expected = c.forecast_ambient_for(due, 30.0, 39.0)
+        assert expected is not None, "a schedule inside the forecast must be priced by it"
+        mins = c.newton_minutes(30.0, 39.0, ambient=expected[0])
+        assert abs((due - c.newton_start_at).total_seconds() / 60 - mins) < 1e-6
+
+    def test_each_shadow_records_its_own_source(self):
+        """They price different windows — the run ending at the scheduled time, and the
+        one ending when heating would finish — so one shared field described whichever
+        branch ran last."""
+        from custom_components.mspa.sensor import (
+            MSpaNewtonReadyAtSensor, MSpaNewtonStartAtSensor)
+        assert (MSpaNewtonReadyAtSensor._ambient_source_attr
+                != MSpaNewtonStartAtSensor._ambient_source_attr)
+        c = self._coord()
+        c._update_newton_shadow(30.0, 39.0)
+        for cls, want in ((MSpaNewtonReadyAtSensor, c.newton_ambient_source),
+                          (MSpaNewtonStartAtSensor, c.newton_start_ambient_source)):
+            s = object.__new__(cls)
+            s.coordinator = c
+            assert s.extra_state_attributes["ambient_source"] == want
+
+    def test_no_schedule_leaves_the_start_alone(self):
+        c = self._coord()
+        c.scheduled_ready_at = None
+        c.schedule_target_temp = None
+        c._update_newton_shadow(30.0, 39.0)
+        assert c.newton_start_at is None

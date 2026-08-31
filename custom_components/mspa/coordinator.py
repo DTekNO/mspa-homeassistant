@@ -502,6 +502,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # what the history means: rows from before the forecast was wired in, or from a
         # spell when it was unavailable, were priced from a single instant.
         self.newton_ambient_source: str = "now"
+        # The start-at shadow prices a different window from the ready-at one — the run
+        # ending at the scheduled time, not the one ending when heating would finish —
+        # so it records its own source rather than borrowing the other's.
+        self.newton_start_ambient_source: str = "now"
         self.measured_outdoor_temp: float | None = None
         self._session_air_sum: float = 0.0
         self._session_air_n: int = 0
@@ -2009,15 +2013,33 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.newton_ready_at = (
                     datetime.now(timezone.utc) + timedelta(minutes=minutes))
 
-        # Planned start: the same subtraction `_check_schedule_trigger` makes, against
-        # the same scheduled time, so the two start times are directly comparable.
+        # Planned start: the same subtraction `_check_schedule_trigger` makes, against the
+        # same scheduled time and — this is the part that was missing — priced from the
+        # same ambient.
+        #
+        # It used to call newton_minutes with no ambient at all, which fell back to the
+        # instantaneous reading while the shipping planner used the forecast averaged
+        # across the run. Two different questions again, and far more visible here than
+        # anywhere else it happened: a schedule days out is priced from weather days away,
+        # so an afternoon reading against a pre-dawn forecast put the two start times
+        # hours apart. Observed at ten. The comment above this claimed they were directly
+        # comparable, which is exactly the sort of thing a comment should not be trusted
+        # for.
+        self.newton_start_ambient_source = "now"
         if (self.scheduled_ready_at is not None and not self._schedule_triggered
                 and self.schedule_target_temp is not None):
-            minutes = self.newton_minutes(plan_temp, self.schedule_target_temp)
+            due = dt_util.as_utc(self.scheduled_ready_at)
+            planned = self.forecast_ambient_for(
+                due, plan_temp, self.schedule_target_temp)
+            if planned is not None:
+                start_amb, start_kind = planned
+                self.newton_start_ambient_source = f"forecast_{start_kind}"
+            else:
+                start_amb, self.newton_start_ambient_source = self.effective_ambient()
+            minutes = self.newton_minutes(
+                plan_temp, self.schedule_target_temp, ambient=start_amb)
             if minutes is not None:
-                self.newton_start_at = (
-                    dt_util.as_utc(self.scheduled_ready_at)
-                    - timedelta(minutes=minutes))
+                self.newton_start_at = due - timedelta(minutes=minutes)
 
     # How often the forecast is re-read after a success. The call itself is cheap — see
     # below — but it crosses the service bus, and the data behind it only changes hourly.
