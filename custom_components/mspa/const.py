@@ -87,6 +87,24 @@ DEFAULT_HEATER_POWER_HEAT = 2000  # Heating element in active heating (estimated
 # Reads temperature and wind_speed from a weather entity (e.g. Met.no, OpenWeatherMap).
 CONF_WEATHER_ENTITY = "weather_entity"
 
+# Optional local thermometer, as distinct from the weather entity.
+#
+# The weather entity is a forecast source; this is a measurement. They are not the same
+# reading and the difference is the point: a forecast describes the region, a thermometer
+# in the garden describes the air the spa is actually losing heat to, and cold pooling,
+# shelter and sun can separate them by several degrees overnight. On an eleven-hour run
+# the estimate moves about twenty minutes per degree, so a systematic difference is worth
+# an hour and nobody would see it without both numbers recorded side by side.
+#
+# It has to be configured because it cannot be found. A local thermometer is an ordinary
+# `sensor.*` entity with no marking that distinguishes it from the twenty-odd other
+# temperature sensors in a house, and guessing from the name is the kind of cleverness
+# that picks the oven.
+#
+# Recorded and not yet used. Planning still runs on the forecast; this exists so the two
+# can be compared over real sessions before anything depends on it.
+CONF_OUTDOOR_SENSOR = "outdoor_sensor"
+
 # There is deliberately no switch for "apply the learned response to outdoor
 # temperature". Configuring a weather entity *is* the switch: without one `ambient_temp`
 # is None, and both `ambient_rate_factor` and `learned_ambient_factor` already return no

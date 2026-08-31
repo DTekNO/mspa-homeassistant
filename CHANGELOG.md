@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An optional outdoor thermometer setting.** Point it at a temperature sensor outside
+  and the integration records what the air actually did across each heat-up, alongside
+  the forecast it was planned from. Nothing depends on it yet: a forecast describes the
+  region while a thermometer in your garden describes the air the spa is losing heat to,
+  and shelter, sun and cold air pooling can separate them by several degrees overnight —
+  worth roughly twenty minutes per degree on a long heat-up. Recorded first, so which to
+  trust is decided on real sessions. Leave it empty and nothing is recorded.
+
 ### Changed
 
 - **Estimates no longer carry the prediction bias.** It is still learned from every

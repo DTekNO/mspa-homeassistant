@@ -1739,3 +1739,88 @@ class TestTheBiasIsMeasuredNotApplied:
         src = inspect.getsource(MSpaUpdateCoordinator.session_opening_eta)
         assert 'pred["estimated_minutes"]' in src
         assert "estimated_minutes_biased" not in src.split('"""')[2]
+
+
+class TestTheOneShotRecordsWhatItNeedsTo:
+    """Two quantities that were inferred rather than measured on the session of 28.08,
+    and between them accounted for fifty minutes of error that happened to cancel.
+
+    The start temperature was inferred from the crossing two minutes later; the air was
+    inferred from band means recorded for a different purpose. Neither inference is
+    available in general, and heat-ups from cold are rare enough that a session which
+    fails to record them is a season wasted.
+    """
+
+    def _coord(self, *, sensor="sensor.outside", state="12.0", unit="°C"):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        st = (None if state is None else
+              type("S", (), {"state": state,
+                             "attributes": {"unit_of_measurement": unit}})())
+        c.hass = type("H", (), {
+            "states": type("St", (), {"get": staticmethod(lambda e: st)})()})()
+        c.config_entry = type("E", (), {
+            "options": {"outdoor_sensor": sensor} if sensor else {}})()
+        return c
+
+    def test_it_reads_a_local_thermometer(self):
+        assert self._coord().read_outdoor_sensor() == pytest.approx(12.0)
+        assert self._coord().outdoor_sensor == "sensor.outside"
+
+    def test_fahrenheit_is_converted(self):
+        assert self._coord(state="53.6", unit="°F").read_outdoor_sensor() == (
+            pytest.approx(12.0))
+
+    def test_a_bad_reading_is_absent_rather_than_wrong(self):
+        """This is being recorded to judge a forecast against, so a contaminated mean is
+        worse than a missing one."""
+        for state in ("unavailable", "unknown", "", "n/a", "999", "-999"):
+            assert self._coord(state=state).read_outdoor_sensor() is None
+        assert self._coord(state=None).read_outdoor_sensor() is None
+        assert self._coord(sensor=None).read_outdoor_sensor() is None
+
+    def test_it_has_to_be_configured(self):
+        """A local thermometer is an ordinary sensor entity with nothing marking it out
+        from the twenty-odd others in a house, and guessing from the name picks the
+        oven."""
+        assert self._coord(sensor=None).outdoor_sensor is None
+        from pathlib import Path
+        root = Path(__file__).parent.parent / "custom_components" / "mspa"
+        for name in ("config_flow.py", "strings.json", "translations/en.json"):
+            assert "outdoor_sensor" in (root / name).read_text().lower(), name
+
+    def test_the_session_record_carries_both_air_figures(self):
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
+        for key in ("forecast_air_c", "measured_air_at_start_c",
+                    "measured_air_mean_c", "measured_air_samples",
+                    "forecast_air_error_c"):
+            assert f'"{key}"' in src, key
+        # And absent rather than null without a thermometer: a record full of nulls
+        # reads as a sensor that failed, an absent key as one never configured, and an
+        # analysis has to tell those apart.
+        assert "if _measured is not None:" in src
+        assert "if self._session_air_n:" in src
+
+    def test_and_the_start_temperature_both_ways(self):
+        """The reading is the last threshold crossed, so the truth is up to half a band
+        above it — always in the same direction, and worth 25 minutes on a long run."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
+        for key in ("start_temp", "start_temp_extrapolated",
+                    "estimated_minutes_from_extrapolated"):
+            assert f'"{key}"' in src, key
+        assert '"error_minutes_from_extrapolated"' in src, (
+            "recording the alternative estimate is no use unless it is scored")
+
+    def test_nothing_yet_depends_on_the_measured_air(self):
+        """Recorded, not adopted. Planning still runs on the forecast — changing what is
+        being measured in the same week as measuring it would answer neither question."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        for name in ("forecast_ambient_for", "live_ambient_for", "effective_ambient",
+                     "newton_minutes"):
+            src = inspect.getsource(getattr(MSpaUpdateCoordinator, name))
+            assert "read_outdoor_sensor" not in src, f"{name} consults it already"

@@ -12,6 +12,7 @@ from homeassistant.helpers.selector import (
 )
 from .const import (
     DOMAIN,
+    CONF_OUTDOOR_SENSOR,
     CONF_REGION,
     DEFAULT_REGION,
     REGIONS,
@@ -289,6 +290,12 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_WEATHER_ENTITY,
                 description={"suggested_value": self.config_entry.options.get(CONF_WEATHER_ENTITY)},
             ): EntitySelector(EntitySelectorConfig(domain="weather")),
+            vol.Optional(
+                CONF_OUTDOOR_SENSOR,
+                description={"suggested_value": self.config_entry.options.get(
+                    CONF_OUTDOOR_SENSOR)},
+            ): EntitySelector(EntitySelectorConfig(
+                domain="sensor", device_class="temperature")),
             vol.Optional(
                 CONF_SCHEDULE_TARGET_TEMP,
                 default=self.config_entry.options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP),

@@ -48,6 +48,7 @@ from .const import (
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_WEATHER_ENTITY,
+    CONF_OUTDOOR_SENSOR,
     CONF_PREDICTION_MODEL,
     DEFAULT_PREDICTION_MODEL,
     PREDICTION_MODEL_NEWTON,
@@ -501,6 +502,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # what the history means: rows from before the forecast was wired in, or from a
         # spell when it was unavailable, were priced from a single instant.
         self.newton_ambient_source: str = "now"
+        self.measured_outdoor_temp: float | None = None
+        self._session_air_sum: float = 0.0
+        self._session_air_n: int = 0
         # "hourly", "twice_daily", "daily", or None. Recorded because it decides how
         # much an averaged window can mean.
         self.forecast_resolution: str | None = None
@@ -739,6 +743,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self.ambient_temp, self.ambient_wind = _read_weather_entity(
                 self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
             )
+            # The measured air, accumulated across a running session so the forecast it
+            # was planned on can be scored against what actually happened outside.
+            measured = self.read_outdoor_sensor()
+            self.measured_outdoor_temp = measured
+            if measured is not None and self._prediction is not None:
+                self._session_air_sum += measured
+                self._session_air_n += 1
             self.ambient_condition = _read_weather_condition(
                 self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
             )
@@ -775,6 +786,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # Applied to every estimate here, not only the physical one. The bucket
                 # correction is the same physics through a coarser model: a rate learned
                 # in other weather, adjusted for the weather expected across this run.
+                # The reading is the last threshold *crossed*, so during heating the
+                # true temperature sits between it and half a degree above — about
+                # 0.25 °C high on average, and always in the same direction. On the
+                # session of 28.08 the record opened at 28.0 and crossed 28.5 two minutes
+                # later, so the water was really near 28.47, and that half-band was worth
+                # 25 minutes of over-prediction on an eleven-hour run.
+                #
+                # `scheduling_temp` already extrapolates within the band and the scheduler
+                # and the shadow both use it; only this record does not. Recorded rather
+                # than adopted for now: this is the number being scored, and changing what
+                # it means in the same week as measuring it would leave neither answered.
+                _extrap = self.scheduling_temp()
                 _open = self.live_ambient_for(new_temp, new_target)
                 _open_amb, _open_src = (
                     (_open[0], f"forecast_{_open[1]}") if _open
@@ -823,6 +846,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         # can tell a model that was wrong from one that had not yet
                         # learned anything.
                         "newton_params": _newton_params(self.newton_fit()),
+                        # The same estimate from the in-band extrapolation instead of the
+                        # quantised reading, so the half-band bias can be measured rather
+                        # than argued about.
+                        "start_temp_extrapolated": _round_or_none(_extrap, 2),
+                        "estimated_minutes_from_extrapolated": _round_or_none(
+                            self.heating_minutes(_extrap, new_target,
+                                                 ambient=_open_amb)
+                            if _extrap is not None else None),
+                        # What the forecast said when the plan was made, to be
+                        # scored against the measured mean added when the session closes.
+                        "forecast_air_c": _round_or_none(_open_amb, 2),
                         # Which ambient priced that estimate: a live reading, a forecast
                         # mean across the run, or the seasonal baseline standing in for a
                         # weather source that was down. Without it a session planned
@@ -858,6 +892,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             for i, b in enumerate(self.heat_rate_buckets)
                         ],
                     }
+                    # The thermometer is optional, so its keys are absent rather than
+                    # null when there is none. A record full of nulls reads as a sensor
+                    # that failed; an absent key reads as one that was never configured,
+                    # and a later analysis needs to tell those apart.
+                    _measured = self.read_outdoor_sensor()
+                    if _measured is not None:
+                        self._prediction["measured_air_at_start_c"] = round(_measured, 2)
+                        self._prediction["outdoor_sensor"] = self.outdoor_sensor
+                    self._session_air_sum = 0.0
+                    self._session_air_n = 0
                     self._shadow = ShadowPlan(
                         base_rates=self._prediction["plan_rates"],
                         start_temp=new_temp,
@@ -947,11 +991,27 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     "error_minutes_learned": _error_against(
                         self._prediction.get("estimated_minutes_learned"),
                         actual_minutes),
+                    "error_minutes_from_extrapolated": _error_against(
+                        self._prediction.get("estimated_minutes_from_extrapolated"),
+                        actual_minutes),
                     "error_minutes_newton": _error_against(
                         self._prediction.get("estimated_minutes_newton"),
                         actual_minutes),
                     "end_time": datetime.now(timezone.utc).isoformat(),
                 }
+                # What the air actually did across the run, against what the forecast
+                # said it would — twenty minutes per degree on a run this long, so a
+                # systematic difference is worth an hour and is invisible without both
+                # numbers side by side. Added only where there was a thermometer to
+                # measure it with; see the note at the session-open keys.
+                if self._session_air_n:
+                    measured_mean = self._session_air_sum / self._session_air_n
+                    result["measured_air_mean_c"] = round(measured_mean, 2)
+                    result["measured_air_samples"] = self._session_air_n
+                    forecast_air = self._prediction.get("forecast_air_c")
+                    if forecast_air is not None:
+                        result["forecast_air_error_c"] = round(
+                            forecast_air - measured_mean, 2)
                 self._prediction_history.append(result)
                 self._prediction_history = self._prediction_history[-10:]  # keep last 10
                 self._prediction = None
@@ -1742,6 +1802,36 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             st["sum_delta_rate"] += delta * rate
         st["min_amb"] = ambient if st["min_amb"] is None else min(st["min_amb"], ambient)
         st["max_amb"] = ambient if st["max_amb"] is None else max(st["max_amb"], ambient)
+
+    @property
+    def outdoor_sensor(self) -> str | None:
+        """The configured local thermometer, or None. See CONF_OUTDOOR_SENSOR."""
+        entry = getattr(self, "config_entry", None)
+        if entry is None:
+            return None
+        return (getattr(entry, "options", None) or {}).get(CONF_OUTDOOR_SENSOR)
+
+    def read_outdoor_sensor(self) -> float | None:
+        """Measured outdoor temperature in °C, or None when it cannot be read.
+
+        Unavailable, unknown, non-numeric and absurd values all answer None rather than
+        contaminating a session mean — this is being recorded to judge a forecast
+        against, so a bad reading is worse than a missing one.
+        """
+        entity_id = self.outdoor_sensor
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unknown", "unavailable", ""):
+            return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        unit = state.attributes.get("unit_of_measurement")
+        if unit in ("°F", "F"):
+            value = (value - 32.0) * 5.0 / 9.0
+        return value if -80.0 <= value <= 60.0 else None
 
     @property
     def weather_entity(self) -> str | None:
