@@ -1719,6 +1719,13 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
         # and this sensor's job is to keep recording. A diagnostic that goes unavailable
         # because the thing it observes threw is a diagnostic that loses exactly the run
         # worth looking at.
+        # Which shipping sensor this one is the shadow of, spelled out. Both shadows sit
+        # next to each other in the panel and one is a start while the other is a finish,
+        # so the tempting pairing is the wrong one: comparing "Newton start at" against
+        # "Ready at" differences a start against a finish and yields the length of the
+        # heat-up, which looks like a spectacular disagreement and is not one. Caught by
+        # the person who wrote this, which is fair warning about everyone else.
+        out["compare_with"] = self._compare_with
         try:
             out["shipping_equivalent"] = self._shipping_equivalent()
         except Exception:                                    # noqa: BLE001
@@ -1737,6 +1744,7 @@ class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
     _shadow_name = "Newton ready at"
     _shadow_slug = "newton_ready_at"
     _ambient_source_attr = "newton_ambient_source"
+    _compare_with = "Ready at"
     _attr_icon = "mdi:function-variant"
 
     @property
@@ -1774,6 +1782,7 @@ class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
     _shadow_name = "Newton start at"
     _shadow_slug = "newton_start_at"
     _ambient_source_attr = "newton_start_ambient_source"
+    _compare_with = "Heat Schedule — the 'Start at' time, not Ready at"
     _attr_icon = "mdi:function-variant"
 
     @property

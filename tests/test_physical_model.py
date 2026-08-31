@@ -1974,3 +1974,18 @@ class TestBothStartTimesArePricedTheSameWay:
         src = inspect.getsource(MSpaUpdateCoordinator._check_schedule_trigger)
         assert "self.forecast_ambient_for(target_utc" in src
         assert "ambient=self.schedule_ambient" in src
+
+    def test_each_shadow_names_what_it_shadows(self):
+        """One is a start and the other a finish, and they sit next to each other in the
+        panel. Differencing "Newton start at" against "Ready at" gives the length of the
+        heat-up — which looks like a ten-hour disagreement and is not one. Observed."""
+        from custom_components.mspa.sensor import (
+            MSpaNewtonReadyAtSensor, MSpaNewtonStartAtSensor)
+        c = self._coord()
+        c._update_newton_shadow(30.0, 39.0)
+        for cls, want in ((MSpaNewtonReadyAtSensor, "Ready at"),
+                          (MSpaNewtonStartAtSensor, "Heat Schedule")):
+            s = object.__new__(cls)
+            s.coordinator = c
+            assert want in s.extra_state_attributes["compare_with"]
+        assert "not Ready at" in MSpaNewtonStartAtSensor._compare_with
