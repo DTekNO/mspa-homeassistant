@@ -509,6 +509,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.measured_outdoor_temp: float | None = None
         self._session_air_sum: float = 0.0
         self._session_air_n: int = 0
+        self._session_air_dark_sum: float = 0.0
+        self._session_air_dark_n: int = 0
         # "hourly", "twice_daily", "daily", or None. Recorded because it decides how
         # much an averaged window can mean.
         self.forecast_resolution: str | None = None
@@ -754,6 +756,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if measured is not None and self._prediction is not None:
                 self._session_air_sum += measured
                 self._session_air_n += 1
+                if self.sun_is_up() is False:
+                    self._session_air_dark_sum += measured
+                    self._session_air_dark_n += 1
             self.ambient_condition = _read_weather_condition(
                 self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
             )
@@ -906,6 +911,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         self._prediction["outdoor_sensor"] = self.outdoor_sensor
                     self._session_air_sum = 0.0
                     self._session_air_n = 0
+                    self._session_air_dark_sum = 0.0
+                    self._session_air_dark_n = 0
                     self._shadow = ShadowPlan(
                         base_rates=self._prediction["plan_rates"],
                         start_temp=new_temp,
@@ -1012,6 +1019,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     measured_mean = self._session_air_sum / self._session_air_n
                     result["measured_air_mean_c"] = round(measured_mean, 2)
                     result["measured_air_samples"] = self._session_air_n
+                    # Split out the hours with the sun down, which is when a garden
+                    # thermometer is measuring air rather than its own surroundings.
+                    # Both means and both counts are kept, so the daylight figure can be
+                    # recovered from them algebraically and nothing is thrown away —
+                    # which matters because whether daylight readings are usable depends
+                    # on the installation, not on the integration.
+                    if self._session_air_dark_n:
+                        result["measured_air_mean_dark_c"] = round(
+                            self._session_air_dark_sum / self._session_air_dark_n, 2)
+                        result["measured_air_samples_dark"] = self._session_air_dark_n
                     forecast_air = self._prediction.get("forecast_air_c")
                     if forecast_air is not None:
                         result["forecast_air_error_c"] = round(
@@ -1814,6 +1831,21 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if entry is None:
             return None
         return (getattr(entry, "options", None) or {}).get(CONF_OUTDOOR_SENSOR)
+
+    def sun_is_up(self) -> bool | None:
+        """Whether the sun is above the horizon, or None if `sun.sun` is absent.
+
+        Used to split a session's measured air into daylight and dark rather than to
+        correct anything. Which parts of a day a particular thermometer can be trusted
+        in is a property of where it is mounted — this one sits above a wood wall that
+        catches the morning sun, so warm air rises past it until the sun comes round —
+        and that is not something an integration can know. Recording the split lets the
+        judgement be made afterwards, by someone who has seen the installation.
+        """
+        state = self.hass.states.get("sun.sun")
+        if state is None or state.state in ("unknown", "unavailable", ""):
+            return None
+        return state.state == "above_horizon"
 
     def read_outdoor_sensor(self) -> float | None:
         """Measured outdoor temperature in °C, or None when it cannot be read.

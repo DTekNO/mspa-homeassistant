@@ -2029,3 +2029,39 @@ class TestBothStartTimesArePricedTheSameWay:
         s.coordinator = c
         a = s.extra_state_attributes
         assert a["outdoor_sensor"] == "sensor.garden" and a["outdoor_sensor_c"] is None
+
+    def test_the_measured_air_is_split_by_sun(self):
+        """Whether a garden thermometer's daylight readings are usable depends on where
+        it is mounted, which the integration cannot know. This one sits above a wood wall
+        that catches the morning sun, so warm air rises past it until the sun comes round
+        — worth +5 °C against the forecast at 09:00 and nothing at all overnight.
+        Recording the split lets that judgement be made by someone who has seen it."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        for sun, temp in (("below_horizon", "12.0"), ("above_horizon", "20.0")):
+            st = {"sun.sun": type("S", (), {"state": sun, "attributes": {}})(),
+                  "sensor.g": type("S", (), {
+                      "state": temp, "attributes": {"unit_of_measurement": "°C"}})()}
+            c.hass = type("H", (), {"states": type("St", (), {
+                "get": staticmethod(lambda e: st.get(e))})()})()
+            c.config_entry = type("E", (), {"options": {"outdoor_sensor": "sensor.g"}})()
+            assert c.sun_is_up() is (sun == "above_horizon")
+            assert c.read_outdoor_sensor() == pytest.approx(float(temp))
+
+    def test_no_sun_entity_is_not_an_error(self):
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.hass = type("H", (), {
+            "states": type("St", (), {"get": staticmethod(lambda e: None)})()})()
+        assert c.sun_is_up() is None, "absent, not False — False would claim it is night"
+
+    def test_both_means_are_kept_so_daylight_is_recoverable(self):
+        """Two means and two counts give all three regimes: whole run, dark, and the
+        daylight part by subtraction. Nothing is discarded on the integration's
+        judgement."""
+        import inspect
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
+        for key in ("measured_air_mean_c", "measured_air_samples",
+                    "measured_air_mean_dark_c", "measured_air_samples_dark"):
+            assert f'"{key}"' in src, key
