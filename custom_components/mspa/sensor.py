@@ -1508,6 +1508,14 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
         c = self.coordinator
         out = {
             "weather_entity": c.weather_entity,
+            # The configured thermometer and what it reads right now. Surfaced because
+            # the alternative way to find out whether it is being read is to finish a
+            # heat-up and look for the air keys in the session record — and a heat-up
+            # from cold is not a thing to spend on a configuration check. A null reading
+            # against a named entity says the entity is there and unreadable, which is a
+            # different problem from not having chosen one.
+            "outdoor_sensor": c.outdoor_sensor,
+            "outdoor_sensor_c": _r(c.read_outdoor_sensor(), 2),
             # Where the number above came from. "now" is a live reading; anything else
             # means the factor is 1.0 for want of one rather than by measurement, which
             # a bare 1.0 cannot tell you.

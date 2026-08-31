@@ -1989,3 +1989,43 @@ class TestBothStartTimesArePricedTheSameWay:
             s.coordinator = c
             assert want in s.extra_state_attributes["compare_with"]
         assert "not Ready at" in MSpaNewtonStartAtSensor._compare_with
+
+    def test_the_thermometer_can_be_checked_before_a_run_not_after(self):
+        """The only other way to learn whether it is being read is to finish a heat-up
+        and look for the air keys, and a heat-up from cold is not a configuration test."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        from custom_components.mspa.sensor import MSpaAmbientLearningSensor
+        st = type("S", (), {"state": "11.5",
+                            "attributes": {"unit_of_measurement": "°C"}})()
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.ambient_temp, c.ambient_baseline = 14.0, 15.9
+        c._band_stats, c._band_observations, c._prediction_history = {}, [], []
+        c.heat_rate_buckets = None
+        c.hass = type("H", (), {
+            "states": type("St", (), {"get": staticmethod(lambda e: st)})()})()
+        c.config_entry = type("E", (), {"options": {
+            "weather_entity": "weather.home",
+            "outdoor_sensor": "sensor.garden"}})()
+        s = object.__new__(MSpaAmbientLearningSensor)
+        s.coordinator = c
+        a = s.extra_state_attributes
+        assert a["outdoor_sensor"] == "sensor.garden"
+        assert a["outdoor_sensor_c"] == pytest.approx(11.5)
+
+    def test_a_named_but_unreadable_thermometer_is_distinguishable(self):
+        """Null against a name is an entity that is there and broken; null against no
+        name is one never chosen. Different problems, different fixes."""
+        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+        from custom_components.mspa.sensor import MSpaAmbientLearningSensor
+        st = type("S", (), {"state": "unavailable", "attributes": {}})()
+        c = object.__new__(MSpaUpdateCoordinator)
+        c.ambient_temp, c.ambient_baseline = 14.0, 15.9
+        c._band_stats, c._band_observations, c._prediction_history = {}, [], []
+        c.heat_rate_buckets = None
+        c.hass = type("H", (), {
+            "states": type("St", (), {"get": staticmethod(lambda e: st)})()})()
+        c.config_entry = type("E", (), {"options": {"outdoor_sensor": "sensor.garden"}})()
+        s = object.__new__(MSpaAmbientLearningSensor)
+        s.coordinator = c
+        a = s.extra_state_attributes
+        assert a["outdoor_sensor"] == "sensor.garden" and a["outdoor_sensor_c"] is None
