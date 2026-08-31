@@ -942,6 +942,26 @@ class TestPlanningUsesTheForecast:
         mean, _n, kind = got
         assert kind == "tail" and mean == pytest.approx(5.0)
 
+    def test_a_run_starting_now_is_not_called_partial(self):
+        """met.no's first row is the next whole hour, so a window for a run starting now
+        almost always begins a few minutes before the forecast does. Without a step of
+        slack at the head, "partial" was stamped on nearly every in-flight estimate and
+        stopped distinguishing anything."""
+        from datetime import timedelta
+        now = self._now()
+        first_row = now + timedelta(minutes=7)          # the next whole hour
+        rows = [(first_row + timedelta(hours=i), 10.0) for i in range(48)]
+        _m, _n, kind = forecast_window_mean(rows, now + timedelta(hours=8.5), 8.5)
+        assert kind == "window", "a 7-minute sliver at the head is not a partial forecast"
+
+    def test_but_a_genuinely_short_forecast_still_is(self):
+        """The slack is one period, not a licence."""
+        from datetime import timedelta
+        now = self._now()
+        rows = [(now + timedelta(hours=i), 10.0) for i in range(48)]
+        _m, _n, kind = forecast_window_mean(rows, now + timedelta(hours=8), 30.0)
+        assert kind == "partial"
+
     def test_no_forecast_means_no_answer_rather_than_a_guess(self):
         from datetime import timedelta
         assert forecast_window_mean([], self._now(), 6.0) is None

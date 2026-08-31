@@ -1112,8 +1112,15 @@ def forecast_window_mean(rows, window_end, span_hours, *,
         step_s = gaps[len(gaps) // 2] or 3600.0
     else:
         step_s = 3600.0
+    # One step of slack at the head, and it is the difference between a label that means
+    # something and one stamped on nearly every estimate. met.no's first row is the next
+    # whole hour, so a window for a run starting *now* almost always begins a few minutes
+    # before the forecast does — 06:53 against a first row of 07:00. The missing sliver is
+    # at most one period, sits at the end of the window carrying least weight under the
+    # law, and is best described by the very row that follows it. Treating that as
+    # uncovered reported "partial" for a forecast that covers the run perfectly well.
     covered = (window_end <= last + timedelta(seconds=step_s)
-               and window_end - timedelta(hours=span) >= first)
+               and window_end - timedelta(hours=span) >= first - timedelta(seconds=step_s))
     if not covered:
         span = min(span, float(diurnal_h))
     start = window_end - timedelta(hours=span)
