@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Learned heating rates are now also stored corrected to a reference outdoor
+  temperature.** A rate bucket used to store whatever rate it happened to see, under
+  whatever weather prevailed while the water crossed that band — which is not a property
+  of the spa. The conditions are not random across bands either: cold crossings always
+  happen at the start of a heat-up and near-target crossings at the end, so a run
+  starting in the evening learns its cold rate in the dark and its hot rate in the
+  morning, every time. The result is a rate curve that flattens a little every session,
+  which eventually leaves the physical model fitting a spa that barely loses heat. The
+  corrected set is learned in parallel and drives nothing you see; it is scored against
+  the shipping estimate on finished sessions, like the physical model, and will be
+  adopted only if it does better. The diagnostic attributes also now report whether the
+  three learned rates still decrease as the physics requires, and how far they sit from
+  a curve a single time constant could draw.
+
 - **An optional outdoor thermometer setting.** Point it at a temperature sensor outside
   and the integration records what the air actually did across each heat-up, alongside
   the forecast it was planned from. Nothing depends on it yet: a forecast describes the

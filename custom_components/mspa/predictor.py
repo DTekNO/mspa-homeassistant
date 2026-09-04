@@ -1143,3 +1143,171 @@ def forecast_window_mean(rows, window_end, span_hours, *,
     nearest = min(ordered, key=lambda tv: abs((tv[0] - window_end).total_seconds()))
     kind = "tail" if window_end > ordered[-1][0] else "nearest"
     return (nearest[1], 1, kind)
+
+
+# ── Normalising learned rates to a reference ambient ─────────────────────────
+#
+# A bucket learns the rate it happened to see, under whatever weather prevailed while
+# the water crossed that band. Nothing normalises it, and the correction is applied only
+# at prediction time — so the stored number means "the rate at whatever it was like when
+# this was learned", which is not a property of the spa.
+#
+# That would be tolerable if the conditions were random across bands. They are not. Cold
+# crossings always happen at the start of a run and hot crossings always at the end, so a
+# run that starts in the evening learns its cold bucket in the dark and its hot bucket in
+# the morning. The bias is structural and never averages out however many sessions run.
+#
+# Measured on the 03-04.09.2026 cold start: cold learned at 12.3 °C in darkness, hot at
+# 17.5 °C in sun. Feeding both in raw moves cold 1.187 → 1.140 and hot 0.885 → 0.918 —
+# the cold/hot spread closes from 1.34 to 1.24 in a single session, and the next session
+# closes it again. A flattened curve is exactly the pathology `newton_fit` documents
+# (buckets reading 1.03/0.99/1.01, implying tau 512 h), because the physical fit is
+# seeded from these buckets.
+#
+# The fix is to store the rate at a fixed reference ambient and expand it back out at
+# the ambient a plan is priced for.
+AMBIENT_REF_C = 10.0
+# Deliberately a constant and not `ambient_baseline`. The baseline is a seasonal EMA:
+# normalise to it and a bucket learned in January stops meaning the same thing as one
+# learned in July, which is the whole problem this is meant to remove. The seasonal
+# adjustment belongs at prediction time, where it already lives.
+
+# Identification gate for a fitted sensitivity. A slope from thirty traverses all taken
+# between 12 and 14 °C is noise wearing a number — the same argument `_accumulate_band_stats`
+# already makes for `min_amb`/`max_amb`. Range is the gate, not count; count is only a
+# floor beneath it.
+BAND_K_MIN_RANGE_C = 8.0
+BAND_K_MIN_N = 6.0
+# Falling back to the cooling curve rather than to zero. Measured 03.09.2026 over 87 h of
+# idle cooling with gaps spanning 8.8–18.5 K: k ≈ 24 W/K, tau ≈ 62 h. That is a
+# measurement of *this* spa, independent of the buckets and of the physical fit seeded
+# from them, which is what makes it usable here without circularity.
+BAND_K_PRIOR = 1.0 / 62.0
+# A sensitivity outside this is not a spa. The lower bound is a body that barely notices
+# the weather, the upper an uninsulated one; either says the fit has found something
+# other than the ambient response.
+BAND_K_MIN = 0.004
+BAND_K_MAX = 0.060
+
+# Sun on the cover, as an equivalent air temperature rather than as a separate heat path.
+#
+# Good insulation works both ways: it resists solar gain reaching the water exactly as it
+# resists loss leaving it. So the sun does not inject watts past the cover — it raises the
+# temperature of the cover's *outer* surface, and the water then loses heat through the
+# insulation to that temperature instead of to the air. This is the sol-air temperature
+# from building physics, and its consequence here is that solar carries the *same* 1/tau
+# coefficient as any other ambient change, rather than needing a coefficient of its own.
+#
+# Held at zero. The effect is real — an idle tub gained 0.5 °C between 07:31 and 14:13 on
+# 31.08.2026 while the air stayed 8–11 K *below* the water, which conduction cannot do —
+# but its size is not yet measured on this spa, and a guessed coefficient applied
+# confidently is worse than none because it looks principled. The regressor is
+# accumulated from now on so this becomes a fitted number rather than an argument.
+SOLAR_ALPHA_K = 0.0
+
+
+def sol_air_temp(ambient_c, solar_index, alpha=SOLAR_ALPHA_K):
+    """Effective outdoor temperature seen through the cover, in °C.
+
+    `solar_index` is a unitless 0–1 proxy for irradiance on the cover. With `alpha` at
+    zero this returns the air temperature unchanged, which is the shipping behaviour.
+    """
+    if ambient_c is None:
+        return None
+    if not solar_index or not alpha:
+        return float(ambient_c)
+    return float(ambient_c) + float(alpha) * float(solar_index)
+
+
+def band_ambient_k(fit, *, amb_range=None):
+    """Sensitivity of one band's rate to ambient, °C/h per K, and where it came from.
+
+    Returns `(k, source)` with source one of "fitted", "prior" or "none". `k` is
+    positive: a warmer ambient means a faster rate, because the gap the loss scales with
+    is smaller.
+
+    The fit is used only where it is identified — enough traverses, spread across enough
+    ambient — and only where it lands somewhere a spa could plausibly be. Everything else
+    falls to the cooling-curve prior, which is a real measurement of this spa rather than
+    a default, and is never worse than declining to correct at all.
+    """
+    if fit is not None and amb_range is not None and amb_range >= BAND_K_MIN_RANGE_C:
+        n = fit.get("n") or 0
+        slope = fit.get("slope")
+        if n >= BAND_K_MIN_N and slope is not None:
+            # `band_rate_fit` regresses rate on ambient, so its slope is already dr/da.
+            if BAND_K_MIN <= slope <= BAND_K_MAX:
+                return float(slope), "fitted"
+    return BAND_K_PRIOR, "prior"
+
+
+def normalise_rate(rate, ambient_eff, k, ref=AMBIENT_REF_C):
+    """An observed rate restated as the rate the same span would run at `ref`.
+
+    Additive, not multiplicative, and that is the physics rather than a simplification:
+    Newton makes a change in air worth the same absolute °C/h whatever the rate, not the
+    same percentage. The multiplicative form errs most in the hot band, where the rate is
+    smallest and the prediction matters most.
+
+    The correction is constant across a band, so it applies to the *chord* a bucket
+    learns as exactly as to an instantaneous rate. Checked against the closed-form Newton
+    chord over 20–30, 30–37 and 37–39 °C: the error is below 0.0006 °C/h across a 35 K
+    span of air, which is four orders of magnitude under the quantity being corrected.
+    """
+    if rate is None or ambient_eff is None or k is None:
+        return None
+    return float(rate) - (float(ambient_eff) - ref) * float(k)
+
+
+def expand_rate(rate_norm, ambient_eff, k, ref=AMBIENT_REF_C):
+    """The inverse of `normalise_rate`: a stored rate priced for the ambient of a plan."""
+    if rate_norm is None or ambient_eff is None or k is None:
+        return None
+    return float(rate_norm) + (float(ambient_eff) - ref) * float(k)
+
+
+def bucket_shape(buckets, ref=AMBIENT_REF_C):
+    """How far the three learned rates are from a curve the physics allows.
+
+    Two findings, cheap and always available:
+
+    `monotonic` — cold > mid > hot is forced by the law, because the gap loss scales with
+    rises with water temperature. A violation is proof that the stored rates carry their
+    learning conditions rather than the spa's response, and it is the direct, readable
+    form of the failure `newton_fit`'s seed gate can only catch by its symptoms.
+
+    `residual` — under a single tau the three must be *collinear* against the gap, not
+    merely decreasing. Three points and a two-parameter line leave one number: the middle
+    band's deviation from the line through the outer two, in °C/h. Positive means the mid
+    band runs faster than a straight line allows; negative means the hot band falls away
+    faster than one tau can explain, which is what this spa shows.
+
+    Returns None where fewer than three buckets have been learned.
+    """
+    if not buckets or len(buckets) < 3 or any(b is None or b <= 0 for b in buckets[:3]):
+        return None
+    spans = ((HEAT_BUCKET_LEARN_MIN, HEAT_BUCKET_T1),
+             (HEAT_BUCKET_T1, HEAT_BUCKET_T2),
+             (HEAT_BUCKET_T2, HEAT_BUCKET_LEARN_MAX))
+    gaps = [((lo + hi) / 2.0) - ref for lo, hi in spans]
+    r = [float(b) for b in buckets[:3]]
+    monotonic = r[0] > r[1] > r[2]
+    # The line through the outer two, evaluated at the middle gap.
+    span = gaps[2] - gaps[0]
+    predicted_mid = r[0] + (r[2] - r[0]) * (gaps[1] - gaps[0]) / span if span else None
+    residual = (r[1] - predicted_mid) if predicted_mid is not None else None
+    taus = []
+    for (g0, r0), (g1, r1) in ((( gaps[0], r[0]), (gaps[1], r[1])),
+                               ((gaps[1], r[1]), (gaps[2], r[2]))):
+        slope = (r1 - r0) / (g1 - g0) if g1 != g0 else 0.0
+        taus.append(round(-1.0 / slope, 1) if slope < 0 else None)
+    return {
+        "monotonic": monotonic,
+        "rates": [round(x, 4) for x in r],
+        "gaps": [round(g, 2) for g in gaps],
+        # Implied tau from each adjacent pair. Equal under a single tau; this spa reads
+        # ~57 h across cold→mid and ~29 h across mid→hot, which is the extra loss at high
+        # water temperature that a one-parameter Newton model cannot express.
+        "implied_tau_h": taus,
+        "collinearity_residual": round(residual, 4) if residual is not None else None,
+    }

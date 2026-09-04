@@ -15,6 +15,7 @@ Run with: python -m pytest tests/test_rate_learning.py -v
 """
 import pytest
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
+from custom_components.mspa import predictor
 
 
 def _coord(**overrides) -> MSpaUpdateCoordinator:
@@ -36,8 +37,12 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     # Mirrors the real __init__. This fixture is built by hand with object.__new__, so
     # anything the coordinator initialises has to be repeated here or the first attribute
     # the code adds fails only in the tests — which reads as the code being wrong.
-    c._window_amb_sum = c._window_wind_sum = 0.0
-    c._window_amb_n = c._window_wind_n = 0
+    c._window_amb_sum = c._window_wind_sum = c._window_solar_sum = 0.0
+    c._window_amb_n = c._window_wind_n = c._window_solar_n = 0
+    # The normalised set is learned in parallel with the raw one, so the fixture needs
+    # both or every traverse fails on the first bucket it tries to normalise.
+    c.heat_rate_buckets_norm = [None, None, None]
+    c._bucket_base_value_norm = None
     c._band_observations = []
     c._band_stats = {}
     c._window_disturbed = False
@@ -777,3 +782,78 @@ class TestUnmeasurableConditionsAreIgnored:
         assert why and "cover" in why
         assert c._window_looks_unmeasurable(0, 25.0, 1.10) is None, (
             "an ordinary span must still pass")
+
+
+class TestNormalisedBucketsResistTheStructuralBias:
+    """The reason the normalised set exists.
+
+    Cold crossings happen at the start of a run and hot crossings at the end, so a run
+    that begins in the evening learns its cold bucket in the dark and its hot bucket in
+    the morning. The conditions are not random across bands — they are correlated with
+    band position by construction — so the bias never averages out however many sessions
+    run, and it flattens the curve a little every time.
+
+    Measured on the 03-04.09.2026 cold start: cold learned at 12.3 °C, hot at 17.5 °C.
+    """
+
+    def _traverse(self, c, temps, ambient, start=0.0, step_min=30.0):
+        t = start
+        for temp in temps:
+            c.ambient_temp = ambient
+            c._track_heating_rate(temp, 3, t * _MIN)
+            t += step_min
+        return t
+
+    def test_the_raw_curve_flattens_and_the_normalised_one_does_not(self):
+        """A cold band measured cold and a hot band measured warm, as a real run does."""
+        c = _coord(heat_rate_buckets=[1.20, 1.05, 0.90],
+                   heat_rate_buckets_norm=[1.20, 1.05, 0.90],
+                   ambient_baseline=10.0)
+        # The cold band crossed in the dark at 3 °C, then the hot band in the sun at
+        # 21 °C — an 18 K spread across one session, which is what an overnight run does.
+        after = self._traverse(c, [24.0, 24.5, 26.0, 28.0, 30.0, 30.5], 3.0)
+        self._traverse(c, [37.0, 37.5, 38.0, 38.5, 39.0], 21.0, start=after + 60.0)
+
+        raw_spread = c.heat_rate_buckets[0] / c.heat_rate_buckets[2]
+        norm_spread = c.heat_rate_buckets_norm[0] / c.heat_rate_buckets_norm[2]
+        # The raw pair has been pushed together: the cold band was measured in the cold
+        # and reads slow, the hot band was measured in the warm and reads fast.
+        assert raw_spread < norm_spread, (
+            f"raw {c.heat_rate_buckets} spread {raw_spread:.3f} should be flatter "
+            f"than normalised {c.heat_rate_buckets_norm} spread {norm_spread:.3f}")
+
+    def test_the_same_rate_in_different_weather_normalises_to_the_same_number(self):
+        """Two identical traverses at different ambients must store one rate, not two."""
+        rates = []
+        for ambient in (2.0, 18.0):
+            c = _coord(heat_rate_buckets=[None, None, None],
+                       heat_rate_buckets_norm=[None, None, None],
+                       ambient_baseline=10.0)
+            # Same span, same duration, so the *observed* rate is identical.
+            self._traverse(c, [24.0, 24.5, 26.0, 28.0, 30.0, 30.5], ambient)
+            rates.append((c.heat_rate_buckets[0], c.heat_rate_buckets_norm[0]))
+        (raw_cold, norm_cold), (raw_warm, norm_warm) = rates
+        assert raw_cold == pytest.approx(raw_warm), "the observed rates were the same"
+        # The colder traverse describes a faster spa once both are restated at 10 °C.
+        assert norm_cold > norm_warm
+        expected_gap = (18.0 - 2.0) * predictor.BAND_K_PRIOR
+        assert (norm_cold - norm_warm) == pytest.approx(expected_gap, rel=0.05)
+
+    def test_normalising_then_expanding_returns_the_observed_rate(self):
+        """The round trip through storage must be lossless at the ambient it was seen at."""
+        c = _coord(heat_rate_buckets=[None, None, None],
+                   heat_rate_buckets_norm=[None, None, None],
+                   ambient_baseline=10.0)
+        self._traverse(c, [24.0, 24.5, 26.0, 28.0, 30.0, 30.5], 17.0)
+        k, _ = c.ambient_k_for_band(0)
+        back = predictor.expand_rate(c.heat_rate_buckets_norm[0], 17.0, k)
+        assert back == pytest.approx(c.heat_rate_buckets[0], rel=1e-9)
+
+    def test_without_an_ambient_reading_nothing_is_normalised(self):
+        """No air temperature means no correction — and no wrong correction either."""
+        c = _coord(heat_rate_buckets=[None, None, None],
+                   heat_rate_buckets_norm=[None, None, None],
+                   ambient_temp=None, ambient_baseline=None)
+        self._traverse(c, [24.0, 24.5, 26.0, 28.0, 30.0, 30.5], None)
+        assert c.heat_rate_buckets[0] is not None, "the raw bucket still learns"
+        assert c.heat_rate_buckets_norm[0] is None

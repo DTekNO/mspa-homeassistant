@@ -1550,6 +1550,36 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
             out["mean_abs_error_learned_min"] = round(
                 sum(abs(b) for _, b in errs) / len(errs), 1)
 
+        # ── The bucket rates, normalised, and what their shape says ──────────
+        # Both sets side by side. `buckets` is what drives every prediction the user
+        # sees; `buckets_normalised` is the same three rates restated at a fixed
+        # reference ambient, learned in parallel and driving nothing yet.
+        #
+        # `shape` is the free test. Cold > mid > hot is forced by the physics, so a
+        # `monotonic: false` here is proof that the stored rates are carrying the
+        # weather they were learned under rather than the spa's own response — the
+        # readable form of the failure `newton_fit`'s seed gate can only infer from a
+        # runaway tau. `collinearity_residual` is the sharper version: under one tau the
+        # three must fall on a line, and the middle band's distance from it is the
+        # amount of curvature a single-tau model cannot account for.
+        from .predictor import AMBIENT_REF_C as _REF, bucket_shape as _shape
+        out["buckets"] = [_r(b, 4) for b in (c.heat_rate_buckets or [])]
+        out["buckets_normalised"] = [
+            _r(b, 4) for b in (getattr(c, "heat_rate_buckets_norm", None) or [])]
+        out["buckets_normalised_ref_c"] = _REF
+        _sh = _shape(c.heat_rate_buckets)
+        if _sh:
+            out["bucket_shape"] = _sh
+        # Where each band's ambient sensitivity came from. "prior" means the cooling
+        # curve is standing in because the band has not yet been measured across enough
+        # of a spread of outdoor temperatures to fit its own — which will be the answer
+        # for a long time, and is worth seeing rather than assuming.
+        if hasattr(c, "ambient_k_for_band"):
+            out["band_ambient_k"] = {
+                str(i): {"k": round(k, 5), "source": src}
+                for i, (k, src) in ((i, c.ambient_k_for_band(i)) for i in (0, 1, 2))
+            }
+
         # ── The physical model, reported for comparison only ─────────────────
         # Fitted from the same traverses, scored on the same finished sessions, and
         # driving nothing. The question it answers is whether adopting it would have
@@ -1621,6 +1651,19 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
             # difference would flatter whichever model joined later.
             out["mean_abs_error_shipping_min_same_sessions"] = round(
                 sum(abs(a) for a, _ in nerrs) / len(nerrs), 1)
+        # And the normalised buckets, scored the same way and over their own matched set.
+        # These sessions start later again than the Newton ones, so the two shipping
+        # figures beside them are not interchangeable — each is restated over the rows
+        # its own shadow actually covers.
+        berrs = [(r.get("error_minutes_biased"), r.get("error_minutes_buckets_norm"))
+                 for r in getattr(c, "_prediction_history", [])]
+        berrs = [(a, b) for a, b in berrs if a is not None and b is not None]
+        if berrs:
+            out["sessions_compared_buckets_norm"] = len(berrs)
+            out["mean_abs_error_buckets_norm_min"] = round(
+                sum(abs(b) for _, b in berrs) / len(berrs), 1)
+            out["mean_abs_error_shipping_min_same_sessions_norm"] = round(
+                sum(abs(a) for a, _ in berrs) / len(berrs), 1)
         return out
 
 

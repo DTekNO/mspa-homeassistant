@@ -16,6 +16,12 @@ from .predictor import (
     newton_free_fit,
     seed_rows_from_buckets,
     forecast_window_mean,
+    AMBIENT_REF_C,
+    band_ambient_k,
+    bucket_shape,
+    expand_rate,
+    normalise_rate,
+    sol_air_temp,
     newton_heating_minutes,
     physical_constants,
 )
@@ -67,6 +73,7 @@ from .const import (
     BIAS_RATIO_MAX,
 )
 
+import math
 import time
 from homeassistant.const import ATTR_STATE, ATTR_TEMPERATURE
 
@@ -354,6 +361,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._window_amb_n: int = 0
         self._window_wind_sum: float = 0.0
         self._window_wind_n: int = 0
+        # Sun on the cover across the window, as a 0-1 index. Accumulated on the same
+        # footing as ambient because it belongs in the same regression: solar reaches the
+        # water through the insulation, not past it, so it acts as a lift on the outdoor
+        # temperature the cover sees rather than as a heat path of its own.
+        self._window_solar_sum: float = 0.0
+        self._window_solar_n: int = 0
         # Set if anything happened during this window that makes the rate unmeasurable.
         self._window_disturbed: bool = False
         # Full-band traverses, each a clean (water span, mean ambient, realised rate)
@@ -391,6 +404,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Each bucket is updated only by observations made in that temperature
         # range, so predictions integrate the actual observed slow-down curve.
         self.heat_rate_buckets: list[float | None] = [None, None, None]
+
+        # The same three rates, each restated as the rate that band would run at
+        # AMBIENT_REF_C. Learned in parallel and not yet used for anything the user sees:
+        # this is the shadow of the bucket model against itself, scored the same way the
+        # physical model is, so the normalisation is adopted on evidence rather than on
+        # the argument that it ought to help. See predictor.normalise_rate.
+        self.heat_rate_buckets_norm: list[float | None] = [None, None, None]
+        self._bucket_base_value_norm: float | None = None
 
         # Session-level ambient condition scalar.
         # Reset to 1.0 at the start of each genuine heating session (delta > 2°C).
@@ -604,7 +625,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                               if (r.get("actual_minutes") or 0) >= _MIN_SCOREABLE_MINUTES
                               and r.get("estimated_minutes_newton") is not None]),
         ):
-            applied, shadow, newton = [], [], []
+            applied, shadow, newton, normed = [], [], [], []
             for r in rows:
                 if r.get("error_minutes") is not None:
                     applied.append(abs(r["error_minutes"]))
@@ -612,6 +633,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     shadow.append(abs(r["error_minutes_biased"]))
                 if r.get("error_minutes_newton") is not None:
                     newton.append(abs(r["error_minutes_newton"]))
+                if r.get("error_minutes_buckets_norm") is not None:
+                    normed.append(abs(r["error_minutes_buckets_norm"]))
             out[label] = {
                 "sessions": len(rows),
                 # What the integration now ships.
@@ -622,6 +645,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     sum(shadow) / len(shadow) if shadow else None, 1),
                 "mean_abs_error_newton_min": _round_or_none(
                     sum(newton) / len(newton) if newton else None, 1),
+                # The bucket model with its rates normalised to a reference ambient.
+                # Scored over its own sessions, which start later than the others —
+                # compare it against the same rows, not against the headline figure.
+                "mean_abs_error_buckets_norm_min": _round_or_none(
+                    sum(normed) / len(normed) if normed else None, 1),
+                "sessions_buckets_norm": len(normed),
             }
         return out
 
@@ -851,6 +880,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         "estimated_minutes_newton": _round_or_none(
                             self.newton_minutes(new_temp, new_target,
                                                 ambient=_open_amb)),
+                        # And the same session priced from the normalised buckets. None
+                        # until they have been learned, which takes one traverse per band.
+                        "estimated_minutes_buckets_norm": _round_or_none(
+                            self.normalised_minutes(new_temp, new_target,
+                                                    ambient=_open_amb)),
+                        "buckets_norm": [
+                            round(b, 4) if b is not None else None
+                            for b in self.heat_rate_buckets_norm
+                        ],
+                        "bucket_shape": bucket_shape(self.heat_rate_buckets),
                         # The parameters that estimate was made with, so a retrospective
                         # can tell a model that was wrong from one that had not yet
                         # learned anything.
@@ -1008,6 +1047,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     "error_minutes_newton": _error_against(
                         self._prediction.get("estimated_minutes_newton"),
                         actual_minutes),
+                    "error_minutes_buckets_norm": _error_against(
+                        self._prediction.get("estimated_minutes_buckets_norm"),
+                        actual_minutes),
                     "end_time": datetime.now(timezone.utc).isoformat(),
                 }
                 # What the air actually did across the run, against what the forecast
@@ -1122,6 +1164,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         except (ValueError, TypeError):
                             pass
                     stored_buckets = stored.get("heat_rate_buckets")
+                    self.heat_rate_buckets_norm = (
+                        stored.get("heat_rate_buckets_norm")
+                        or [None, None, None])
                     self._prediction_history = stored.get("prediction_history", [])
                     self._band_observations = stored.get("band_observations", [])
                     self._band_stats = stored.get("band_stats", {})
@@ -1184,6 +1229,32 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             self.heat_rate_buckets = [
                                 float(b) if b is not None else None for b in stored_buckets
                             ]
+                    # Bootstrap the normalised set from the raw one, once.
+                    #
+                    # A spa upgrading into this has months of learned buckets and no
+                    # normalised ones, and waiting a traverse per band to fill them would
+                    # leave the shadow blank across exactly the sessions worth comparing.
+                    # `ambient_baseline` is the only estimate available of what those
+                    # rates were learned under — a slow EMA of it, which is the right
+                    # shape of answer even though it cannot be the right number for any
+                    # particular traverse.
+                    #
+                    # This runs per band, not per spa, so a band that has since learned a
+                    # normalised rate of its own is never overwritten by the guess.
+                    for _i in (0, 1, 2):
+                        if (self.heat_rate_buckets_norm[_i] is None
+                                and self.heat_rate_buckets[_i] is not None
+                                and self.ambient_baseline is not None):
+                            _k, _ = self.ambient_k_for_band(_i)
+                            _seeded = normalise_rate(
+                                self.heat_rate_buckets[_i], self.ambient_baseline, _k)
+                            if _seeded is not None and _seeded > 0:
+                                self.heat_rate_buckets_norm[_i] = _seeded
+                                _LOGGER.debug(
+                                    "Bucket[%d] normalised set bootstrapped: %.3f at "
+                                    "baseline %.1f °C → %.3f at %.0f °C",
+                                    _i, self.heat_rate_buckets[_i],
+                                    self.ambient_baseline, _seeded, AMBIENT_REF_C)
                     _LOGGER.debug(
                         "Restored rates from storage: heat=%.3f cool=%.3f",
                         self.computed_heat_rate or 0,
@@ -1249,6 +1320,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "heat_rate": self.computed_heat_rate,
                 "cool_rate": self.computed_cool_rate,
                 "heat_rate_buckets": self.heat_rate_buckets,
+                "heat_rate_buckets_norm": self.heat_rate_buckets_norm,
+                # What the three learned rates say about themselves: whether they still
+                # decrease as the physics requires, and how far they sit from a line a
+                # single tau could draw. Written to the file rather than only computed for
+                # a sensor, so a record months old can still be read for drift.
+                "bucket_shape": bucket_shape(self.heat_rate_buckets),
+                "bucket_shape_norm": bucket_shape(self.heat_rate_buckets_norm),
+                "ambient_ref_c": AMBIENT_REF_C,
+                "band_ambient_k": {
+                    str(i): [round(k, 5), src]
+                    for i, (k, src) in ((i, self.ambient_k_for_band(i))
+                                        for i in (0, 1, 2))
+                },
                 "bucket_save_ts": time.time(),
                 "prediction_history": self._prediction_history,
                 "band_observations": self._band_observations,
@@ -1793,9 +1877,23 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         return {"n": 0, "sum_amb": 0.0, "sum_amb2": 0.0,
                 "sum_delta": 0.0, "sum_delta2": 0.0,
                 "sum_rate": 0.0, "sum_amb_rate": 0.0, "sum_delta_rate": 0.0,
-                "min_amb": None, "max_amb": None}
+                "min_amb": None, "max_amb": None,
+                # Solar, on the same five-number footing as ambient, plus the cross term
+                # a two-regressor fit needs. Accumulated but not yet fitted: with
+                # SOLAR_ALPHA_K at zero nothing downstream reads these. They are here so
+                # that when there is enough of them the question "how much of the morning
+                # speed-up was sun rather than air" is answerable from the record instead
+                # of from a plausible argument.
+                #
+                # The test they exist to run: if solar acts through the cover as a lift
+                # on the outdoor temperature, sum_sol_rate/sum_amb_rate must imply the
+                # *same* K-per-index constant in all three bands. If it were somehow
+                # bypassing the insulation the solar coefficient would instead be flat
+                # in absolute terms while the ambient one scaled with each band's 1/tau.
+                # That is the same shape of check `newton_free_fit` runs on water and air.
+                "sum_sol": 0.0, "sum_sol2": 0.0, "sum_sol_rate": 0.0, "sum_amb_sol": 0.0}
 
-    def _accumulate_band_stats(self, band, rate, ambient, delta) -> None:
+    def _accumulate_band_stats(self, band, rate, ambient, delta, solar=None) -> None:
         """Fold one traverse into the running fit for its band.
 
         Also tracks the range of ambient seen, because that is what decides whether the
@@ -1810,8 +1908,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if st["n"] >= self._BAND_FADE_AFTER:
             f = self._BAND_FADE
             for k in ("n", "sum_amb", "sum_amb2", "sum_delta", "sum_delta2",
-                      "sum_rate", "sum_amb_rate", "sum_delta_rate"):
-                st[k] *= f
+                      "sum_rate", "sum_amb_rate", "sum_delta_rate",
+                      "sum_sol", "sum_sol2", "sum_sol_rate", "sum_amb_sol"):
+                st[k] = st.get(k, 0.0) * f
         st["n"] += 1
         st["sum_amb"] += ambient
         st["sum_amb2"] += ambient * ambient
@@ -1823,6 +1922,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             st["sum_delta_rate"] += delta * rate
         st["min_amb"] = ambient if st["min_amb"] is None else min(st["min_amb"], ambient)
         st["max_amb"] = ambient if st["max_amb"] is None else max(st["max_amb"], ambient)
+        if solar is not None:
+            # setdefault, not assignment: these keys are absent from stats accumulated
+            # before this existed, and a stored dict is restored as it was written.
+            st["sum_sol"] = st.get("sum_sol", 0.0) + solar
+            st["sum_sol2"] = st.get("sum_sol2", 0.0) + solar * solar
+            st["sum_sol_rate"] = st.get("sum_sol_rate", 0.0) + solar * rate
+            st["sum_amb_sol"] = st.get("sum_amb_sol", 0.0) + ambient * solar
 
     @property
     def outdoor_sensor(self) -> str | None:
@@ -1846,6 +1952,93 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if state is None or state.state in ("unknown", "unavailable", ""):
             return None
         return state.state == "above_horizon"
+
+    # Rough clearness by weather condition, used only to scale the solar proxy. These
+    # are not measurements and do not need to be: the proxy's job is to vary with the
+    # sun in roughly the right way so that a coefficient can be fitted against it later.
+    # Whatever error is in these constants is absorbed into that fitted coefficient.
+    _SOLAR_CLEARNESS = {
+        "sunny": 1.0, "windy": 0.9, "windy-variant": 0.9, "partlycloudy": 0.6,
+        "exceptional": 0.5, "lightning": 0.3, "cloudy": 0.25, "snowy": 0.25,
+        "lightning-rainy": 0.2, "rainy": 0.15, "snowy-rainy": 0.15, "fog": 0.15,
+        "hail": 0.15, "pouring": 0.1, "clear-night": 0.0,
+    }
+
+    def solar_index(self) -> float | None:
+        """Sun on the cover as a unitless 0-1 index, or None without `sun.sun`.
+
+        Geometry times clearness. The geometric part is sin(elevation), which is how the
+        beam thins as the sun drops and is zero once it is down; the clearness part comes
+        from the weather entity's own condition string, which is already recorded per
+        traverse for exactly this purpose.
+
+        Deliberately a proxy and not an irradiance. Nothing here is calibrated in W/m2 —
+        it only has to move with the sun so that `sum_sol_rate` can fit a coefficient
+        against it. An unknown condition scores 0.5 rather than 0, because treating an
+        unreported sky as darkness would bias the fit toward finding no solar effect.
+        """
+        # Read defensively. This is called from the rate-tracking hot path on every
+        # poll, and the sun is a convenience here rather than a dependency: anything
+        # that cannot be read is "no solar index", never an exception that would take
+        # the heating-rate sample down with it.
+        states = getattr(getattr(self, "hass", None), "states", None)
+        state = states.get("sun.sun") if states is not None else None
+        if state is None or getattr(state, "state", None) in (
+                None, "unknown", "unavailable", ""):
+            return None
+        try:
+            elevation = float((getattr(state, "attributes", None) or {})
+                              .get("elevation"))
+        except (TypeError, ValueError):
+            return None
+        if elevation <= 0:
+            return 0.0
+        condition = getattr(self, "ambient_condition", None)
+        clearness = self._SOLAR_CLEARNESS.get(condition, 0.5)
+        return math.sin(math.radians(min(elevation, 90.0))) * clearness
+
+    def _window_ambient(self) -> float | None:
+        """Mean air over the traverse in progress, falling back to the current reading."""
+        if self._window_amb_n:
+            return self._window_amb_sum / self._window_amb_n
+        return self.ambient_temp
+
+    def _window_solar(self) -> float | None:
+        """Mean solar index over the traverse in progress, or None if unavailable."""
+        if self._window_solar_n:
+            return self._window_solar_sum / self._window_solar_n
+        return self.solar_index()
+
+    def _window_sol_air(self) -> float | None:
+        """The traverse's effective outdoor temperature: air, lifted by sun on the cover.
+
+        With SOLAR_ALPHA_K at zero this is the air temperature unchanged, so today it
+        changes nothing. It is the seam the solar term will arrive through once there is
+        enough of `sum_sol_rate` to fit one, and putting it in now means the normalisation
+        does not have to be rewritten to accept it.
+        """
+        return sol_air_temp(self._window_ambient(), self._window_solar())
+
+    def ambient_k_for_band(self, band) -> tuple[float, str]:
+        """This band's rate sensitivity to ambient, and whether it was fitted or assumed.
+
+        Fitted from `_band_stats` against air — never from the physical model, and never
+        from the shape of the buckets themselves. Both would be circular: the physical fit
+        is seeded from the buckets, so normalising the buckets by it closes a loop with no
+        outside information in it.
+
+        There is a second, sharper reason not to take it from the buckets' own curvature.
+        That curvature is a derivative with respect to *water* temperature; what is needed
+        here is the derivative with respect to *air*. They are equal only under a single
+        tau, and this spa's three bands imply 57 h across cold-to-mid and 29 h across
+        mid-to-hot. If that difference is an extra loss that tracks water temperature —
+        evaporation is the obvious candidate — then it barely touches the air response,
+        and using 1/29 h in the hot band would over-correct by a factor of two.
+        """
+        stats = self._band_stats.get(str(int(band))) or {}
+        lo, hi = stats.get("min_amb"), stats.get("max_amb")
+        amb_range = (hi - lo) if (lo is not None and hi is not None) else None
+        return band_ambient_k(self.band_rate_fit(band), amb_range=amb_range)
 
     def read_outdoor_sensor(self) -> float | None:
         """Measured outdoor temperature in °C, or None when it cannot be read.
@@ -1979,6 +2172,57 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         than heating the water — see `physical_constants` for why it is not added in.
         """
         return physical_constants(self.newton_fit(), self.heater_power_heat_w)
+
+    def normalised_bucket_rates(self, ambient=None) -> list | None:
+        """The normalised buckets, expanded back out to the ambient a plan is priced for.
+
+        The inverse of what `_track_heating_rate` does when it learns them. Returns None
+        while nothing has been normalised yet, so a caller can tell "not learned" from
+        "learned and slow".
+
+        No solar term is added back here, and that asymmetry is deliberate rather than an
+        oversight: sun is subtracted at learning time, where what happened is known, and
+        not added at planning time, where it would rest on a cloud forecast. Leaving it
+        out makes the plan predict slightly slow, so the spa arrives early rather than
+        late — the forgiving direction for an error nobody can remove.
+        """
+        amb = ambient if ambient is not None else self.effective_ambient()[0]
+        if amb is None or not any(r for r in self.heat_rate_buckets_norm):
+            return None
+        rates = []
+        for index, stored in enumerate(self.heat_rate_buckets_norm):
+            if stored is None:
+                rates.append(None)
+                continue
+            k, _ = self.ambient_k_for_band(index)
+            rates.append(expand_rate(stored, amb, k))
+        return rates
+
+    def normalised_minutes(self, from_temp, to_temp, *, ambient=None) -> float | None:
+        """What the bucket model would predict if its rates had been normalised.
+
+        The third shadow, beside the physical model. Same span, same ambient, same
+        segmentation — the only difference is that each band's rate was stored at a fixed
+        reference and priced back out, instead of being stored as whatever the weather
+        happened to be when it was learned.
+
+        The model's own ambient correction is switched off here rather than left running:
+        the rates handed to it already carry the correction, and applying it twice is the
+        one way this change can be worse than no change at all.
+        """
+        rates = self.normalised_bucket_rates(ambient)
+        if rates is None or all(r is None for r in rates):
+            return None
+        predictor = HeatPredictor.from_coordinator(self)
+        predictor.buckets = rates
+        predictor.band_fits = {}
+        predictor.ambient_temp = predictor.ambient_baseline
+        # The session scalar is 1.0 at the moment a session opens, which is when this is
+        # called, so pinning it changes nothing today. Pinned anyway so that the shadow
+        # keeps measuring the normalisation alone if it is ever called mid-session.
+        predictor.session_scalar = 1.0
+        predictor.fresh_buckets = frozenset()
+        return predictor.heating_minutes(from_temp, to_temp)
 
     def newton_minutes(self, from_temp, to_temp, *, ambient=None) -> float | None:
         """What the physical model would predict for this span, or None if it cannot.
@@ -2478,6 +2722,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._window_amb_n = 1 if self.ambient_temp is not None else 0
         self._window_wind_sum = float(self.ambient_wind) if self.ambient_wind is not None else 0.0
         self._window_wind_n = 1 if self.ambient_wind is not None else 0
+        _sol = self.solar_index()
+        self._window_solar_sum = float(_sol) if _sol is not None else 0.0
+        self._window_solar_n = 1 if _sol is not None else 0
         cond = getattr(self, "ambient_condition", None)
         self._window_condition_counts = {cond: 1} if cond else {}
         # The disturbance survives a mid-band re-anchor.
@@ -2534,6 +2781,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         condition = self._window_condition or getattr(self, "ambient_condition", None)
         wind = (self._window_wind_sum / self._window_wind_n
                 if self._window_wind_n else self.ambient_wind)
+        _solar = self._window_solar()
         water_mean = (float(from_temp) + float(to_temp)) / 2.0
         self._band_observations.append({
             "at": datetime.now(timezone.utc).isoformat(),
@@ -2559,6 +2807,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # reconstruct it and cannot reconstruct it differently.
             "delta_mean": (round(water_mean - float(amb), 2)
                            if amb is not None else None),
+            # Sun on the cover over the traverse, 0-1. The `condition` above says what the
+            # sky was called; this says how much sun that was worth at this latitude and
+            # hour, which is the form a regression can use.
+            "solar_mean": (round(float(_solar), 3) if _solar is not None else None),
         })
         self._band_observations = (
             self._band_observations[-self._BAND_OBSERVATIONS_MAX:])
@@ -2568,7 +2820,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if usable and bucket_learnable:
             self._accumulate_band_stats(
                 band, float(rate), amb if amb is None else float(amb),
-                None if amb is None else water_mean - float(amb))
+                None if amb is None else water_mean - float(amb),
+                None if _solar is None else float(_solar))
         _LOGGER.debug(
             "Band observation: band %d, %.1f→%.1f °C in %.2f h = %.3f °C/h, "
             "ambient mean %s °C (water-air %s)",
@@ -2670,6 +2923,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if self.ambient_wind is not None:
                     self._window_wind_sum += float(self.ambient_wind)
                     self._window_wind_n += 1
+                _sol = self.solar_index()
+                if _sol is not None:
+                    self._window_solar_sum += float(_sol)
+                    self._window_solar_n += 1
                 anchor_bucket = _heat_bucket_index(self._rate_last_temp)
                 accepted = False
                 if elapsed_hours >= _MIN_RATE_SAMPLE_HOURS:
@@ -2720,6 +2977,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         if self._bucket_base_bucket != _bi:
                             self._bucket_base_bucket = _bi
                             self._bucket_base_value = self.heat_rate_buckets[_bi]
+                            self._bucket_base_value_norm = \
+                                self.heat_rate_buckets_norm[_bi]
                         _bp = self._bucket_base_value
                         _span = abs(curr_temp - self._rate_last_temp)
                         _alpha = _EMA_ALPHA * min(1.0, _span / _BUCKET_SPAN_FULL_C)
@@ -2743,6 +3002,27 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             self.heat_rate_buckets[_bi] = (
                                 _alpha * rate + (1 - _alpha) * _bp
                             ) if _bp is not None else rate
+                            # The same sample, restated at AMBIENT_REF_C before being
+                            # learned from, so what is stored describes the spa rather
+                            # than the evening it was measured on. Cold crossings happen
+                            # at the start of a run and hot crossings at the end, so
+                            # without this the two bands are systematically learned under
+                            # different weather and the curve flattens a little every
+                            # session. Parallel and inert: nothing reads these yet.
+                            _amb_eff = self._window_sol_air()
+                            _k, _k_src = self.ambient_k_for_band(_bi)
+                            _rate_norm = normalise_rate(rate, _amb_eff, _k)
+                            if _rate_norm is not None and _rate_norm > 0:
+                                _bpn = self._bucket_base_value_norm
+                                self.heat_rate_buckets_norm[_bi] = (
+                                    _alpha * _rate_norm + (1 - _alpha) * _bpn
+                                ) if _bpn is not None else _rate_norm
+                                _LOGGER.debug(
+                                    "Bucket[%d] normalised: %.3f °C/h at %.1f °C "
+                                    "→ %.3f at %.0f °C (k=%.4f, %s) → stored %.3f",
+                                    _bi, rate, _amb_eff if _amb_eff is not None else 0.0,
+                                    _rate_norm, AMBIENT_REF_C, _k, _k_src,
+                                    self.heat_rate_buckets_norm[_bi])
                             self._session_fresh_buckets.add(_bi)
                         else:
                             _LOGGER.debug(

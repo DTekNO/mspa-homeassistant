@@ -28,6 +28,7 @@ from custom_components.mspa.predictor import (
     seed_rows_from_buckets,
     forecast_window_mean,
 )
+from custom_components.mspa import predictor
 
 
 TAU, LIFT = 25.0, 45.0        # a spa that holds 45 °C above air, time constant 25 h
@@ -538,6 +539,9 @@ class TestAFreshFillIsNotThrownAway:
         c._window_disturbed = False
         c._window_amb_sum = c._window_amb_n = 0
         c._window_wind_sum = c._window_wind_n = 0
+        c._window_solar_sum = c._window_solar_n = 0
+        c.heat_rate_buckets_norm = [None, None, None]
+        c._bucket_base_value_norm = None
         c.ambient_temp = 8.0
         c.ambient_wind = 2.0
         c.ambient_baseline = 8.0
@@ -741,6 +745,9 @@ class TestTheSolarConfoundIsRecorded:
         c._window_disturbed = False
         c._window_amb_sum = c._window_amb_n = 0
         c._window_wind_sum = c._window_wind_n = 0
+        c._window_solar_sum = c._window_solar_n = 0
+        c.heat_rate_buckets_norm = [None, None, None]
+        c._bucket_base_value_norm = None
         c._window_condition_counts = {}
         c.ambient_temp = 14.0
         c.ambient_wind = 2.0
@@ -2065,3 +2072,134 @@ class TestBothStartTimesArePricedTheSameWay:
         for key in ("measured_air_mean_c", "measured_air_samples",
                     "measured_air_mean_dark_c", "measured_air_samples_dark"):
             assert f'"{key}"' in src, key
+
+
+# ── Normalising learned bucket rates to a reference ambient ──────────────────
+
+class TestRateNormalisation:
+    """The transform that stops a bucket storing the weather it was learned under."""
+
+    def test_round_trip_is_exact(self):
+        k = 1.0 / 62.0
+        for rate, air in ((1.15, 17.5), (0.88, 3.0), (1.30, -8.0)):
+            normed = predictor.normalise_rate(rate, air, k)
+            assert predictor.expand_rate(normed, air, k) == pytest.approx(rate, abs=1e-12)
+
+    def test_at_the_reference_it_does_nothing(self):
+        k = 1.0 / 62.0
+        assert predictor.normalise_rate(
+            0.9, predictor.AMBIENT_REF_C, k) == pytest.approx(0.9)
+
+    def test_warmer_air_normalises_down(self):
+        """A rate measured in the warm is a slower rate at the reference."""
+        k = 1.0 / 62.0
+        assert predictor.normalise_rate(1.15, 17.5, k) < 1.15
+        assert predictor.normalise_rate(1.15, 2.0, k) > 1.15
+
+    def test_additive_correction_matches_the_exact_newton_chord(self):
+        """The bucket learns a chord, not a point rate — the shift must still be right.
+
+        This is the assumption the whole design rests on: that a constant offset in air
+        moves a *chord* by the same constant. If it were false the correction would need
+        an integral per band instead of one addition.
+        """
+        tau, p_over_c = 60.0, 1.35
+
+        def chord(t1, t2, air):
+            asymptote = air + tau * p_over_c
+            hours = tau * math.log((asymptote - t1) / (asymptote - t2))
+            return (t2 - t1) / hours
+
+        for lo, hi in ((20.0, 30.0), (30.0, 37.0), (37.0, 39.0)):
+            for air in (-5.0, 0.0, 10.0, 20.0, 30.0):
+                exact = chord(lo, hi, air) - chord(lo, hi, predictor.AMBIENT_REF_C)
+                additive = (air - predictor.AMBIENT_REF_C) / tau
+                assert exact == pytest.approx(additive, abs=1e-3)
+
+    def test_none_in_none_out(self):
+        assert predictor.normalise_rate(None, 10.0, 0.016) is None
+        assert predictor.normalise_rate(1.0, None, 0.016) is None
+        assert predictor.expand_rate(1.0, 10.0, None) is None
+
+
+class TestBandAmbientK:
+    """Which sensitivity gets used, and whether it says so honestly."""
+
+    def test_no_fit_falls_back_to_the_cooling_prior(self):
+        k, source = predictor.band_ambient_k(None)
+        assert source == "prior"
+        assert k == pytest.approx(predictor.BAND_K_PRIOR)
+
+    def test_a_fit_over_too_narrow_a_range_is_not_used(self):
+        """Thirty traverses all taken between 12 and 14 °C is noise wearing a number."""
+        fit = {"n": 30, "slope": 0.02}
+        _, source = predictor.band_ambient_k(fit, amb_range=3.0)
+        assert source == "prior"
+
+    def test_a_fit_with_range_and_evidence_is_used(self):
+        k, source = predictor.band_ambient_k({"n": 10, "slope": 0.02}, amb_range=12.0)
+        assert (k, source) == (0.02, "fitted")
+
+    def test_an_implausible_slope_is_refused(self):
+        """A sensitivity outside the clamp says the fit found something that isn't air."""
+        for slope in (0.9, -0.02, 0.0):
+            _, source = predictor.band_ambient_k({"n": 30, "slope": slope}, amb_range=20.0)
+            assert source == "prior", slope
+
+    def test_too_few_observations_even_with_range(self):
+        _, source = predictor.band_ambient_k({"n": 2, "slope": 0.02}, amb_range=20.0)
+        assert source == "prior"
+
+
+class TestBucketShape:
+    """The free test on the three learned rates."""
+
+    def test_the_live_buckets_are_monotonic(self):
+        shape = predictor.bucket_shape([1.187, 1.038, 0.885])
+        assert shape["monotonic"] is True
+
+    def test_the_documented_flat_pathology_is_caught(self):
+        """1.03/0.99/1.01 is the real reading that sent a seeded fit to tau 512 h."""
+        shape = predictor.bucket_shape([1.03, 0.99, 1.01])
+        assert shape["monotonic"] is False
+
+    def test_a_single_tau_leaves_no_residual(self):
+        """Rates generated from one tau must come back collinear."""
+        tau, p_over_c = 60.0, 1.4
+        spans = ((20.0, 30.0), (30.0, 37.0), (37.0, 39.0))
+        rates = [p_over_c - (((lo + hi) / 2.0) - predictor.AMBIENT_REF_C) / tau
+                 for lo, hi in spans]
+        shape = predictor.bucket_shape(rates)
+        assert shape["collinearity_residual"] == pytest.approx(0.0, abs=1e-9)
+        assert shape["implied_tau_h"][0] == pytest.approx(tau, abs=0.1)
+        assert shape["implied_tau_h"][1] == pytest.approx(tau, abs=0.1)
+
+    def test_the_live_buckets_are_not_on_one_tau(self):
+        """Measured 04.09.2026: ~57 h cold-to-mid against ~29 h mid-to-hot."""
+        shape = predictor.bucket_shape([1.187, 1.038, 0.885])
+        cold_mid, mid_hot = shape["implied_tau_h"]
+        assert cold_mid == pytest.approx(57.0, abs=1.0)
+        assert mid_hot == pytest.approx(29.4, abs=1.0)
+        assert abs(shape["collinearity_residual"]) > 0.01
+
+    def test_declines_without_three_rates(self):
+        assert predictor.bucket_shape([1.1, None, 0.9]) is None
+        assert predictor.bucket_shape([]) is None
+        assert predictor.bucket_shape(None) is None
+
+
+class TestSolAir:
+    """Sun enters as a lift on the outdoor temperature, and is pinned off for now."""
+
+    def test_pinned_at_zero_it_changes_nothing(self):
+        assert predictor.SOLAR_ALPHA_K == 0.0
+        assert predictor.sol_air_temp(12.0, 1.0) == pytest.approx(12.0)
+
+    def test_with_a_coefficient_it_lifts_the_air(self):
+        assert predictor.sol_air_temp(12.0, 0.5, alpha=10.0) == pytest.approx(17.0)
+
+    def test_no_sun_is_the_air_itself(self):
+        assert predictor.sol_air_temp(12.0, 0.0, alpha=10.0) == pytest.approx(12.0)
+
+    def test_no_air_is_no_answer(self):
+        assert predictor.sol_air_temp(None, 1.0, alpha=10.0) is None
