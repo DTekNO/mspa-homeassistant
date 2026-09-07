@@ -384,10 +384,31 @@ def learning_anchor_zone(temp):
     Without the sub-range zone the anchor set at the start of a cold session never moves
     until 30 °C, and `in_learning_range` tests the *from* temperature — so a session
     beginning at 15 offers every one of its samples as 15→x and has all of them refused,
-    including the full 20→30 traverse that is exactly what the cold bucket wants. The
-    top end has no equivalent problem: there the anchor (37) is inside the learning
-    range and only the far end of the span leaves it, so the samples up to 39 are taken
-    normally and only the tail above is refused.
+    including the full 20→30 traverse that is exactly what the cold bucket wants.
+
+    There is a zone above HEAT_BUCKET_LEARN_MAX for a different reason, and this used to
+    say the top end had no equivalent problem. That was true of bucket *learning* and
+    false of everything else. A band observation is recorded only when the water leaves
+    its zone, and band 2 is the top band — during a heat-up the water enters it and
+    stops. So the hot band never recorded a traverse and structurally could not: measured
+    04.09.2026 on a spa that had been running for months, `band_stats` held keys "0" and
+    "1" and nothing else, after a clean 37→39 crossing that same morning.
+
+    The consequences compound quietly. With no fit for band 2, `learned_ambient_factor`
+    falls back permanently to the seed `AMBIENT_SENSITIVITY[2]`, which is the largest of
+    the three and the one carrying the most weight in a near-target estimate — so the
+    band where the weather matters most was the only one that could never learn what the
+    weather does to it.
+
+    Treating HEAT_BUCKET_LEARN_MAX as a zone edge closes that. The recorded traverse is
+    37→39: a full band, entered and left at real boundaries, exactly like the other two.
+    Bucket learning is unchanged, because the rate sample is taken before the zone
+    comparison and `in_learning_range(37, 39)` was already true.
+
+    A spa whose target sits below HEAT_BUCKET_LEARN_MAX still records nothing for band 2,
+    and that is correct rather than a gap: a 37→38 chord runs faster than a 37→39 one, so
+    mixing the two would add spread to `band_stats` that reads as ambient sensitivity and
+    is nothing of the kind.
 
     Returns None for an unknown temperature, which never equals another zone, so an
     unusable reading closes the window rather than silently extending it.
@@ -398,7 +419,11 @@ def learning_anchor_zone(temp):
         t = float(temp)
     except (TypeError, ValueError):
         return None
-    return -1 if t < HEAT_BUCKET_LEARN_MIN else bucket_index(t)
+    if t < HEAT_BUCKET_LEARN_MIN:
+        return -1
+    if t >= HEAT_BUCKET_LEARN_MAX:
+        return 3
+    return bucket_index(t)
 
 
 def in_learning_range(from_temp, to_temp) -> bool:

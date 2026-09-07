@@ -10,9 +10,11 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.loader import async_get_integration
 
 from .const import DOMAIN
+from .device_compat import device_by_identifier
 from .coordinator import MSpaUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
 
 # This integration only supports config entries
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -74,10 +76,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     real_device_id = coordinator.device_id
     if real_device_id and real_device_id != "mspa_hottub":
         dev_reg = dr.async_get(hass)
-        old_device = dev_reg.async_get_device(identifiers={(DOMAIN, "mspa_hottub")})
+
+        old_device = device_by_identifier(dev_reg, entry.entry_id, "mspa_hottub")
         if old_device is not None:
             # Remove the empty new-identifier device if it was already created
-            new_device = dev_reg.async_get_device(identifiers={(DOMAIN, real_device_id)})
+            new_device = device_by_identifier(dev_reg, entry.entry_id, real_device_id)
             if new_device is not None and new_device.id != old_device.id:
                 _LOGGER.info(
                     "Removing empty duplicate device '%s' before migration",

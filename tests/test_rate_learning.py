@@ -857,3 +857,84 @@ class TestNormalisedBucketsResistTheStructuralBias:
         self._traverse(c, [24.0, 24.5, 26.0, 28.0, 30.0, 30.5], None)
         assert c.heat_rate_buckets[0] is not None, "the raw bucket still learns"
         assert c.heat_rate_buckets_norm[0] is None
+
+
+class TestTheHotBandCanFinallyClose:
+    """Band 2 is the top band, so during a heat-up the water enters it and stops.
+
+    A band observation is recorded only when the water leaves its zone, so the hot band
+    never recorded a traverse and structurally could not. Measured 04.09.2026 on a spa
+    that had been running for months: `band_stats` held keys "0" and "1" and nothing
+    else, the morning after a clean 37→39 crossing.
+
+    The cost was not the missing row. With no fit for band 2, `learned_ambient_factor`
+    fell back permanently to the seed sensitivity — the largest of the three, and the one
+    that dominates a near-target estimate.
+    """
+
+    def _heating(self, c, temps, ambient=12.0, start=0.0, step_min=30.0):
+        t = start
+        for temp in temps:
+            c.ambient_temp = ambient
+            c._track_heating_rate(temp, 3, t * _MIN)
+            t += step_min
+
+    def test_reaching_the_learning_max_leaves_the_zone(self):
+        assert predictor.learning_anchor_zone(38.5) == 2
+        assert predictor.learning_anchor_zone(39.0) == 3
+        assert (predictor.learning_anchor_zone(39.0)
+                != predictor.learning_anchor_zone(38.5))
+
+    def test_the_hot_traverse_is_recorded(self):
+        c = _coord(heat_rate_buckets=[1.10, 1.03, 0.88],
+                   heat_rate_buckets_norm=[1.10, 1.03, 0.88], ambient_baseline=12.0)
+        self._heating(c, [36.5, 37.0, 37.5, 38.0, 38.5, 39.0])
+        hot = [o for o in c._band_observations if o["band"] == 2]
+        assert hot, "crossing 39 must close the hot band's window"
+        assert (hot[0]["from_temp"], hot[0]["to_temp"]) == (37.0, 39.0), \
+            "the chord must be the whole band, edge to edge"
+        assert hot[0]["usable"] and hot[0]["bucket_learnable"]
+
+    def test_and_reaches_the_running_fit(self):
+        """The point of the fix: band 2 gets a row in band_stats it can be fitted from."""
+        c = _coord(heat_rate_buckets=[1.10, 1.03, 0.88],
+                   heat_rate_buckets_norm=[1.10, 1.03, 0.88], ambient_baseline=12.0)
+        self._heating(c, [36.5, 37.0, 37.5, 38.0, 38.5, 39.0])
+        assert "2" in c._band_stats
+        assert c._band_stats["2"]["n"] == 1
+        assert c._band_stats["2"]["min_amb"] == pytest.approx(12.0)
+
+    def test_the_bucket_still_learns_exactly_as_before(self):
+        """The rate sample is taken before the zone comparison, so nothing moved."""
+        rates = []
+        for zone_fix in (True,):
+            c = _coord(heat_rate_buckets=[1.10, 1.03, 0.88],
+                       heat_rate_buckets_norm=[1.10, 1.03, 0.88], ambient_baseline=12.0)
+            self._heating(c, [36.5, 37.0, 37.5, 38.0, 38.5, 39.0])
+            rates.append(c.heat_rate_buckets[2])
+        # 37→39 over 2 h is 1.0 °C/h; the hot band is 2 °C of a 4 °C full span, so the
+        # EMA weight is 0.25 * 0.5 = 0.125.
+        assert rates[0] == pytest.approx(0.125 * 1.0 + 0.875 * 0.88, abs=1e-6)
+
+    def test_a_target_below_the_max_records_nothing_for_band_two(self):
+        """A 37→38 chord runs faster than a 37→39 one — mixing them would be worse."""
+        c = _coord(heat_rate_buckets=[1.10, 1.03, 0.88],
+                   heat_rate_buckets_norm=[1.10, 1.03, 0.88], ambient_baseline=12.0)
+        self._heating(c, [36.5, 37.0, 37.5, 38.0])
+        assert not [o for o in c._band_observations if o["band"] == 2]
+        assert "2" not in c._band_stats
+
+    def test_the_tail_above_the_max_is_still_refused_by_the_bucket(self):
+        c = _coord(heat_rate_buckets=[1.10, 1.03, 0.88],
+                   heat_rate_buckets_norm=[1.10, 1.03, 0.88], ambient_baseline=12.0)
+        self._heating(c, [36.5, 37.0, 38.0, 39.0])
+        before = c.heat_rate_buckets[2]
+        self._heating(c, [39.5, 40.0], start=300.0)
+        assert c.heat_rate_buckets[2] == before, "39→40 must not move the hot bucket"
+
+    def test_the_cold_and_mid_bands_are_unaffected(self):
+        c = _coord(heat_rate_buckets=[1.10, 1.03, 0.88],
+                   heat_rate_buckets_norm=[1.10, 1.03, 0.88], ambient_baseline=12.0)
+        self._heating(c, [28.0, 29.0, 30.0, 33.0, 35.0, 37.0])
+        bands = sorted({o["band"] for o in c._band_observations})
+        assert bands == [0, 1]
