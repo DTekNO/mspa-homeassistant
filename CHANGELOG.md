@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2026.9.1]
 
 **No breaking changes.** No entity has been removed or renamed, no attribute has changed
 meaning, and nothing on a dashboard or in an automation needs rewiring — every new sensor
