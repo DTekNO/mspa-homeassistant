@@ -123,3 +123,46 @@ Two diagnostic sensors — **Newton ready at** and **Newton start at** — repor
 physical model would have said, recomputed every poll and deciding nothing. Every
 finished session is priced by both and scored against what actually happened, so the
 question is settled by heat-ups rather than by argument.
+
+---
+
+## What you can watch
+
+Nothing here decides anything. The physical model is measured in the open so it can be
+judged on heat-ups rather than on argument, and everything it produces is diagnostic.
+
+**Newton ready at** and **Newton start at** report to the nearest five minutes. They are
+recomputed on every poll, and at full precision they moved a second or two each time and
+filled the recorder with changes that were not changes. Five minutes still leaves 108
+points across a nine-hour run, which is ample for seeing whether the estimate wanders —
+and wandering is the whole thing they exist to reveal.
+
+Both go **blank** whenever the model declines to answer: too few heating stretches
+recorded, or a night cold enough that it calls the target unreachable. The blank is
+deliberate. A filled-in fallback would look like an answer and hide the one fact worth
+knowing, which is that the model had nothing to say.
+
+The scoring appears on the **Ambient learning** sensor (diagnostic, disabled by default):
+
+| Attribute | What it says |
+|---|---|
+| `physical_model` | the current fit — `tau_h`, `asymptote_lift_c`, and how many traverses are behind it |
+| `physical_model_test` | the falsification test: the water and air coefficients that ought to come out equal and opposite |
+| `mean_abs_error_newton_min` | the physical model's error over finished sessions |
+| `sessions_compared_newton` | how many sessions that error rests on |
+| `implied_tub` | effective volume in litres, and loss in watts per °C |
+
+`implied_tub` is only ever as good as the heater power you configured for the energy
+sensors. It passes straight through the arithmetic, so a default left at 2000 W where the
+element is really 2200 W makes the tub read 10% small. Worth setting from your model's
+spec. The volume is derived and never entered — that is the point of it, because a fit
+implying 900 litres for a 600-litre spa has something wrong with it that no amount of
+curve-fitting would reveal.
+
+Two recording changes feed it. Each heating stretch now stores the weather condition it
+happened in: sun falling on the spa is heat the model knows nothing about, and it is the
+most likely thing to be mistaken for a result — nothing corrects for it, but it can now
+be checked for. And stretches below 20 °C are kept. They are still not learned from as
+rate buckets, since that range is outside what a bucket describes, but they are the most
+informative measurement the model can get, and a fresh fill from groundwater is the only
+time most spas produce one.

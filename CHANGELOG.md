@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**No breaking changes.** No entity has been removed or renamed, no attribute has changed
+meaning, and nothing on a dashboard or in an automation needs rewiring — every new sensor
+sits alongside the existing ones. Two things you may notice, both under Changed: estimates
+no longer carry the prediction bias, so Ready at and heat schedule times may shift
+slightly, generally later; and one redundant option has gone from the settings dialog,
+which changes nothing for anyone who had it on.
+
 ### Added
 
 - **Ready at and Heat Schedule now have localised counterparts.** Four new sensors —
@@ -27,6 +34,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Refs #20, thanks @IanJS46.
 
+- **The heat schedule now plans with the forecast, not just the temperature outside
+  right now.** A schedule is committed hours before it runs — an overnight plan settled
+  at 22:00 for a 09:00 finish is made while the air is still falling and finishes after
+  dawn — so the reading at the moment of committing describes neither end of the run. The
+  integration now averages the hourly forecast over the hours leading up to your ready
+  time and plans with that. Against exact hour-by-hour calculation this lands within
+  0.2%, where the old approach was out by 14% on an autumn morning and 10% the other way
+  on a winter night. In settled weather the difference is a few minutes; it grows as the
+  season turns. Needs a weather entity that offers an hourly forecast, and falls back to
+  the previous behaviour whenever one is missing, unavailable, or does not reach far
+  enough ahead.
+
+  **The same applies to a heat-up already under way**, where it matters more rather than
+  less. Mid-run before dawn the thermometer is reading the coldest hour of the night
+  while every remaining hour is warmer — on an autumn night that makes the estimate
+  around 40% too long at 04:00, and it is what makes a Ready at time sit still all night
+  and then race forward once the sun comes up. The window now covers the rest of the run
+  and shrinks as the run proceeds. One exception worth knowing: a scheduled heat-up under
+  the established model holds the plan it opened with, by design, so this helps free
+  heating and the experimental model rather than a schedule already running.
+
+  When a heat-up is long enough to run past the end of the forecast, the average is taken
+  over a whole day rather than over whatever part of one the forecast happens to reach.
+  Two days and one night is not a day's weather, and averaging an odd number of daylight
+  and dark hours can shift the figure by a couple of degrees on nothing but where the run
+  falls. Where the forecast does cover the whole run, the whole run is used however long
+  it is — those are the hours the spa will actually be heating through.
+
+- **A repair notice appears when the weather source stops providing what is needed.**
+  Home Assistant's Repairs page will tell you if the weather entity is missing,
+  unavailable, or offers no forecast, and say what to check. It waits for three
+  consecutive failed reads, five minutes apart, before saying anything — so a brief
+  outage at a restart does not raise one, but a weather source that is genuinely gone is
+  reported within about a quarter of an hour. It clears itself when the forecast comes
+  back. Nothing is broken while it is showing: estimates fall back to the current
+  outdoor temperature, and then to the seasonal average this spa has learned its heating
+  rates under, so they stay usable and become less accurate. Borrowed from Better
+  Thermostat, which flags a missing outside-temperature sensor the same way.
+
+- **An optional outdoor thermometer setting.** Point it at a temperature sensor outside
+  and the integration records what the air actually did across each heat-up, alongside
+  the forecast it was planned from. Nothing depends on it yet: a forecast describes the
+  region while a thermometer in your garden describes the air the spa is losing heat to,
+  and shelter, sun and cold air pooling can separate them by several degrees overnight —
+  worth roughly twenty minutes per degree on a long heat-up. Recorded first, so which to
+  trust is decided on real sessions. Leave it empty and nothing is recorded.
+
 - **Learned heating rates are now also stored corrected to a reference outdoor
   temperature.** A rate bucket used to store whatever rate it happened to see, under
   whatever weather prevailed while the water crossed that band — which is not a property
@@ -41,13 +95,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three learned rates still decrease as the physics requires, and how far they sit from
   a curve a single time constant could draw.
 
-- **An optional outdoor thermometer setting.** Point it at a temperature sensor outside
-  and the integration records what the air actually did across each heat-up, alongside
-  the forecast it was planned from. Nothing depends on it yet: a forecast describes the
-  region while a thermometer in your garden describes the air the spa is losing heat to,
-  and shelter, sun and cold air pooling can separate them by several degrees overnight —
-  worth roughly twenty minutes per degree on a long heat-up. Recorded first, so which to
-  trust is decided on real sessions. Leave it empty and nothing is recorded.
+- **Experimental: the physical heating model now runs alongside the one that ships.**
+  This is the next step in the learning and prediction work rather than a change to it.
+  Nothing here decides anything: your Ready at and heat schedule still come from the
+  learned rate buckets, exactly as before.
+
+  Newton's law describes a heated spa with two parameters where the integration currently
+  uses three learned rate buckets plus a correction for the weather bolted on outside. It
+  has one property the bucket model cannot: outdoor temperature is an *input* to it rather
+  than something to be learned, so adopting it would delete the weather correction rather
+  than improve it. Every finished heat-up is now priced by both models and scored against
+  what actually happened, so the question gets settled by heat-ups rather than by argument.
+
+  Two diagnostic sensors, **Newton ready at** and **Newton start at**, report what the
+  physical model would have said. Please don't build automations or dashboard cards on
+  them yet — they are unproven and may change without notice. They will be made more
+  accessible gradually over the coming weeks as the evidence accumulates, and if the model
+  proves out the improvement will arrive in the existing Ready at and Heat schedule
+  sensors, which keep their ids and their meaning. There would be nothing to rewire then
+  either.
+
+  📖 **[How the heat-up is predicted](docs/prediction-models.md)** — both models, why the
+  physical one is falsifiable where the buckets are not, and what the diagnostic
+  attributes mean.
 
 ### Fixed
 
@@ -96,116 +166,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same thing, and its only distinct state — a weather entity configured but the
   correction switched off — was one nobody wanted. Nothing changes for anyone who had it
   on, which was the default.
-
-### Added
-
-- **The physical model now shadows Ready at and the schedule — experimental, for
-  observation only.** Please don't build automations or dashboard cards on these two
-  sensors yet: they are unproven, they go blank whenever the model has too little data or
-  says the target is out of reach, and they may change or disappear without notice. If
-  the model proves out, the improvement will arrive in the existing Ready at and Heat
-  schedule sensors, so there will be nothing to rewire. Two diagnostic sensors,
-  **Newton ready at** and **Newton start at**, report what the physical model would have
-  said, recomputed on every poll. Your schedule and your Ready at are unchanged and still
-  come from the learned buckets; these two decide nothing. They report to the nearest five minutes: they
-  are recomputed on every poll, and at full precision they moved a second or two each
-  time and filled the history with changes that were not changes. They exist as sensors rather
-  than attributes so their history is recorded and can be charted, which is the only way
-  to see whether the model wanders during a long heat-up. Both are blank when the model
-  declines — too few heating stretches recorded, or a night cold enough that it says the
-  target is unreachable — and that blank is deliberate, since a filled-in fallback would
-  hide the answer. The same figures are written to the integration's storage file.
-
-  The physical model is primed from the learned rate buckets, so it has something to say
-  from the day it is enabled rather than after eight recorded heat-ups. A bucket is
-  physical data already digested — "this spa climbs at this rate across this stretch" —
-  and three of them place the line the model needs. The priming is dropped as soon as
-  real measurements can carry the fit, and is refused outright when the bucket shape
-  implies a spa that sheds almost no heat.
-
-  Each heating stretch now also records the weather condition it happened in. Sun falling
-  on the spa is heat the model knows nothing about, and it is the most likely thing to be
-  mistaken for a result — nothing corrects for it, but it can now be checked for.
-
-  **The heat schedule now plans with the forecast, not just the temperature outside
-  right now.** A schedule is committed hours before it runs — an overnight plan settled
-  at 22:00 for a 09:00 finish is made while the air is still falling and finishes after
-  dawn — so the reading at the moment of committing describes neither end of the run. The
-  integration now averages the hourly forecast over the hours leading up to your ready
-  time and plans with that. Against exact hour-by-hour calculation this lands within
-  0.2%, where the old approach was out by 14% on an autumn morning and 10% the other way
-  on a winter night. In settled weather the difference is a few minutes; it grows as the
-  season turns. Needs a weather entity that offers an hourly forecast, and falls back to
-  the previous behaviour whenever one is missing, unavailable, or does not reach far
-  enough ahead.
-
-  **The same applies to a heat-up already under way**, where it matters more rather than
-  less. Mid-run before dawn the thermometer is reading the coldest hour of the night
-  while every remaining hour is warmer — on an autumn night that makes the estimate
-  around 40% too long at 04:00, and it is what makes a Ready at time sit still all night
-  and then race forward once the sun comes up. The window now covers the rest of the run
-  and shrinks as the run proceeds. One exception worth knowing: a scheduled heat-up under
-  the established model holds the plan it opened with, by design, so this helps free
-  heating and the experimental model rather than a schedule already running.
-
-  **A repair notice appears when the weather source stops providing what is needed.**
-  Home Assistant's Repairs page will tell you if the weather entity is missing,
-  unavailable, or offers no forecast, and say what to check. It waits for three
-  consecutive failed reads, five minutes apart, before saying anything — so a brief
-  outage at a restart does not raise one, but a weather source that is genuinely gone is
-  reported within about a quarter of an hour. It clears itself when the forecast comes
-  back. Nothing is broken
-  while it is showing: estimates fall back to the current outdoor temperature, and then
-  to the seasonal average this spa has learned its heating rates under, so they stay
-  usable and become less accurate. Borrowed from Better Thermostat, which flags a
-  missing outside-temperature sensor the same way.
-
-  When a heat-up is long enough to run past the end of the forecast, the average is taken
-  over a whole day rather than over whatever part of one the forecast happens to reach.
-  Two days and one night is not a day's weather, and averaging an odd number of daylight
-  and dark hours can shift the figure by a couple of degrees on nothing but where the run
-  falls. Where the forecast does cover the whole run, the whole run is used however long
-  it is — those are the hours the spa will actually be heating through.
-
-  Heating stretches below 20 °C are now kept for the physical model. They are still not
-  learned from as rate buckets — that range is outside what a bucket describes — but they
-  are the most informative measurement the physical model can get, and a fresh fill from
-  groundwater is the only time most spas produce one.
-
-  Internally, Ready at and the Heat schedule can now be switched between the two models
-  without moving an entity: same sensors, same ids, same meaning, so nothing on a
-  dashboard or in an automation would need changing if the physical model is ever
-  adopted. There is deliberately no setting for it — the switch is not offered while the
-  model is still being evaluated.
-
-- **The physical heating model is now measured alongside the one that ships.** Newton's
-  law describes a heated spa with two parameters — a time constant and how far above air
-  temperature the heater can hold the water — where the integration currently uses three
-  learned rate buckets plus a separate correction for the weather. The physical model has
-  one useful property the bucket model cannot have: outdoor temperature is an *input* to
-  it rather than something to be learned, so adopting it would delete the weather
-  correction rather than improve it.
-
-  Nothing about your predictions changes. The model is fitted from heating stretches
-  already being recorded, and every heat-up is now priced by it as well, so the two can
-  be compared on real finished sessions. The comparison appears on the **Ambient
-  learning** diagnostic sensor (disabled by default) as `physical_model`,
-  `physical_model_test` and `mean_abs_error_newton_min`, alongside the shipping model's
-  error over the same sessions.
-
-  Because the heater's power is already known — you set it for the energy sensors, and
-  heating rates are only ever learned in full-heat mode, so it is unambiguously the
-  active-heating figure rather than the pre-heat one — the fit also implies your tub's
-  **effective volume in litres** and how fast it loses heat in watts per °C. Both appear
-  under `implied_tub`, and both are only as good as that rating: it passes straight
-  through, so a default left at 2000 W where the element is really 2200 W makes the tub
-  read 10% small. Worth setting from your model's spec. The volume is
-  derived and never entered: that is the point of it, because a fit that implies 900
-  litres for a 600-litre spa has something wrong with it that no amount of curve-fitting
-  would reveal.
-
-  It needs weeks of heat-ups before it says anything. `sessions_compared_newton` is
-  reported next to the error so it is clear how much evidence is behind it.
 
 ## [2026.8.2]
 
