@@ -96,6 +96,12 @@ def _ready_status(readiness):
     return MSpaReadyStatusSensor.native_value.fget(stub)
 
 
+def _ready_compact(readiness):
+    stub = type("S", (), {"_readiness": readiness,
+                          "native_value": _ready_time(readiness)})()
+    return MSpaReadyAtTimeSensor.extra_state_attributes.fget(stub)["compact"]
+
+
 def _sched_start(schedule):
     return MSpaHeatScheduleStartSensor.native_value.fget(
         type("S", (), {"_schedule": schedule})())
@@ -356,3 +362,58 @@ class TestTheOriginalsAreUntouched:
             schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0),
             MockConfigEntry())
         assert re.match(r"^Start at \d{2}:\d{2}( \+\d+d)?$", s.native_value)
+
+
+class TestTheCompactAttribute:
+    """The escape hatch for places the localised state will not fit.
+
+    A picture-elements state-label renders a timestamp state as "11 September 2026 at
+    14:00", which is right and unusable in the corner of a photo. That element prints an
+    `attribute:` raw, so a pre-formatted string put there arrives on screen verbatim.
+    Server-formatted and therefore not localised — which is exactly why it is an
+    attribute and not the state.
+    """
+
+    def _heating(self):
+        return _ReadinessStub(MockCoordinator(
+            near_target=False, ready_latched=False,
+            water_temp=20.0, target_temp=40.0, heat_rate=2.0, heater="on"))
+
+    def test_it_has_the_shape_the_deprecated_state_had(self):
+        """A dashboard moving off the text sensor should see the same kind of string.
+
+        Not asserted byte-for-byte against that state: the old _fmt_local formats in the
+        *machine's* timezone and _fmt_compact in Home Assistant's configured one. They
+        agree on a normal install and the new one is right where they do not.
+        """
+        r = self._heating()
+        compact = _ready_compact(r)
+        assert re.match(r"^\d{2}:\d{2}( \+\d+d)?$", compact), compact
+        assert compact[:5] == _ready_time(r).strftime("%H:%M")   # as_local is identity here
+
+    def test_it_is_none_when_there_is_no_time(self):
+        """A stale badge is worse than none: it would say a spa still had time to go."""
+        r = self._heating()
+        with patch("custom_components.mspa.sensor._compute_ready_at",
+                   return_value=("ready", None)):
+            assert _ready_time(r) is None
+            assert _ready_compact(r) is None
+
+    def test_the_schedule_start_carries_no_prefix(self):
+        """"Start at" belongs to whatever displays it, not to the value."""
+        s = _ScheduleStub(MockCoordinator(
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=12),
+            schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0),
+            MockConfigEntry())
+        state = s.native_value
+        stub = type("S", (), {"_schedule": s,
+                              "native_value": _sched_start(s)})()
+        compact = MSpaHeatScheduleStartSensor.extra_state_attributes.fget(
+            stub)["compact"]
+        assert compact and not compact.startswith("Start at")
+        assert state == f"Start at {compact}"
+
+    def test_it_stays_out_of_the_state(self):
+        """The state must remain a real timestamp or Home Assistant cannot localise it."""
+        r = self._heating()
+        assert isinstance(_ready_time(r), datetime)

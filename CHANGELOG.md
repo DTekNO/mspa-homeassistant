@@ -29,8 +29,14 @@ which changes nothing for anyone who had it on.
   24-hour clock and English. Home Assistant will do the formatting, but only for a state
   that is *nothing but* a timestamp, and it will translate a state only when the whole
   state is a fixed word. Neither can be applied to "Start at 10:34 +1d". Handing the
-  time to one sensor and the words to another lets each be done properly. The `+1d`
-  suffix goes with it — a rendered timestamp already carries its date.
+  time to one sensor and the words to another lets each be done properly.
+
+  Both timestamp sensors also carry a `compact` attribute — `14:00`, or `14:00 +3d` —
+  for the one place the localised state will not go. A `picture-elements` overlay renders
+  a timestamp as "11 September 2026 at 14:00", which is correct and runs off the side of
+  the photo; that card prints an attribute raw, so the short form can be used there
+  instead. It is formatted on the server and so is not localised, which is exactly why it
+  is an attribute and not the state.
 
   Refs #20, thanks @IanJS46.
 

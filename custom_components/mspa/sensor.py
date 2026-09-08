@@ -916,6 +916,20 @@ def _day_offset_suffix(dt_utc) -> str:
     return f" +{days}d" if days > 0 else ""
 
 
+def _fmt_compact(dt_utc) -> "str | None":
+    """'14:00', or '14:00 +3d' when it falls on a later day. None stays None.
+
+    Home Assistant's configured timezone, via dt_util — not the machine's. _fmt_local
+    above predates this and uses `.astimezone()`, which is the host's idea of local time;
+    the two agree on a normal install and diverge on one where HA's timezone was set to
+    something other than the operating system's. New code should use this one.
+    """
+    if dt_utc is None:
+        return None
+    local = dt_util.as_local(dt_utc)
+    return f"{local.strftime('%H:%M')}{_day_offset_suffix(dt_utc)}"
+
+
 def _compute_schedule_value(result) -> str:
     """Return the Heat Schedule display value from a _schedule_data() result."""
     if result is None:
@@ -1528,6 +1542,22 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 # entities answering "when" with different numbers is worse than either alone.
 
 
+# Both timestamp sensors carry a `compact` attribute: the same moment as the state, but
+# pre-formatted as "14:00" or "14:00 +3d".
+#
+# It exists for one place the localised state cannot go. A picture-elements `state-label`
+# renders a timestamp state through formatEntityState, which gives "11 September 2026 at
+# 14:00" — correct, localised, and far too long for a corner of a photo. That element also
+# accepts `attribute:`, and unlike the more-info dialog it prints an attribute *raw*, so a
+# string put there arrives on screen exactly as written.
+#
+# It is server-formatted, so it is 24-hour and in the server's timezone for every viewer —
+# the same limitation the deprecated text sensors have, and the reason it is an attribute
+# rather than the state. The state stays the properly typed timestamp that Home Assistant
+# localises per viewer; `compact` is the fallback for somewhere that cannot use it. Having
+# both on one entity is what lets the text sensors eventually go.
+
+
 class MSpaReadyAtTimeSensor(MSpaSensorEntity):
     """The Ready at time as a real timestamp, formatted by Home Assistant.
 
@@ -1555,6 +1585,10 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
     @property
     def native_value(self):
         return self._readiness.display_ready_at()[1]
+
+    @property
+    def extra_state_attributes(self):
+        return {"compact": _fmt_compact(self.native_value)}
 
 
 class MSpaReadyStatusSensor(MSpaSensorEntity):
@@ -1617,6 +1651,12 @@ class MSpaHeatScheduleStartSensor(MSpaSensorEntity):
     @property
     def native_value(self):
         return self._schedule.display_schedule()[1]
+
+    @property
+    def extra_state_attributes(self):
+        # The time only, with no "Start at" — the label belongs to whatever is
+        # displaying it, and a caller that wants a prefix can supply its own.
+        return {"compact": _fmt_compact(self.native_value)}
 
 
 class MSpaHeatScheduleStatusSensor(MSpaSensorEntity):

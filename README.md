@@ -192,6 +192,32 @@ instead, and Home Assistant knows who is looking.
 Their attributes are unaffected either way — `ready_at`, `start_at` and `target_time`
 remain ISO 8601 timestamps and remain the right thing for automations to act on.
 
+**Somewhere the long form will not fit?** Both timestamp sensors also carry a `compact`
+attribute holding the short form — `14:00`, or `14:00 +3d` when it lands on a later day.
+It is formatted on the server, so unlike the state it is 24-hour and in *your* Home
+Assistant's timezone for everyone; that is the trade, and it is why it is an attribute
+rather than the state.
+
+The case it exists for is a `picture-elements` overlay, where a timestamp state renders
+as "11 September 2026 at 14:00" and runs off the side of the photo. A `state-label`
+prints an `attribute:` raw, so this arrives exactly as written:
+
+```yaml
+- type: conditional
+  conditions:
+    - condition: state
+      entity: sensor.mspa_ready_status
+      state: [heating, scheduled]
+  elements:
+    - type: state-label
+      entity: sensor.mspa_ready_at_time
+      attribute: compact
+      prefix: 'Ready '
+```
+
+Note the condition matches `heating`, not `Heating` — a status sensor's state is the
+untranslated token, and the translated word is only what you see.
+
 **How it fits together:** set **Scheduled for** to when you want to use the spa. The **Heat Schedule** sensor works backwards through the learned heating rates — corrected for any available weather data while waiting to start — to compute when heating must start, and the integration **starts the spa itself** when that moment arrives. The **Ready at** sensor then tracks the live estimate through to `Ready` and can be used on your dashboard to let you know how long you have to wait! The start time is re-evaluated continuously until it fires, so if the spa cools faster than expected, the start moves earlier rather than quietly missing your target.
 
 Optionally configure a [weather entity](#optional-weather-entity) to make the pre-start estimate account for outdoor conditions.
