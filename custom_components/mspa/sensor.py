@@ -137,9 +137,24 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # Temperature-reach sensors are registered for every spa.
     # They show as unavailable until a reliable rate is established
     # (computed EMA for heating/cooling, or device_heat_perhour as fallback for heating).
+    # The two text sensors, plus the localised companions that mirror them.  The
+    # companions hold a reference rather than re-deriving, so they are constructed
+    # from the same instances that get added.
+    #
+    # Order matters, mildly: the readiness sensor's ETA slew advances in its own
+    # native_value, and entities in one batch are written in the order given, so
+    # listing it first means the companions read a position established this update
+    # rather than the previous one.  Being wrong about that costs at most one slew
+    # step, which is capped at a minute — worth getting right, not worth locking.
+    readiness = MSpaReadinessSensor(coordinator)
+    schedule = MSpaHeatScheduleSensor(coordinator, entry)
     async_add_entities([
-        MSpaReadinessSensor(coordinator),
-        MSpaHeatScheduleSensor(coordinator, entry),
+        readiness,
+        schedule,
+        MSpaReadyAtTimeSensor(coordinator, readiness),
+        MSpaReadyStatusSensor(coordinator, readiness),
+        MSpaHeatScheduleStartSensor(coordinator, schedule),
+        MSpaHeatScheduleStatusSensor(coordinator, schedule),
     ])
 
     # Device detail sensor — exposes extended info from /api/device/detail/ as attributes
@@ -1096,6 +1111,34 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     def icon(self):
         return "mdi:hot-tub"
 
+    def display_ready_at(self):
+        """Return (kind, timestamp) for whatever this sensor is currently showing.
+
+        Single source of truth: the attribute has to agree with the state.
+        This used to re-derive the time independently, which disagreed with the
+        display whenever a schedule was driving it — with a schedule pending and
+        the spa cooling toward its maintenance setpoint the state showed
+        "13:00 +1d" while ready_at reported nothing, because the old branch bailed
+        out on `cooling`.  Deriving both from _compute_ready_at() removes the
+        second opinion.
+
+        Also the source for the Ready at time and Ready status sensors, which is
+        why it reads `_eta_display` rather than calling `_slew_eta`: the slew
+        advances by wall-clock time and is not idempotent, so only `native_value`
+        may drive it.  Before the first `native_value` of a session there is no
+        slewed position yet and the raw estimate stands in for one update.
+        """
+        kind, kind_dt = _compute_ready_at(self.coordinator)
+        if kind == "sched":
+            # Scheduled times are shown verbatim and never slewed.
+            return kind, kind_dt
+        if kind == "eta":
+            # Match the slewed display rather than the raw anchor estimate.
+            smoothed = (self._round_eta(self._eta_display)
+                        if self._eta_display is not None else None)
+            return kind, (smoothed if smoothed is not None else kind_dt)
+        return kind, None       # 'ready' / 'none' — there is no time to report
+
     @property
     def extra_state_attributes(self):
         direction = _spa_direction(self.coordinator)
@@ -1127,22 +1170,7 @@ class MSpaReadinessSensor(MSpaSensorEntity):
         except (TypeError, ValueError):
             water_temp = target_temp = None
 
-        # Single source of truth: the attribute has to agree with the state.
-        # This used to re-derive the time independently, which disagreed with the
-        # display whenever a schedule was driving it — with a schedule pending and
-        # the spa cooling toward its maintenance setpoint the state showed
-        # "13:00 +1d" while ready_at reported nothing, because the old branch bailed
-        # out on `cooling`.  Deriving both from _compute_ready_at() removes the
-        # second opinion.
-        kind, kind_dt = _compute_ready_at(self.coordinator)
-        if kind == "sched":
-            # Scheduled times are shown verbatim and never slewed.
-            ready_at_utc = kind_dt
-        elif kind == "eta":
-            # Match the slewed display rather than the raw anchor estimate.
-            ready_at_utc = smoothed if smoothed is not None else kind_dt
-        else:
-            ready_at_utc = None     # 'ready' / 'none' — there is no time to report
+        kind, ready_at_utc = self.display_ready_at()
         ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
 
         # The rate actually in effect for the current estimate: segmented over
@@ -1395,6 +1423,35 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
         start_at_utc = target_utc - timedelta(minutes=minutes_needed)
         return (target_utc, target_temp, start_at_utc)
 
+    def display_schedule(self):
+        """Return (status token, displayed start) for this update.
+
+        The status half of what `native_value` renders as text, in the fixed
+        vocabulary the Heat schedule status sensor publishes; the start is the
+        *held* one the text state shows, not the live plan the `start_at`
+        attribute reports (see the class docstring for why they differ).
+
+        Derived here rather than parsed back out of the rendered string so the
+        companion entities cannot drift from the sensor they mirror.  Safe to call
+        more than once per update: `_schedule_data` only reads, and `_slew_start`
+        is a pure function of (raw, held, now) by design.
+        """
+        result = self._schedule_data()
+        if result is None:
+            return "not_scheduled", None
+        if result == "ready":
+            return "ready", None
+        if result == "triggered":
+            return "heating", None
+        if isinstance(result, tuple) and len(result) == 2:
+            # A schedule exists but is beyond the lookahead horizon, so there is a
+            # target and deliberately no start time to show.
+            return "scheduled", None
+        _, _, raw_start = result
+        now_utc = dt_util.utcnow()
+        start = self._slew_start(raw_start, now_utc)
+        return ("start_now" if now_utc >= start else "waiting"), start
+
     @property
     def native_value(self):
         result = self._schedule_data()
@@ -1441,6 +1498,152 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
             "circulating": circulating,
             "temperature_basis": temperature_basis,
         }
+
+
+# Localised companions to the two text sensors above.
+#
+# `sensor.mspa_ready_at` and `sensor.mspa_heat_schedule` build their own display
+# strings with strftime and English literals, which pins them to a 24-hour clock and
+# to English however the viewer has set up their profile.  That cannot be fixed in
+# place, for a reason worth writing down: Home Assistant's time format is a per-user
+# frontend preference with no server-side equivalent (there is no `time_format`
+# anywhere in core's Python), and an entity state is one string shared by every
+# viewer.  So the integration cannot format it correctly even in principle.
+#
+# Both of the frontend's own mechanisms work only on states that carry nothing else:
+# a `device_class: timestamp` state is rendered through formatDateTime in the
+# viewer's format and timezone, and a state translation looks up
+# `component.mspa.entity.sensor.<translation_key>.state.<state>` with no placeholder
+# substitution, so the whole state has to be the key.  Neither can touch
+# "Start at 15:15 +1d".
+#
+# Hence the split: the time moves to a timestamp entity and the words to an enum
+# entity, and each gets localised by the mechanism built for it.  The `+Nd` suffix
+# retires with the split — a rendered timestamp carries its own date.
+#
+# The originals keep working unchanged.  They are the compact single-badge form and
+# people have them on dashboards and in automations; they are deprecated in the
+# README rather than repurposed, and can be removed in a later major.  Every value
+# here comes from the sensor it mirrors rather than being recomputed, because two
+# entities answering "when" with different numbers is worse than either alone.
+
+
+class MSpaReadyAtTimeSensor(MSpaSensorEntity):
+    """The Ready at time as a real timestamp, formatted by Home Assistant.
+
+    None while the spa is Ready or there is nothing to predict — the Ready status
+    companion is what distinguishes those two, since an absent time cannot.
+    """
+
+    name = "Ready at time"
+    _attr_icon = "mdi:clock-check-outline"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator, readiness):
+        super().__init__(coordinator)
+        self._attr_device_info = self.device_info
+        self._readiness = readiness
+        self._attr_unique_id = (
+            f"mspa_ready_at_time_{getattr(coordinator, 'device_id', 'unknown')}")
+
+    @property
+    def available(self):
+        # Deliberately the readiness sensor's own answer: the pair describes one
+        # thing and should not be half-present on a dashboard.
+        return self._readiness.available
+
+    @property
+    def native_value(self):
+        return self._readiness.display_ready_at()[1]
+
+
+class MSpaReadyStatusSensor(MSpaSensorEntity):
+    """Which of the Ready at states is in force, as a translatable token.
+
+    'scheduled' means the time being shown is the one that was asked for; 'heating'
+    means it is a live prediction.  Unknown when there is nothing to report, which
+    is a state Home Assistant already translates.
+    """
+
+    name = "Ready status"
+    _attr_icon = "mdi:hot-tub"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_translation_key = "ready_status"
+    _attr_options = ["ready", "heating", "scheduled"]
+
+    # The kinds _compute_ready_at returns, mapped onto the published vocabulary.
+    # 'none' is absent on purpose: it means "no opinion", which is what unknown
+    # already says, and inventing a token for it would put a word on a dashboard
+    # where a blank is more honest.
+    _KINDS = {"ready": "ready", "eta": "heating", "sched": "scheduled"}
+
+    def __init__(self, coordinator, readiness):
+        super().__init__(coordinator)
+        self._attr_device_info = self.device_info
+        self._readiness = readiness
+        self._attr_unique_id = (
+            f"mspa_ready_status_{getattr(coordinator, 'device_id', 'unknown')}")
+
+    @property
+    def available(self):
+        return self._readiness.available
+
+    @property
+    def native_value(self):
+        return self._KINDS.get(self._readiness.display_ready_at()[0])
+
+
+class MSpaHeatScheduleStartSensor(MSpaSensorEntity):
+    """The planned conditioning start as a real timestamp.
+
+    The held start, matching what the Heat Schedule text sensor displays, rather
+    than the live plan — the `start_at` attribute over there remains the live one
+    for automations to act on, and the two can differ while the start is still
+    hours away.  None whenever there is no start to show: no schedule, already
+    heating, or a target beyond the lookahead horizon.
+    """
+
+    name = "Heat schedule start"
+    _attr_icon = "mdi:clock-start"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator, schedule):
+        super().__init__(coordinator)
+        self._attr_device_info = self.device_info
+        self._schedule = schedule
+        self._attr_unique_id = (
+            f"mspa_heat_schedule_start_{getattr(coordinator, 'device_id', 'unknown')}")
+
+    @property
+    def native_value(self):
+        return self._schedule.display_schedule()[1]
+
+
+class MSpaHeatScheduleStatusSensor(MSpaSensorEntity):
+    """What the heat schedule is doing, as a translatable token.
+
+    'scheduled' is the beyond-the-horizon case: a schedule exists but no start time
+    is projected for it yet.  'waiting' means a start time is known and still ahead,
+    and is the state whose time the Heat schedule start sensor carries.
+    """
+
+    name = "Heat schedule status"
+    _attr_icon = "mdi:calendar-clock"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_translation_key = "heat_schedule_status"
+    _attr_options = ["not_scheduled", "scheduled", "waiting",
+                     "start_now", "heating", "ready"]
+
+    def __init__(self, coordinator, schedule):
+        super().__init__(coordinator)
+        self._attr_device_info = self.device_info
+        self._schedule = schedule
+        self._attr_unique_id = (
+            f"mspa_heat_schedule_status_{getattr(coordinator, 'device_id', 'unknown')}")
+
+    @property
+    def native_value(self):
+        return self._schedule.display_schedule()[0]
 
 
 # This sensor is used to indicate faults or warnings in the MSpa system.

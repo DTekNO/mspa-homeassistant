@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ready at and Heat Schedule now have localised counterparts.** Four new sensors —
+  **Ready at time**, **Ready status**, **Heat schedule start** and **Heat schedule
+  status** — show what the existing two show, but in your own time format, timezone and
+  language. The originals are unchanged and keep working; they are deprecated in favour
+  of the new pair and will be removed in a future major release.
+
+  The split exists because a single sensor cannot do both jobs. Home Assistant's time
+  format is a per-user frontend preference with no server-side equivalent, while an
+  entity state is one string every user sees — so a sensor that formats "10:34" itself
+  can never honour your preference, and that is why the existing two are fixed to a
+  24-hour clock and English. Home Assistant will do the formatting, but only for a state
+  that is *nothing but* a timestamp, and it will translate a state only when the whole
+  state is a fixed word. Neither can be applied to "Start at 10:34 +1d". Handing the
+  time to one sensor and the words to another lets each be done properly. The `+1d`
+  suffix goes with it — a rendered timestamp already carries its date.
+
+  Refs #20, thanks @IanJS46.
+
 - **Learned heating rates are now also stored corrected to a reference outdoor
   temperature.** A rate bucket used to store whatever rate it happened to see, under
   whatever weather prevailed while the water crossed that band — which is not a property

@@ -163,6 +163,35 @@ This section covers two sensors and one control entity that work together:
 | **Scheduled for** | Control (datetime) | Set when you want the spa ready |
 | **Cancel Heat Schedule** | Button | Clears a pending schedule without touching the heater |
 
+Each of the two sensors also has a **localised pair** that shows the same thing in your
+own language and time format:
+
+| Entity | Type | Purpose |
+|--------|------|---------|
+| **Ready at time** | Sensor (timestamp) | The same moment as **Ready at**, rendered in your profile's time format and timezone. Blank when the spa is ready or there is nothing to predict. |
+| **Ready status** | Sensor (enum) | Which of `Ready` / `Heating` / `Scheduled` is in force, translated |
+| **Heat schedule start** | Sensor (timestamp) | The planned start, in your own format. Blank when there is no start to show. |
+| **Heat schedule status** | Sensor (enum) | `Not scheduled` / `Scheduled` / `Waiting to start` / `Start now` / `Heating` / `Ready`, translated |
+
+**Which pair should I use?** If you want the compact one-line badge, keep **Ready at**
+and **Heat Schedule** — they are unchanged. If you want the time in 12-hour clock, in
+another timezone, or the words in your own language, use the localised pair.
+
+The reason there are two of each is worth knowing, because it is not going away: Home
+Assistant's time format is a *per-user* setting in the frontend, and an integration only
+ever produces one state that every user sees. So a sensor that formats a time itself
+cannot honour your preference even in principle — the preference does not exist on the
+server. **Ready at** and **Heat Schedule** format their own text, which is why they are
+fixed to a 24-hour clock and English. A timestamp sensor hands the job to Home Assistant
+instead, and Home Assistant knows who is looking.
+
+> **Deprecated:** **Ready at** and **Heat Schedule** keep their present behaviour and are
+> safe to use, but new dashboards should prefer the localised pair. They will be removed
+> in a future major release, with notice.
+
+Their attributes are unaffected either way — `ready_at`, `start_at` and `target_time`
+remain ISO 8601 timestamps and remain the right thing for automations to act on.
+
 **How it fits together:** set **Scheduled for** to when you want to use the spa. The **Heat Schedule** sensor works backwards through the learned heating rates — corrected for any available weather data while waiting to start — to compute when heating must start, and the integration **starts the spa itself** when that moment arrives. The **Ready at** sensor then tracks the live estimate through to `Ready` and can be used on your dashboard to let you know how long you have to wait! The start time is re-evaluated continuously until it fires, so if the spa cools faster than expected, the start moves earlier rather than quietly missing your target.
 
 Optionally configure a [weather entity](#optional-weather-entity) to make the pre-start estimate account for outdoor conditions.
