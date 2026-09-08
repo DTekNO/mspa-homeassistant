@@ -103,6 +103,14 @@ CONF_WEATHER_ENTITY = "weather_entity"
 #
 # Recorded and not yet used. Planning still runs on the forecast; this exists so the two
 # can be compared over real sessions before anything depends on it.
+#
+# Deliberately NOT offered in the options dialog. It is a development instrument, not a
+# feature: nothing depends on it, it asks the user to pick an entity to no visible end,
+# and it would have to be supported and documented from the moment it shipped. To set it
+# on an installation that is collecting the comparison, add it to the config entry's
+# options in .storage/core.config_entries. The options flow preserves keys it does not
+# manage (see OPTION_KEYS in config_flow.py), so a later Submit in the dialog will not
+# wipe it. If it ever earns a place in the UI it can be added back deliberately.
 CONF_OUTDOOR_SENSOR = "outdoor_sensor"
 
 # There is deliberately no switch for "apply the learned response to outdoor

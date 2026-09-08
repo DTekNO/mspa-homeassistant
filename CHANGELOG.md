@@ -73,14 +73,6 @@ which changes nothing for anyone who had it on.
   rates under, so they stay usable and become less accurate. Borrowed from Better
   Thermostat, which flags a missing outside-temperature sensor the same way.
 
-- **An optional outdoor thermometer setting.** Point it at a temperature sensor outside
-  and the integration records what the air actually did across each heat-up, alongside
-  the forecast it was planned from. Nothing depends on it yet: a forecast describes the
-  region while a thermometer in your garden describes the air the spa is losing heat to,
-  and shelter, sun and cold air pooling can separate them by several degrees overnight —
-  worth roughly twenty minutes per degree on a long heat-up. Recorded first, so which to
-  trust is decided on real sessions. Leave it empty and nothing is recorded.
-
 - **Learned heating rates are now also stored corrected to a reference outdoor
   temperature.** A rate bucket used to store whatever rate it happened to see, under
   whatever weather prevailed while the water crossed that band — which is not a property
@@ -120,18 +112,6 @@ which changes nothing for anyone who had it on.
   attributes mean.
 
 ### Fixed
-
-- **The near-setpoint heating rate can now learn how the weather affects it.** A band's
-  response to outdoor temperature is fitted from complete traverses of that band, and a
-  traverse was only recorded once the water left it — but the near-setpoint band is the
-  top one, so during a heat-up the water arrives and stops. It had therefore never
-  recorded a single traverse and never could, on any spa, since the feature was added.
-  The practical effect was that the correction for outdoor temperature in the last two
-  degrees — the largest of the three, and the one that decides whether "Ready at" is
-  right — was stuck on its shipped default and could not be improved by anything your
-  spa did. A heat-up that reaches the top of the learning range now closes the band
-  properly. Nothing about existing predictions changes; the band simply starts
-  accumulating the evidence it was always meant to.
 
 - **No more deprecation warnings in the log after a restart.** The device-registry lookup
   used during the one-time migration of the old device identifier used a call that Home

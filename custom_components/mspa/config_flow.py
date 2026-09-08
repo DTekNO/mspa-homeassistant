@@ -12,7 +12,6 @@ from homeassistant.helpers.selector import (
 )
 from .const import (
     DOMAIN,
-    CONF_OUTDOOR_SENSOR,
     CONF_REGION,
     DEFAULT_REGION,
     REGIONS,
@@ -246,13 +245,32 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return OptionsFlowHandler()
 
 
+# The options this dialog owns.  Anything in the config entry that is not listed here
+# was set from outside the dialog and must survive a Submit — see async_step_init.
+# test_options_flow_key_list_matches_the_form keeps the two in step.
+OPTION_KEYS = frozenset({
+    "pump_power", "bubble_power", "heater_power_preheat", "heater_power_heat",
+    CONF_TRACK_TEMPERATURE_UNIT, CONF_ALWAYS_ENFORCE_UNIT, CONF_RESTORE_STATE,
+    CONF_WEATHER_ENTITY, CONF_SCHEDULE_TARGET_TEMP,
+})
+
+
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Options flow for per-device power consumption settings."""
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:
-            # Save options and return
-            return self.async_create_entry(title="", data=user_input)
+            # Carry across any option this dialog does not manage.
+            #
+            # async_create_entry replaces the options wholesale, so an option set outside
+            # the dialog — CONF_OUTDOOR_SENSOR, which is deliberately not offered here —
+            # would be silently wiped the first time somebody opened Options and pressed
+            # Submit.  Only unmanaged keys are merged: a blanket merge would also
+            # resurrect a cleared weather entity, because clearing an EntitySelector
+            # drops the key from user_input rather than setting it to None.
+            hidden = {k: v for k, v in self.config_entry.options.items()
+                      if k not in OPTION_KEYS}
+            return self.async_create_entry(title="", data={**hidden, **user_input})
 
         data_schema = vol.Schema({
             vol.Optional(
@@ -290,12 +308,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_WEATHER_ENTITY,
                 description={"suggested_value": self.config_entry.options.get(CONF_WEATHER_ENTITY)},
             ): EntitySelector(EntitySelectorConfig(domain="weather")),
-            vol.Optional(
-                CONF_OUTDOOR_SENSOR,
-                description={"suggested_value": self.config_entry.options.get(
-                    CONF_OUTDOOR_SENSOR)},
-            ): EntitySelector(EntitySelectorConfig(
-                domain="sensor", device_class="temperature")),
             vol.Optional(
                 CONF_SCHEDULE_TARGET_TEMP,
                 default=self.config_entry.options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP),

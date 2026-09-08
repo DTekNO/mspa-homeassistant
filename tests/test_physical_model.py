@@ -1811,10 +1811,64 @@ class TestTheOneShotRecordsWhatItNeedsTo:
         from the twenty-odd others in a house, and guessing from the name picks the
         oven."""
         assert self._coord(sensor=None).outdoor_sensor is None
+
+    def test_but_it_is_not_offered_to_users(self):
+        """A development instrument, kept out of the options dialog on purpose.
+
+        It drives nothing a user can see, so asking someone to pick an entity for it
+        buys them nothing and commits us to supporting it from the day it ships. This
+        guards the way back in: the option is easy to re-add by reflex when working on
+        the surrounding code. Set it by editing the config entry instead — see the note
+        on CONF_OUTDOOR_SENSOR in const.py.
+        """
+        from tests.test_config_flow_translations import _schema_keys_by_step
+        for step, keys in _schema_keys_by_step().items():
+            assert "outdoor_sensor" not in keys, f"{step} asks the user for it"
         from pathlib import Path
         root = Path(__file__).parent.parent / "custom_components" / "mspa"
-        for name in ("config_flow.py", "strings.json", "translations/en.json"):
-            assert "outdoor_sensor" in (root / name).read_text().lower(), name
+        for name in ("strings.json", "translations/en.json"):
+            assert "outdoor_sensor" not in (root / name).read_text(encoding="utf-8"), name
+
+    def test_and_a_hidden_option_survives_the_options_dialog(self):
+        """Submitting Options must not wipe what the dialog does not manage.
+
+        async_create_entry replaces the options wholesale, so without this the thermometer
+        would vanish the first time anyone opened Options and pressed Submit — silently,
+        and only visible weeks later as a gap in the comparison it was collecting for.
+
+        Read from source rather than imported: config_flow pulls in voluptuous and the HA
+        selector helpers, which the stubs in conftest do not provide.
+        """
+        from pathlib import Path
+        src = (Path(__file__).parent.parent / "custom_components" / "mspa"
+               / "config_flow.py").read_text(encoding="utf-8")
+        save = src[src.index("class OptionsFlowHandler"):]
+        save = save[:save.index("data_schema = vol.Schema({")]
+        assert "OPTION_KEYS" in save, "the save path no longer preserves hidden options"
+        assert "async_create_entry(title=\"\", data=user_input)" not in save, (
+            "saving the raw input again — a hidden option would be wiped")
+
+    def test_the_managed_option_list_matches_the_form(self):
+        """OPTION_KEYS decides what gets wiped, so drift silently deletes an option."""
+        import ast
+        from pathlib import Path
+        from tests.test_config_flow_translations import (
+            _conf_constants, _schema_keys_by_step)
+        root = Path(__file__).parent.parent / "custom_components" / "mspa"
+        tree = ast.parse((root / "config_flow.py").read_text(encoding="utf-8"))
+        conf = _conf_constants()
+        declared = None
+        for node in tree.body:
+            if (isinstance(node, ast.Assign)
+                    and any(getattr(t, "id", None) == "OPTION_KEYS"
+                            for t in node.targets)):
+                declared = {
+                    e.value if isinstance(e, ast.Constant) else conf[e.id]
+                    for e in node.value.args[0].elts}
+        assert declared is not None, "OPTION_KEYS has gone"
+        form = _schema_keys_by_step()[("options", "init")]
+        assert declared == form, (
+            f"only in form: {form - declared}; only in OPTION_KEYS: {declared - form}")
 
     def test_the_session_record_carries_both_air_figures(self):
         import inspect
