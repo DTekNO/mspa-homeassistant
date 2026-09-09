@@ -22,3 +22,8 @@ mspa_rates_*
 # well as by extension: the patterns above cover .csv and .log, but a Zone.Identifier
 # stream or anything else dropped in here carries the same private data.
 historical-data/
+
+# Scratch space. Same reasoning as historical-data/: whatever lands here is working
+# material, and it tends to be exports and dashboard YAML carrying device aliases and
+# entity ids. Ignored as a directory so nothing in it needs its own pattern.
+tmp/
