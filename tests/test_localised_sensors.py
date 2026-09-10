@@ -70,57 +70,74 @@ class _ReadinessStub:
         self._eta_plan_key = None
         self._eta_closing = False
 
+    """Stands in for the sensor that now owns the ETA: Ready at time."""
+
     available = True
-    display_ready_at = MSpaReadinessSensor.display_ready_at
+    display_ready_at = MSpaReadyAtTimeSensor.display_ready_at
     # staticmethod on the real class; unwrapped by the class access above, so it
     # has to be rewrapped or `self` gets passed as the datetime.
-    _round_eta = staticmethod(MSpaReadinessSensor._round_eta)
-    _slew_eta = MSpaReadinessSensor._slew_eta
-    _replan_key = MSpaReadinessSensor._replan_key
-    native_value = MSpaReadinessSensor.native_value
+    _round_eta = staticmethod(MSpaReadyAtTimeSensor._round_eta)
+    _slew_eta = MSpaReadyAtTimeSensor._slew_eta
+    _replan_key = MSpaReadyAtTimeSensor._replan_key
+    native_value = MSpaReadyAtTimeSensor.native_value
+    extra_state_attributes = MSpaReadyAtTimeSensor.extra_state_attributes
 
 
 class _ScheduleStub(_HeatScheduleStub):
-    display_schedule = MSpaHeatScheduleSensor.display_schedule
-    native_value = MSpaHeatScheduleSensor.native_value
+    """Stands in for the sensor that now owns the plan: Heat schedule start."""
 
 
+
+# The stub is the owner, so these read it directly.
 def _ready_time(readiness):
-    return MSpaReadyAtTimeSensor.native_value.fget(
-        type("S", (), {"_readiness": readiness})())
+    return readiness.display_ready_at()[1]
 
 
 def _ready_status(readiness):
-    stub = type("S", (), {"_readiness": readiness,
+    stub = type("S", (), {"_time": readiness,
                           "_KINDS": MSpaReadyStatusSensor._KINDS})()
     return MSpaReadyStatusSensor.native_value.fget(stub)
 
 
 def _ready_compact(readiness):
-    stub = type("S", (), {"_readiness": readiness,
-                          "native_value": _ready_time(readiness)})()
-    return MSpaReadyAtTimeSensor.extra_state_attributes.fget(stub)["compact"]
+    return readiness.extra_state_attributes["compact"]
 
 
+# The stub is the owner now, so these are plain attribute reads rather than the
+# hand-built delegate objects they needed while the deprecated sensor held the logic.
 def _sched_start(schedule):
-    return MSpaHeatScheduleStartSensor.native_value.fget(
-        type("S", (), {"_schedule": schedule})())
+    return schedule.native_value
 
 
 def _sched_attrs(schedule):
-    stub = type("S", (), {"_schedule": schedule,
-                          "native_value": _sched_start(schedule)})()
-    return MSpaHeatScheduleStartSensor.extra_state_attributes.fget(stub)
+    return schedule.extra_state_attributes
 
 
 def _sched_status(schedule):
     return MSpaHeatScheduleStatusSensor.native_value.fget(
-        type("S", (), {"_schedule": schedule})())
+        type("S", (), {"_start": schedule})())
+
+
+def _sched_mirror_attrs(schedule):
+    return MSpaHeatScheduleSensor.extra_state_attributes.fget(
+        type("M", (), {"_start": schedule,
+                       "coordinator": schedule.coordinator})())
+
+
+def _sched_text(schedule):
+    """The deprecated mirror's state — the text a dashboard still shows."""
+    return MSpaHeatScheduleSensor.native_value.fget(
+        type("M", (), {"_start": schedule,
+                       "coordinator": schedule.coordinator})())
 
 
 def _state_of(readiness):
-    """The deprecated text sensor's state, with its slew side effects applied."""
-    return MSpaReadinessSensor.native_value.fget(readiness)
+    """The deprecated mirror's state. The owner's native_value drives the slew, so
+    that is called first, exactly as entity ordering guarantees at runtime."""
+    readiness.native_value
+    return MSpaReadinessSensor.native_value.fget(
+        type("M", (), {"_time": readiness,
+                       "coordinator": readiness.coordinator})())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -264,7 +281,7 @@ class TestReadyAtAgreement:
         _state_of(r)                                  # establishes the slew position
         held = r._eta_display
         r._eta_display = held - timedelta(hours=3)    # displayed value moves
-        assert _ready_time(r) == MSpaReadinessSensor._round_eta(r._eta_display)
+        assert _ready_time(r) == MSpaReadyAtTimeSensor._round_eta(r._eta_display)
 
     def test_ready_has_a_status_but_no_timestamp(self):
         c = MockCoordinator(water_temp=40.0, target_temp=40.0,
@@ -314,7 +331,7 @@ class TestHeatScheduleAgreement:
         # No timezone conversion here, unlike the Ready at case: the schedule text
         # goes through dt_util.as_local, which the fixture patches to identity.
         s = self._waiting()
-        state = s.native_value
+        state = _sched_text(s)
         m = re.match(r"^Start at (\d{2}:\d{2})", state)
         assert m, state
         start = _sched_start(s)
@@ -349,7 +366,7 @@ class TestHeatScheduleAgreement:
             scheduled_ready_at=_NOW_UTC + timedelta(minutes=20),
             schedule_target_temp=39.0, water_temp=37.5, heat_rate=2.0),
             MockConfigEntry())
-        assert s.native_value == "Start now"
+        assert _sched_text(s) == "Start now"
         assert _sched_status(s) == "start_now"
         assert _sched_start(s) is not None
 
@@ -367,7 +384,7 @@ class TestTheOriginalsAreUntouched:
             scheduled_ready_at=_NOW_UTC + timedelta(hours=12),
             schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0),
             MockConfigEntry())
-        assert re.match(r"^Start at \d{2}:\d{2}( \+\d+d)?$", s.native_value)
+        assert re.match(r"^Start at \d{2}:\d{2}( \+\d+d)?$", _sched_text(s))
 
 
 class TestTheCompactAttribute:
@@ -411,11 +428,8 @@ class TestTheCompactAttribute:
             scheduled_ready_at=_NOW_UTC + timedelta(hours=12),
             schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0),
             MockConfigEntry())
-        state = s.native_value
-        stub = type("S", (), {"_schedule": s,
-                              "native_value": _sched_start(s)})()
-        compact = MSpaHeatScheduleStartSensor.extra_state_attributes.fget(
-            stub)["compact"]
+        state = _sched_text(s)
+        compact = _sched_attrs(s)["compact"]
         assert compact and not compact.startswith("Start at")
         assert state == f"Start at {compact}"
 
@@ -439,20 +453,19 @@ class TestTheStartSensorCarriesTheScheduleFigures:
             schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0),
             MockConfigEntry())
 
-    def test_every_deprecated_key_survives(self):
+    def test_the_mirror_publishes_exactly_what_the_owner_does(self):
+        """Parity is structural now — the mirror reads the owner — so this guards
+        the inversion rather than two hand-maintained dicts: if anyone gives the
+        deprecated sensor an opinion of its own again, this fails."""
         s = self._waiting()
-        old = MSpaHeatScheduleSensor.extra_state_attributes.fget(s)
-        new = _sched_attrs(s)
-        assert old, "the deprecated sensor published nothing to compare against"
-        missing = {k: v for k, v in old.items() if k not in new}
-        assert not missing, f"lost on the replacement: {missing}"
-        for k, v in old.items():
-            assert new[k] == v, f"{k}: {new[k]!r} != {v!r}"
+        owner = _sched_attrs(s)
+        mirror = _sched_mirror_attrs(s)
+        assert owner, "the owner published nothing to compare against"
+        assert mirror == {k: v for k, v in owner.items() if k != "compact"}
 
-    def test_and_adds_only_compact(self):
+    def test_the_owner_adds_only_compact(self):
         s = self._waiting()
-        old = set(MSpaHeatScheduleSensor.extra_state_attributes.fget(s))
-        assert set(_sched_attrs(s)) - old == {"compact"}
+        assert set(_sched_attrs(s)) - set(_sched_mirror_attrs(s)) == {"compact"}
 
     def test_start_at_is_the_live_plan_not_the_held_state(self):
         """The distinction the whole pair rests on.

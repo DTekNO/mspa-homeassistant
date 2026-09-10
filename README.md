@@ -227,10 +227,11 @@ The old sensors matched on the displayed English (`Ready`, `Start now`, `Not sch
 The new ones never will, because that text is translated per viewer — which is the whole
 reason they exist. A condition written against the display text silently never fires.
 
-**Not yet migrated.** `Ready at` publishes two dozen attributes and `Ready at time`
-carries only `compact`, so anything reading `minutes_remaining`, `ready_at_kind`,
-`direction` or the rate diagnostics must stay on `Ready at` for now. The schedule pair
-is complete; the readiness pair is not, and `Ready at` will not be removed before it is.
+**Both pairs are complete.** Every attribute the old sensors publish is published by
+the replacements, under the same names with the same values — `ready_at`,
+`ready_at_kind`, `minutes_remaining`, `direction` and the rate diagnostics included.
+The replacements own the implementation and the deprecated sensors read *them*, so the
+two cannot drift apart while both exist.
 
 **Somewhere the long form will not fit?** Both timestamp sensors also carry a `compact`
 attribute holding the short form — `14:00`, or `14:00 +3d` when it lands on a later day.

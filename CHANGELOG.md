@@ -28,8 +28,11 @@ which changes nothing for anyone who had it on.
   one-word change, since the names and values are identical. The one thing that does not
   carry over is matching on the displayed text: a status sensor's state is an
   untranslated token (`start_now`, not `Start now`), because the words are translated per
-  viewer. Note also that the readiness pair is not finished — anything reading
-  `minutes_remaining` or the rate diagnostics should stay on **Ready at** for now.
+  viewer.
+
+  **Ready at time** now publishes everything **Ready at** does — `ready_at`,
+  `ready_at_kind`, `minutes_remaining`, `direction`, the rate diagnostics, all of it —
+  so both pairs are complete replacements rather than partial ones.
 
   The split exists because a single sensor cannot do both jobs. Home Assistant's time
   format is a per-user frontend preference with no server-side equivalent, while an

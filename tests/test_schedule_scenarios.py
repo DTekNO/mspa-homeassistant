@@ -16,7 +16,9 @@ from custom_components.mspa.sensor import (
     _anchor_eta_utc,
     _segmented_heating_minutes,
     MSpaReadinessSensor,
+    MSpaReadyAtTimeSensor,
     MSpaHeatScheduleSensor,
+    MSpaHeatScheduleStartSensor,
 )
 from custom_components.mspa.const import (
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
@@ -149,11 +151,18 @@ class _HeatScheduleStub:
         self._start_shown = None
         self._start_key = None
 
-    _schedule_data = MSpaHeatScheduleSensor._schedule_data
-    extra_state_attributes = MSpaHeatScheduleSensor.extra_state_attributes
-    schedule_attributes = MSpaHeatScheduleSensor.schedule_attributes
-    _slew_start = MSpaHeatScheduleSensor._slew_start
-    _plan_key = MSpaHeatScheduleSensor._plan_key
+    # The implementation lives on the replacement now; the deprecated sensor is a
+    # mirror. Bound from the owner so these stubs exercise the real code path.
+    _schedule_data = MSpaHeatScheduleStartSensor._schedule_data
+    schedule_attributes = MSpaHeatScheduleStartSensor.schedule_attributes
+    # Bound as the real properties, not as the methods behind them, so the mirror
+    # sees what it would see on the live sensor.
+    extra_state_attributes = MSpaHeatScheduleStartSensor.extra_state_attributes
+    native_value = MSpaHeatScheduleStartSensor.native_value
+    _slew_start = MSpaHeatScheduleStartSensor._slew_start
+    _plan_key = MSpaHeatScheduleStartSensor._plan_key
+    display_schedule = MSpaHeatScheduleStartSensor.display_schedule
+    display_plan = MSpaHeatScheduleStartSensor.display_plan
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -162,14 +171,24 @@ def _ready_at(c) -> "str | None":
     return _compute_ready_at_value(c)
 
 
+def _mirror(stub, c):
+    """The deprecated sensor, wrapped round the stub that now owns the logic.
+
+    These scenarios test the text a dashboard sees, so they go through the mirror
+    rather than the tokens behind it — the mirror holds a reference to the sensor
+    that owns the plan, which the stub stands in for.
+    """
+    return type("M", (), {"_start": stub, "coordinator": c})()
+
+
 def _heat_schedule(c, entry=None) -> str:
     stub = _HeatScheduleStub(c, entry or MockConfigEntry())
-    return MSpaHeatScheduleSensor.native_value.fget(stub)
+    return MSpaHeatScheduleSensor.native_value.fget(_mirror(stub, c))
 
 
 def _heat_schedule_attrs(c, entry=None) -> dict:
     stub = _HeatScheduleStub(c, entry or MockConfigEntry())
-    return MSpaHeatScheduleSensor.extra_state_attributes.fget(stub)
+    return MSpaHeatScheduleSensor.extra_state_attributes.fget(_mirror(stub, c))
 
 
 def _apply_temp_update(c, new_temp: float, new_target: float) -> None:
@@ -477,8 +496,10 @@ class TestHeatScheduleDisplay:
             schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0,
         )
         stub = _HeatScheduleStub(c, MockConfigEntry())
-        # native_value calls _log_schedule_change on every state transition.
-        assert MSpaHeatScheduleSensor.native_value.fget(stub).startswith("Scheduled")
+        # native_value calls _log_schedule_change on every state transition, and it
+        # is the mirror that logs, so go through it.
+        assert MSpaHeatScheduleSensor.native_value.fget(
+            _mirror(stub, c)).startswith("Scheduled")
 
     def test_at_target_beats_lookahead_so_sensors_agree(self):
         """Readiness is evaluated before the horizon check, so a far-off schedule
@@ -495,8 +516,20 @@ class TestHeatScheduleDisplay:
 # READY AT ETA SLEW — corrections land as bounded ramps, not jumps
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _readiness_sensor(coordinator) -> MSpaReadinessSensor:
-    e = object.__new__(MSpaReadinessSensor)
+def _readiness_text(owner):
+    """The deprecated mirror's state, driven the way entity ordering drives it."""
+    owner.native_value
+    return MSpaReadinessSensor.native_value.fget(
+        type("M", (), {"_time": owner, "coordinator": owner.coordinator})())
+
+
+def _readiness_sensor(coordinator) -> "MSpaReadyAtTimeSensor":
+    """The sensor that owns the ETA and its slew — Ready at time.
+
+    Was MSpaReadinessSensor until the implementation moved; that class is now a
+    mirror holding no state of its own, so building one here would test nothing.
+    """
+    e = object.__new__(MSpaReadyAtTimeSensor)
     e.coordinator = coordinator
     e._eta_display = None
     e._eta_wall = None
@@ -604,7 +637,7 @@ class TestEtaSlew:
         e._eta_wall = self._BASE
         e._eta_plan_key = ("stale",)
         e._eta_closing = True
-        val = MSpaReadinessSensor.native_value.fget(e)
+        val = _readiness_text(e)
         assert val == "Ready"
         assert e._eta_display is None
         assert e._eta_wall is None
@@ -813,7 +846,7 @@ class TestReadyAtAttributeMatchesState:
 
     def _attrs(self, c):
         e = _readiness_sensor(c)
-        return MSpaReadinessSensor.extra_state_attributes.fget(e)
+        return MSpaReadyAtTimeSensor.extra_state_attributes.fget(e)
 
     def test_schedule_pending_while_cooling_exposes_the_scheduled_time(self):
         """The real 6 Aug case: water 23, thermostat 20 (cooling), schedule 39.5."""
@@ -1489,7 +1522,7 @@ class TestProgressDeviation:
 
     def test_exposed_on_the_ready_at_sensor(self):
         c = self._coord(water=35.0, elapsed_min=150)
-        attrs = MSpaReadinessSensor.extra_state_attributes.fget(
+        attrs = MSpaReadyAtTimeSensor.extra_state_attributes.fget(
             _readiness_sensor(c))
         assert attrs["progress_deviation"] == pytest.approx(30.0, abs=0.5)
         assert attrs["plan_settled"] is True
@@ -1506,7 +1539,7 @@ class TestIntegrationVersionAttribute:
 
     def _attrs(self, c):
         e = _readiness_sensor(c)
-        return MSpaReadinessSensor.extra_state_attributes.fget(e)
+        return MSpaReadyAtTimeSensor.extra_state_attributes.fget(e)
 
     def test_the_running_build_is_exposed(self):
         c = MockCoordinator(water_temp=29.5, target_temp=39.5)
