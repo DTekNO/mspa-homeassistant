@@ -151,6 +151,7 @@ class _HeatScheduleStub:
 
     _schedule_data = MSpaHeatScheduleSensor._schedule_data
     extra_state_attributes = MSpaHeatScheduleSensor.extra_state_attributes
+    schedule_attributes = MSpaHeatScheduleSensor.schedule_attributes
     _slew_start = MSpaHeatScheduleSensor._slew_start
     _plan_key = MSpaHeatScheduleSensor._plan_key
 

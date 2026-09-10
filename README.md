@@ -455,7 +455,8 @@ the schedule you set (`sched`) or the integration's live prediction (`eta`).
 
 The **Heat Schedule** sensor exposes the same shape: `target_time` and `start_at`
 are both ISO 8601 UTC, so the computed start of a session is directly usable as a
-trigger.
+trigger. **Heat schedule start** publishes the identical set, so anything reading
+these can move to it now and be unaffected when the deprecated sensor is removed.
 
 ### Availability
 
@@ -757,6 +758,8 @@ So the **state** does not follow every recomputation. A change of reading is sho
 
 The `start_at` **attribute is always the live plan**, so automations act on the real time. It can therefore differ from the displayed `Start at HH:MM` while the start is still hours away — that is deliberate, not a bug.
 
+The same attributes are published by **Heat schedule start**, whose *state* is the held time and whose `start_at` is the live one. Because the two converge within 45 minutes of starting, an automation with a lead time shorter than that can trigger on either.
+
 ### Attributes
 
 | Attribute | Description |
@@ -764,6 +767,11 @@ The `start_at` **attribute is always the live plan**, so automations act on the 
 | `target_time` | ISO 8601 timestamp of the planned ready time |
 | `start_at` | ISO 8601 timestamp when heating should begin — always live, so it can differ from the displayed state while the start is far off |
 | `target_temperature` | The configured target temperature (°C) |
+| `circulating` | Whether the pump was running when the plan was made — see below |
+| `temperature_basis` | What the water reading describes: `tub water` or the pump housing |
+
+All of these also appear on **Heat schedule start**, which adds `compact` (the short
+`19:00 +1d` form, for places a rendered timestamp will not fit).
 
 ### No automation required
 

@@ -1485,6 +1485,23 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 
     @property
     def extra_state_attributes(self):
+        return self.schedule_attributes()
+
+    def schedule_attributes(self):
+        """The schedule's own figures, as a fresh dict.
+
+        Factored out because the Heat schedule start sensor publishes the same set:
+        this sensor is deprecated, and it cannot be removed while it is the only
+        entity carrying the live plan and the target.  Keeping one implementation
+        means the two cannot drift apart in the meantime, and removal is then a
+        matter of moving this method rather than reimplementing it.
+
+        `start_at` is the *live* plan, deliberately — an automation acting on it
+        needs the real time rather than a stable one.  The state of both sensors is
+        the held value from _slew_start, so the two differ by up to
+        _START_DRIFT_EARLIER_MIN while the start is still hours away, and converge
+        inside _START_TRACK_WITHIN_MIN of it.
+        """
         result = self._schedule_data()
         if not isinstance(result, tuple):
             return {}
@@ -1630,11 +1647,14 @@ class MSpaReadyStatusSensor(MSpaSensorEntity):
 class MSpaHeatScheduleStartSensor(MSpaSensorEntity):
     """The planned conditioning start as a real timestamp.
 
-    The held start, matching what the Heat Schedule text sensor displays, rather
-    than the live plan — the `start_at` attribute over there remains the live one
-    for automations to act on, and the two can differ while the start is still
-    hours away.  None whenever there is no start to show: no schedule, already
-    heating, or a target beyond the lookahead horizon.
+    The state is the held start, matching what the Heat Schedule text sensor
+    displays; the `start_at` attribute here is the live plan, for automations to act
+    on.  The two differ by up to _START_DRIFT_EARLIER_MIN while the start is still
+    hours away and are identical for the last _START_TRACK_WITHIN_MIN before it, so
+    anything triggering within three quarters of an hour can use either.
+
+    None whenever there is no start to show: no schedule, already heating, or a
+    target beyond the lookahead horizon.
     """
 
     name = "Heat schedule start"
@@ -1654,9 +1674,18 @@ class MSpaHeatScheduleStartSensor(MSpaSensorEntity):
 
     @property
     def extra_state_attributes(self):
+        # Everything the deprecated Heat Schedule sensor publishes, so that nothing
+        # has to be rewired when it goes: same keys, same meaning, same values.
+        #
+        # Note `start_at` is the live plan while the state is the held one — see
+        # schedule_attributes.  Two timestamps on one entity reads oddly until you
+        # know which is which: the state is what to look at, `start_at` is what to
+        # act on, and they are identical for the last _START_TRACK_WITHIN_MIN.
+        out = self._schedule.schedule_attributes()
         # The time only, with no "Start at" — the label belongs to whatever is
         # displaying it, and a caller that wants a prefix can supply its own.
-        return {"compact": _fmt_compact(self.native_value)}
+        out["compact"] = _fmt_compact(self.native_value)
+        return out
 
 
 class MSpaHeatScheduleStatusSensor(MSpaSensorEntity):

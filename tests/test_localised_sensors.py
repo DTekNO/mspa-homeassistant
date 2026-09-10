@@ -107,6 +107,12 @@ def _sched_start(schedule):
         type("S", (), {"_schedule": schedule})())
 
 
+def _sched_attrs(schedule):
+    stub = type("S", (), {"_schedule": schedule,
+                          "native_value": _sched_start(schedule)})()
+    return MSpaHeatScheduleStartSensor.extra_state_attributes.fget(stub)
+
+
 def _sched_status(schedule):
     return MSpaHeatScheduleStatusSensor.native_value.fget(
         type("S", (), {"_schedule": schedule})())
@@ -417,3 +423,62 @@ class TestTheCompactAttribute:
         """The state must remain a real timestamp or Home Assistant cannot localise it."""
         r = self._heating()
         assert isinstance(_ready_time(r), datetime)
+
+
+class TestTheStartSensorCarriesTheScheduleFigures:
+    """It has to, or the deprecated sensor can never be removed.
+
+    Heat Schedule was the only entity publishing the live plan and the target, so a
+    dashboard or automation reading either was pinned to it. These tests hold the
+    replacement to full parity: same keys, same values, so removal is a rename.
+    """
+
+    def _waiting(self):
+        return _ScheduleStub(MockCoordinator(
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=12),
+            schedule_target_temp=40.0, water_temp=20.0, heat_rate=2.0),
+            MockConfigEntry())
+
+    def test_every_deprecated_key_survives(self):
+        s = self._waiting()
+        old = MSpaHeatScheduleSensor.extra_state_attributes.fget(s)
+        new = _sched_attrs(s)
+        assert old, "the deprecated sensor published nothing to compare against"
+        missing = {k: v for k, v in old.items() if k not in new}
+        assert not missing, f"lost on the replacement: {missing}"
+        for k, v in old.items():
+            assert new[k] == v, f"{k}: {new[k]!r} != {v!r}"
+
+    def test_and_adds_only_compact(self):
+        s = self._waiting()
+        old = set(MSpaHeatScheduleSensor.extra_state_attributes.fget(s))
+        assert set(_sched_attrs(s)) - old == {"compact"}
+
+    def test_start_at_is_the_live_plan_not_the_held_state(self):
+        """The distinction the whole pair rests on.
+
+        The state is smoothed so a dashboard does not twitch; `start_at` is not, so
+        an automation acts on the real time. A change that let these collapse into
+        one value would pass every other test while the feature quietly stopped
+        working, so this forces them apart and checks each follows its own rule.
+        """
+        s = self._waiting()
+        s.native_value                                    # first pass adopts raw
+        raw = s._start_shown
+        # Nudge the held value by less than _START_DRIFT_EARLIER_MIN so the slew
+        # keeps hiding the difference rather than adopting it.
+        s._start_shown = raw + timedelta(minutes=5)
+        shown = _sched_start(s)
+        live = _sched_attrs(s)["start_at"]
+        assert shown == raw + timedelta(minutes=5), "the hold was not respected"
+        assert live == raw.isoformat(), "start_at followed the hold instead of the plan"
+        assert live != shown.isoformat()
+
+    def test_no_schedule_publishes_nothing_but_compact(self):
+        s = _ScheduleStub(MockCoordinator(scheduled_ready_at=None), MockConfigEntry())
+        assert _sched_attrs(s) == {"compact": None}
+
+    def test_the_target_is_readable_while_waiting(self):
+        """The dashboard label reads this; losing it silently blanks the card."""
+        s = self._waiting()
+        assert _sched_attrs(s)["target_temperature"] == 40.0

@@ -31,6 +31,14 @@ which changes nothing for anyone who had it on.
   state is a fixed word. Neither can be applied to "Start at 10:34 +1d". Handing the
   time to one sensor and the words to another lets each be done properly.
 
+  **Heat schedule start** also publishes everything the Heat Schedule sensor does —
+  `start_at`, `target_time`, `target_temperature`, `circulating`, `temperature_basis`
+  — with the same names and the same values. Without that the old sensor could never
+  actually be removed, since it was the only entity carrying the live plan and the
+  target: a dashboard or automation reading either was pinned to it. Note the state is
+  the *held* start and `start_at` is the *live* one, exactly as before; they converge
+  within three quarters of an hour of the start.
+
   Both timestamp sensors also carry a `compact` attribute — `14:00`, or `14:00 +3d` —
   for the one place the localised state will not go. A `picture-elements` overlay renders
   a timestamp as "11 September 2026 at 14:00", which is correct and runs off the side of
