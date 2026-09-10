@@ -20,7 +20,16 @@ which changes nothing for anyone who had it on.
   **Ready at time**, **Ready status**, **Heat schedule start** and **Heat schedule
   status** — show what the existing two show, but in your own time format, timezone and
   language. The originals are unchanged and keep working; they are deprecated in favour
-  of the new pair and will be removed in a future major release.
+  of the new pair and will be removed in a future major release, with notice.
+
+  There is nothing you need to do today. When you next edit a dashboard card or an
+  automation that reads one of them, it is worth pointing it at the replacement while
+  you are there — the README has a short migration section. Reading an attribute is a
+  one-word change, since the names and values are identical. The one thing that does not
+  carry over is matching on the displayed text: a status sensor's state is an
+  untranslated token (`start_now`, not `Start now`), because the words are translated per
+  viewer. Note also that the readiness pair is not finished — anything reading
+  `minutes_remaining` or the rate diagnostics should stay on **Ready at** for now.
 
   The split exists because a single sensor cannot do both jobs. Home Assistant's time
   format is a per-user frontend preference with no server-side equivalent, while an

@@ -189,8 +189,48 @@ instead, and Home Assistant knows who is looking.
 > safe to use, but new dashboards should prefer the localised pair. They will be removed
 > in a future major release, with notice.
 
-Their attributes are unaffected either way — `ready_at`, `start_at` and `target_time`
-remain ISO 8601 timestamps and remain the right thing for automations to act on.
+### Migrating
+
+Nothing is urgent — the old sensors go on working until a major release removes them,
+and you will get notice. But the replacements exist now, so a dashboard or automation
+touched for any other reason is worth pointing at the new pair while you are in there.
+
+| Instead of | Use | For |
+|---|---|---|
+| `sensor.mspa_ready_at` | `sensor.mspa_ready_at_time` | the time, in the viewer's own format |
+| | `sensor.mspa_ready_status` | the words: `ready` / `heating` / `scheduled` |
+| `sensor.mspa_heat_schedule` | `sensor.mspa_heat_schedule_start` | the start time, and every attribute below |
+| | `sensor.mspa_heat_schedule_status` | `not_scheduled` / `scheduled` / `waiting` / `start_now` / `heating` / `ready` |
+
+**Reading an attribute** — change the entity, nothing else. The names and values are
+identical:
+
+```jinja
+{{ state_attr('sensor.mspa_heat_schedule',       'start_at') }}
+{{ state_attr('sensor.mspa_heat_schedule_start', 'start_at') }}
+```
+
+**Showing the time on a dashboard** — point the card at the timestamp sensor and let
+Home Assistant format it. Where the rendered form is too long, use its `compact`
+attribute, which is the same short string the old sensor's state used.
+
+**Matching on the state** — this is the one that bites. A status sensor's state is the
+untranslated token, not the words you see:
+
+```yaml
+- condition: state
+  entity: sensor.mspa_heat_schedule_status
+  state: start_now          # not "Start now"
+```
+
+The old sensors matched on the displayed English (`Ready`, `Start now`, `Not scheduled`).
+The new ones never will, because that text is translated per viewer — which is the whole
+reason they exist. A condition written against the display text silently never fires.
+
+**Not yet migrated.** `Ready at` publishes two dozen attributes and `Ready at time`
+carries only `compact`, so anything reading `minutes_remaining`, `ready_at_kind`,
+`direction` or the rate diagnostics must stay on `Ready at` for now. The schedule pair
+is complete; the readiness pair is not, and `Ready at` will not be removed before it is.
 
 **Somewhere the long form will not fit?** Both timestamp sensors also carry a `compact`
 attribute holding the short form — `14:00`, or `14:00 +3d` when it lands on a later day.
