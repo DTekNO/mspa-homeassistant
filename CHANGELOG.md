@@ -139,6 +139,13 @@ which changes nothing for anyone who had it on.
 
 ### Fixed
 
+- **A stalled connection can no longer hang the integration.** Two calls to the MSpa
+  cloud had no time limit: the one that sends a command, and the status read every
+  update performs. If the connection was accepted but then went quiet — or never
+  answered at all, which is what a dropped link looks like from this side — the call
+  would wait indefinitely rather than failing and being retried on the next poll. Every
+  call now gives up after at most ten seconds to connect and thirty to reply.
+
 - **Fewer dropped polls on a flaky connection.** Every call to the MSpa cloud opened a
   new connection, which meant a fresh DNS lookup each time — around 2,900 a day at the
   normal polling rate, each one a chance to fail. The integration now keeps one

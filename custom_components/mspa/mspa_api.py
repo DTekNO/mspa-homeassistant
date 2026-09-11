@@ -123,6 +123,26 @@ _DEMO_STATUS = {
 }
 
 
+# (connect, read) for every cloud call.
+#
+# Both halves matter and they fail differently. Without a connect timeout a SYN that
+# is never answered — the usual shape of a satellite link that has dropped, as opposed
+# to one that refuses — blocks the executor thread indefinitely: the OS will retry for
+# minutes before giving up, and nothing above ever hears about it. Without a read
+# timeout a server that accepts the connection and then goes quiet does the same.
+#
+# Two call sites had no timeout at all until 2026-09-11: the write command, and the
+# status poll that every update runs. The poll is the worse of the two, because the
+# rapid-poll burst fires it once a second for fifteen seconds after a command, so one
+# hung call could tie up several executor threads before the burst gave up.
+#
+# 10 s to connect is generous for a reachable host and short enough that a dead link
+# is noticed within one 60 s poll interval. 30 s to read matches what the calls that
+# did have a timeout already used, and the worst case of 40 s still lands inside that
+# interval — where the old bare `timeout=30` allowed 30 to connect plus 30 to read.
+_HTTP_TIMEOUT = (10, 30)
+
+
 def _new_session() -> requests.Session:
     """One connection-pooling session per account.
 
@@ -430,7 +450,7 @@ class MSpaApiClient:
 
         try:
             response = await self.hass.async_add_executor_job(
-                functools.partial(self._session.post, token_request_url, headers=headers, json=payload, timeout=30)
+                functools.partial(self._session.post, token_request_url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
             )
             _LOGGER.debug("DIAGNOSTIC: Authentication HTTP status code: %s", response.status_code)
 
@@ -503,7 +523,8 @@ class MSpaApiClient:
         _LOGGER.debug("send_device_command: %s, url: %s", desired_dict, url)
         await self._throttle.acquire()
         response = await self.hass.async_add_executor_job(
-            functools.partial(self._session.post, url, headers=headers, json=payload)
+            functools.partial(self._session.post, url, headers=headers,
+                              json=payload, timeout=_HTTP_TIMEOUT)
         )
         response = response.json()
         if (response.get('message') != 'SUCCESS') and (not retry):
@@ -579,7 +600,8 @@ class MSpaApiClient:
         url = f"{self.base_url}/api/device/thing_shadow/"
         await self._throttle.acquire()
         response = await self.hass.async_add_executor_job(
-            functools.partial(self._session.post, url, headers=headers, json=payload)
+            functools.partial(self._session.post, url, headers=headers,
+                              json=payload, timeout=_HTTP_TIMEOUT)
         )
         response = response.json()
         if not response.get("data") and not retry:
@@ -608,7 +630,7 @@ class MSpaApiClient:
         try:
             await self._throttle.acquire()
             response = await self.hass.async_add_executor_job(
-                functools.partial(self._session.get, url, headers=headers, params=params, timeout=30)
+                functools.partial(self._session.get, url, headers=headers, params=params, timeout=_HTTP_TIMEOUT)
             )
             response_json = response.json()
             data = response_json.get("data")
@@ -631,7 +653,7 @@ class MSpaApiClient:
         try:
             await self._throttle.acquire()
             response = await self.hass.async_add_executor_job(
-                functools.partial(self._session.get, url, headers=headers, timeout=30)
+                functools.partial(self._session.get, url, headers=headers, timeout=_HTTP_TIMEOUT)
             )
             _LOGGER.debug("DIAGNOSTIC: Device list HTTP status code: %s", response.status_code)
             _LOGGER.debug("DIAGNOSTIC: Device list raw response: %s", response.text)

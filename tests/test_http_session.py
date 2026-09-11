@@ -99,6 +99,43 @@ class TestNothingBypassesIt:
         assert '"session": _new_session()' in src
         assert 'hass.data["mspa_auth"][self._creds_key]["session"]' in src
 
+    def test_no_call_site_can_block_for_ever(self):
+        """Every request must carry a timeout, connect and read.
+
+        Two had none until 2026-09-11 — the write command and the status poll every
+        update runs. A SYN that is never answered, which is what a dropped satellite
+        link looks like, would have held an executor thread for minutes with nothing
+        above it hearing a thing; the rapid-poll burst fires that same status call
+        once a second, so one hung call could tie up several threads at once.
+        """
+        tree = ast.parse(_SRC.read_text(encoding="utf-8"))
+        bad = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "partial"):
+                continue
+            target = node.args[0] if node.args else None
+            if not (isinstance(target, ast.Attribute)
+                    and target.attr in ("get", "post", "put", "delete", "request")):
+                continue
+            if "timeout" not in {kw.arg for kw in node.keywords}:
+                bad.append(node.lineno)
+        assert not bad, f"HTTP call with no timeout at line(s) {bad}"
+
+    def test_the_timeout_is_a_connect_read_pair(self):
+        """A scalar sets both halves to the same value, so a generous read budget
+        also buys a generous connect budget — the one that matters on a dead link."""
+        t = _real_module()._HTTP_TIMEOUT
+        assert isinstance(t, tuple) and len(t) == 2, f"not a (connect, read) pair: {t}"
+        connect, read = t
+        assert 0 < connect <= read
+        # Worst case must stay inside one poll interval, or a stalled call is still
+        # running when the next update starts.
+        from custom_components.mspa.const import DEFAULT_SCAN_INTERVAL
+        assert connect + read < DEFAULT_SCAN_INTERVAL, (
+            f"{connect}+{read}s can outlast the {DEFAULT_SCAN_INTERVAL}s poll interval")
+
     def test_every_call_site_uses_it(self):
         src = _SRC.read_text(encoding="utf-8")
         n = len(re.findall(r"functools\.partial\(self\._session\.(get|post)", src))
