@@ -456,6 +456,119 @@ spa has winter data, or sooner if the bucket shape keeps drifting flat — live 
 read 1.03 / 0.99 / 1.01 against a statistics-derived 1.263 / 1.086 / 0.841, and a flat
 shape is exactly what a straight line would fix.
 
+## The Session Scalar Freezes, and Silences the Weather Model
+
+**Status: measured, not yet designed.** Found on the run of 11.09.2026, by the owner
+noticing the sensor disagreed with mental arithmetic.
+
+### What happens
+
+Two behaviours compound. Neither is a coding slip — both are the documented design
+(see *Precedence* in the README) — but together they pin a long run to the conditions
+of its first hour.
+
+**The scalar stops updating once the water leaves its source bucket.**
+
+```python
+if self._session_scalar_bucket is None and _bp is not None:
+    self._session_scalar_bucket = _bi        # the first bucket to get data, forever
+if _bi == self._session_scalar_bucket and _bp is not None:
+    self._session_scalar = 0.4 * ratio + 0.6 * self._session_scalar
+```
+
+The source bucket is set once per session and never revisited. A run starting from
+cold takes its scalar from bucket 0 and then carries that number through bands 1 and 2
+unchanged, however long the run lasts and however much the weather moves.
+
+**A non-unity scalar suppresses the ambient correction entirely.**
+
+```python
+if self.session_scalar != 1.0:
+    return rate * self.session_scalar     # returns here
+factor = learned_ambient_factor(...)      # unreachable
+```
+
+Not blended, not preferred — unreachable. The `ambient_factor` attribute goes on being
+computed and published while nothing consumes it, which is why the dashboard can show a
+correction that is not being applied.
+
+**And the source band is the worst possible one to measure in.**
+`AMBIENT_SENSITIVITY = (0.0, 0.02, 0.06)`. Bucket 0 is the band the model *defines* as
+insensitive to outdoor temperature. So the scalar is measured where air is held not to
+matter, frozen, and then applied to the band where it matters three times more than
+anywhere else — while displacing the correction built for exactly that band.
+
+### Evidence
+
+11.09.2026, a scheduled overnight run, 18.5 → 39.0 °C, cloudy throughout, so no solar
+term to argue about. The air followed an ordinary diurnal curve that the forecast had:
+minimum 12.7 °C at 05:41, rising steadily to 15.6 °C by 11:50 UTC.
+
+The scalar was fixed at **0.857** from bucket 0 and last moved at 03:47 UTC, when the
+water passed 30 °C — ten hours before the figures below.
+
+| | rate °C/h | ETA |
+|---|---|---|
+| what the model used (hot bucket × frozen scalar) | 0.762 | 16:18 |
+| had the scalar tracked this session's mid band | 0.829 | 16:05 |
+| had the ambient factor also applied (1.13) | 0.861 | 16:00 |
+| **observed, last four crossings** | **0.934** | **15:49** |
+
+The session's own mid-band data implies a scalar of **0.933** (observed 0.934 against a
+1.001 bucket) — 8.9% above the frozen 0.857, with no mechanism to notice.
+
+Two further points make this a clean case rather than a noisy one:
+
+- **The realised rate did not decline across the run**, holding near 0.90–0.93 from
+  29 °C to 37 °C, where Newton's law says it should fall steadily. The 2.9 °C of diurnal
+  warming offset the rising water almost exactly. That offset is the thing the frozen
+  scalar cannot see.
+- **The physical model, which does use the forecast, was closer.** Newton reported
+  `ambient_source: forecast_window` and 16:05 against the bucket model's 16:25. Same
+  weather data, available to both; one of them spent it.
+
+### Why it is built this way, and where that reasoning breaks
+
+The intent is sound and worth keeping: *a real observation of today beats a model of
+today.* The scalar exists to catch what the weather model cannot see — a cover left
+off, a low water level, an unusually cold fill.
+
+It breaks on the word *today*. A measurement taken ten hours ago in the dark is not an
+observation of current conditions; it is a stale one competing with a live forecast and
+winning on a rule that assumed it would be fresh. The rule was written for a three-hour
+top-up, where the first bucket really is representative of the whole run, and it is
+wrong for an overnight climb from cold.
+
+### Options
+
+Not yet chosen; they are not mutually exclusive.
+
+- **Keep updating the scalar in whichever band the water is in**, comparing against that
+  band's own base rate. Small change, and it would have carried 0.857 → ~0.93 on this
+  run. It does mix two things into one number, though — genuine unmodelled conditions
+  and the band-to-band error of the buckets themselves.
+- **Combine rather than short-circuit**: apply the scalar *and* the ambient factor, the
+  scalar carrying what the weather model cannot see and the factor carrying what it can.
+  This is the version that matches the stated intent, and it makes the published
+  `ambient_factor` mean something again.
+- **Decay the scalar toward 1.0 with age**, so a stale measurement yields to the model
+  instead of outranking it indefinitely.
+- **Let the frozen plan re-price on the forecast.** A scheduled run holds its opening
+  plan by design, to stop the ETA chasing every sample. That is right for noise and
+  wrong for a forecast that was known at the outset; re-pricing on the *forecast* rather
+  than on the instantaneous reading would keep the stability and lose the staleness.
+
+### Still owed
+
+- Whether any of this survives adopting the physical model. If air temperature becomes a
+  term in the equation rather than a correction bolted on outside, the scalar's job
+  shrinks to genuinely unmodelled conditions and the suppression question disappears
+  with the thing being suppressed. See *Alternative: a physical heating model*.
+- A second long run from cold to confirm the size of the effect. One run establishes the
+  mechanism; it does not fix the magnitude.
+
+---
+
 ## Learned Weather Factor
 
 > **Read *Alternative: a physical heating model* first.** On 639 hours of statistics,
@@ -469,6 +582,10 @@ shape is exactly what a straight line would fix.
 ### Motivation
 
 The prediction model currently corrects for outdoor conditions in two places, and neither of them actually *learns* the relationship.
+
+> See also *[The Session Scalar Freezes, and Silences the Weather
+> Model](#the-session-scalar-freezes-and-silences-the-weather-model)*. Learning better
+> sensitivities does nothing while a frozen scalar stops them being consulted at all.
 
 **`ambient_rate_factor` uses hardcoded sensitivities.** `AMBIENT_SENSITIVITY = (0.0, 0.02, 0.06)` — a fraction of the bucket's rate lost per °C below the learned baseline — was derived from physical reasoning about the water-to-air temperature gap, not measured. No installation has ever confirmed those numbers. A well-insulated spa with a rigid cover might sit at half those values; an uncovered one in an exposed garden could be double.
 
