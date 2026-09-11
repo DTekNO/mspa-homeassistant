@@ -456,116 +456,158 @@ spa has winter data, or sooner if the bucket shape keeps drifting flat — live 
 read 1.03 / 0.99 / 1.01 against a statistics-derived 1.263 / 1.086 / 0.841, and a flat
 shape is exactly what a straight line would fix.
 
-## The Session Scalar Freezes, and Silences the Weather Model
+## Why the Opening Plan Was Two Hours Fast — run of 11.09.2026
 
-**Status: measured, not yet designed.** Found on the run of 11.09.2026, by the owner
-noticing the sensor disagreed with mental arithmetic.
+**Status: measured, nothing changed.** Found because the owner's mental arithmetic
+disagreed with the sensor. Three causes compound; the first is the one that matters and
+was not the one first suspected.
 
-### What happens
+A scheduled overnight run, 18.5 → 39.0 °C against a 14:00 target, cloudy throughout —
+so no solar term to argue about. The air followed an ordinary diurnal curve that the
+forecast had: 12.7 °C at 05:41, rising to 15.6 °C by 11:50 UTC.
 
-Two behaviours compound. Neither is a coding slip — both are the documented design
-(see *Precedence* in the README) — but together they pin a long run to the conditions
-of its first hour.
+### What happened
 
-**The scalar stops updating once the water leaves its source bucket.**
+| | Ready at said | run length | vs target |
+|---|---|---|---|
+| 18:50 local, heating fires | 13:35 | 18.75 h | −25 min |
+| 05:47 local, water crosses 30 °C | **16:45** | 21.92 h | **+165 min** |
+| 13:48 local | 16:25 | 21.58 h | +145 min |
 
-```python
-if self._session_scalar_bucket is None and _bp is not None:
-    self._session_scalar_bucket = _bi        # the first bucket to get data, forever
-if _bi == self._session_scalar_bucket and _bp is not None:
-    self._session_scalar = 0.4 * ratio + 0.6 * self._session_scalar
+Eleven hours of confident silence, then a single 190-minute correction — by which point
+the run was long committed and the target unreachable. The opening plan was ~2 h fast;
+the revision then overcorrected to ~1 h slow.
+
+### Cause 1 — the spa measured the right answer and was outvoted 87/13
+
+This is the headline, and it is not the mechanism originally suspected.
+
+`AMBIENT_SENSITIVITY = (0.0, 0.02, 0.06)` declares the cold band **insensitive to
+outdoor temperature**. The cold band occupied eleven of this run's nineteen hours.
+
+Meanwhile the Ambient learning sensor already held a fit for that band, from this spa:
+
+```
+fit_cold = {n: 3, slope_per_deg: 0.02747, rate_at_baseline: 1.055, ambient_mean: 13.7}
 ```
 
-The source bucket is set once per session and never revisited. A run starting from
-cold takes its scalar from bucket 0 and then carries that number through bands 1 and 2
-unchanged, however long the run lasts and however much the weather moves.
+At the overnight 12.8 °C that fit predicts **1.030 °C/h**. The band delivered **1.024** —
+right to within 0.6%. It was ignored, because `LEARNED_SHRINK_N = 20` gives a fit with
+n=3 a weight of 3/(3+20) = 13%:
 
-**A non-unity scalar suppresses the ambient correction entirely.**
+| | °C/h |
+|---|---|
+| learned fit (13% of the vote) | 1.030 |
+| seed, sensitivity 0.0 (87% of the vote) | 1.142 |
+| **blended, actually used** | **1.140** |
+| **observed** | **1.024** |
+
+That is ~1.1 h of the ~2 h opening error, in one band, with the correct figure sitting
+in the integration's own state the whole time.
+
+The shrinkage is the deeper problem. At roughly one traverse per session per band, n=20
+is about five months of daily use before a spa's own measurements carry equal weight
+with a number nobody has ever validated. `LEARNED_SHRINK_N` was chosen for stability
+against noise; on this evidence it is also a five-month embargo on learning.
+
+### Cause 2 — the session scalar freezes, then silences the weather model
+
+Two documented behaviours (see *Precedence* in the README) that compound.
+
+**The scalar stops updating once the water leaves its source bucket.** The source is set
+once per session and never revisited, so a run from cold takes its scalar from bucket 0
+and carries it through bands 1 and 2 unchanged. On this run it was pinned at **0.857**
+from 03:47 UTC — ten hours before it was last consulted — while the session's own
+mid-band data implied **0.933**.
+
+**A non-unity scalar makes the ambient branch unreachable**, not merely outranked:
 
 ```python
 if self.session_scalar != 1.0:
     return rate * self.session_scalar     # returns here
-factor = learned_ambient_factor(...)      # unreachable
+factor = learned_ambient_factor(...)      # never evaluated
 ```
 
-Not blended, not preferred — unreachable. The `ambient_factor` attribute goes on being
-computed and published while nothing consumes it, which is why the dashboard can show a
-correction that is not being applied.
+So `ambient_factor` goes on being computed and published while nothing consumes it —
+which is why the dashboard can show a 1.13 correction that is not being applied.
 
-**And the source band is the worst possible one to measure in.**
-`AMBIENT_SENSITIVITY = (0.0, 0.02, 0.06)`. Bucket 0 is the band the model *defines* as
-insensitive to outdoor temperature. So the scalar is measured where air is held not to
-matter, frozen, and then applied to the band where it matters three times more than
-anywhere else — while displacing the correction built for exactly that band.
+And the source band is the worst available: bucket 0 is the band the model *defines* as
+insensitive to air, so the scalar is measured where weather is held not to matter, then
+applied to band 2 where it matters three times more than anywhere else.
 
-### Evidence
+The intent — *a real observation of today beats a model of today* — is worth keeping. It
+breaks on the word *today*: a ten-hour-old measurement taken in the dark is a stale
+observation outranking a live forecast, on a rule written for a short top-up where the
+first bucket really is representative.
 
-11.09.2026, a scheduled overnight run, 18.5 → 39.0 °C, cloudy throughout, so no solar
-term to argue about. The air followed an ordinary diurnal curve that the forecast had:
-minimum 12.7 °C at 05:41, rising steadily to 15.6 °C by 11:50 UTC.
+### Cause 3 — the first correction lands after the point of no return
 
-The scalar was fixed at **0.857** from bucket 0 and last moved at 03:47 UTC, when the
-water passed 30 °C — ten hours before the figures below.
+`uses_frozen_plan` holds the opening plan and corrects it "at the few points where a
+complete traverse has been measured" — that is, at band edges. On a cold start the first
+edge is 30 °C, which took eleven hours.
 
-| | rate °C/h | ETA |
-|---|---|---|
-| what the model used (hot bucket × frozen scalar) | 0.762 | 16:18 |
-| had the scalar tracked this session's mid band | 0.829 | 16:05 |
-| had the ambient factor also applied (1.13) | 0.861 | 16:00 |
-| **observed, last four crossings** | **0.934** | **15:49** |
+The scheduler and Ready at share `heating_minutes`, so at the instant of firing they
+agree. What diverges is that one of them gets corrected later and the other has already
+spent its decision. A revision that arrives with no slack left is not a revision; it is
+a notification that the schedule will miss, issued two hours before the user notices.
 
-The session's own mid-band data implies a scalar of **0.933** (observed 0.934 against a
-1.001 bucket) — 8.9% above the frozen 0.857, with no mechanism to notice.
+Band edges are the wrong trigger for a cold start. A 0.5 °C crossing twenty minutes in
+already says something about tonight.
 
-Two further points make this a clean case rather than a noisy one:
+### Two more defects visible in the same state dump
 
-- **The realised rate did not decline across the run**, holding near 0.90–0.93 from
-  29 °C to 37 °C, where Newton's law says it should fall steadily. The 2.9 °C of diurnal
-  warming offset the rising water almost exactly. That offset is the thing the frozen
-  scalar cannot see.
-- **The physical model, which does use the forecast, was closer.** Newton reported
-  `ambient_source: forecast_window` and 16:05 against the bucket model's 16:25. Same
-  weather data, available to both; one of them spent it.
+- **A learned fit can come out with the wrong sign and is used anyway.**
+  `fit_mid.slope_per_deg = -0.0236` — warmer air makes the spa heat *slower*, from n=3.
+  The bucket shape has a `monotonic` guard; the ambient fits have no sign check, so a
+  physically impossible fit is blended in at 13% rather than rejected.
+- **The learned weather factor has so far changed nothing measurable.**
+  `mean_abs_error_seed_only_min` and `mean_abs_error_learned_min` are both 41.9 — exactly
+  what being outvoted 87/13 predicts.
 
-### Why it is built this way, and where that reasoning breaks
+### What the scoreboard already says
 
-The intent is sound and worth keeping: *a real observation of today beats a model of
-today.* The scalar exists to catch what the weather model cannot see — a cover left
-off, a low water level, an unusually cold fill.
+```
+mean_abs_error_newton_min                      19.9
+mean_abs_error_shipping_min_same_sessions      48.8
+```
 
-It breaks on the word *today*. A measurement taken ten hours ago in the dark is not an
-observation of current conditions; it is a stale one competing with a live forecast and
-winning on a rule that assumed it would be fresh. The rule was written for a three-hour
-top-up, where the first bucket really is representative of the whole run, and it is
-wrong for an overnight climb from cold.
+Over the same sessions the physical model is **2.5× better**, while still `seeded: True`
+on n=3 — i.e. it has never had real data and is already winning. On this run it also
+read `ambient_source: forecast_window` and landed twenty minutes closer than the bucket
+model on weather data both models could see.
 
-### Options
+Two sessions is not a verdict. It is enough to say the bucket model's corrections should
+not be patched one at a time while the thing they exist to approximate is outperforming
+them untrained.
 
-Not yet chosen; they are not mutually exclusive.
+### Before changing anything
 
-- **Keep updating the scalar in whichever band the water is in**, comparing against that
-  band's own base rate. Small change, and it would have carried 0.857 → ~0.93 on this
-  run. It does mix two things into one number, though — genuine unmodelled conditions
-  and the band-to-band error of the buckets themselves.
-- **Combine rather than short-circuit**: apply the scalar *and* the ambient factor, the
-  scalar carrying what the weather model cannot see and the factor carrying what it can.
-  This is the version that matches the stated intent, and it makes the published
-  `ambient_factor` mean something again.
-- **Decay the scalar toward 1.0 with age**, so a stale measurement yields to the model
-  instead of outranking it indefinitely.
-- **Let the frozen plan re-price on the forecast.** A scheduled run holds its opening
-  plan by design, to stop the ETA chasing every sample. That is right for noise and
-  wrong for a forecast that was known at the outset; re-pricing on the *forecast* rather
-  than on the instantaneous reading would keep the stability and lose the staleness.
+**A live test cycle is a week.** That rules out iterating in production, and it argues
+for deciding as much as possible offline first.
 
-### Still owed
+Most of this *can* be decided offline, and without waiting for new instrumentation. The
+climate entity already records `current_temperature` and `hvac_action`, so the recorder
+holds every past session at full fidelity — see *Learn from a Stored Sample Series, not
+Incremental State*. That makes the following answerable today, by replay:
 
-- Whether any of this survives adopting the physical model. If air temperature becomes a
-  term in the equation rather than a correction bolted on outside, the scalar's job
-  shrinks to genuinely unmodelled conditions and the suppression question disappears
-  with the thing being suppressed. See *Alternative: a physical heating model*.
-- A second long run from cold to confirm the size of the effect. One run establishes the
-  mechanism; it does not fix the magnitude.
+- the right `AMBIENT_SENSITIVITY` for each band, or whether the whole construct should
+  be replaced by the physical model's single air term
+- whether `LEARNED_SHRINK_N = 20` is defensible, and what a sign guard on the fits costs
+- whether combining the scalar with the ambient factor beats either alone
+- whether a time-based or degree-based first revision beats band edges
+- the bucket model against the physical model over every session on record, rather than
+  the two the live scorer has seen
+
+What replay cannot answer is anything about live behaviour under a frozen plan, and
+anything needing conditions not yet recorded — a hard frost, an uncovered run.
+
+**The case for one rewrite rather than a sequence of patches.** Each cause above has an
+obvious local fix, and applying them one at a time would cost a week each and interact:
+raising the cold sensitivity changes what the scalar measures, which changes what the
+band-edge revision corrects. The corrections are not independent, so tuning them
+independently is how a model acquires a decade of compensating errors. If the prediction
+path is to be reworked, it should be designed once against the replayed history and
+deployed once.
 
 ---
 
@@ -583,9 +625,12 @@ Not yet chosen; they are not mutually exclusive.
 
 The prediction model currently corrects for outdoor conditions in two places, and neither of them actually *learns* the relationship.
 
-> See also *[The Session Scalar Freezes, and Silences the Weather
-> Model](#the-session-scalar-freezes-and-silences-the-weather-model)*. Learning better
-> sensitivities does nothing while a frozen scalar stops them being consulted at all.
+> See also *[Why the Opening Plan Was Two Hours
+> Fast](#why-the-opening-plan-was-two-hours-fast--run-of-11092026)*, which measured this
+> section's premise and found it worse than stated: on 11.09.2026 the learned cold-band
+> fit predicted the realised rate to within 0.6% and was blended in at 13%, against a
+> hardcoded sensitivity of zero. Learning better sensitivities achieves nothing until
+> `LEARNED_SHRINK_N` lets them be consulted.
 
 **`ambient_rate_factor` uses hardcoded sensitivities.** `AMBIENT_SENSITIVITY = (0.0, 0.02, 0.06)` — a fraction of the bucket's rate lost per °C below the learned baseline — was derived from physical reasoning about the water-to-air temperature gap, not measured. No installation has ever confirmed those numbers. A well-insulated spa with a rigid cover might sit at half those values; an uncovered one in an exposed garden could be double.
 
