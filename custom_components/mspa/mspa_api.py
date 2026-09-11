@@ -123,6 +123,40 @@ _DEMO_STATUS = {
 }
 
 
+def _new_session() -> requests.Session:
+    """One connection-pooling session per account.
+
+    Every call used to go through `requests.get` / `requests.post`, which builds a
+    throwaway Session per request: a fresh TCP connect, a fresh TLS handshake and a
+    fresh DNS lookup every time. At a 30 s poll that is ~2,900 resolutions a day per
+    coordinator, and each one is a chance to fail — which is what produced
+
+        Failed to resolve 'api.iot.the-mspa.com' ([Errno -3] Try again)
+
+    on 2026-09-11, a transient resolver failure during a satellite-link drop. Keeping
+    the connection open removes most of those lookups, so a brief DNS outage no longer
+    lands on a poll that would otherwise have succeeded.
+
+    Shared per credentials rather than per client, alongside the token and locks, so
+    several coordinators on one account share the pool. That is safe here because
+    nothing mutates session state after construction: the auth token travels in
+    per-request headers, not in `session.headers`, and the API sets no cookies. The
+    underlying urllib3 pool is itself thread-safe, which matters because these calls
+    run in the executor.
+
+    Retries stay at the requests default of zero. The coordinator already retries by
+    polling again in 30 s, and a backoff inside the call could outlast the interval.
+    Note this is why the urllib3 message reads "Max retries exceeded" for what was a
+    single attempt — the budget is zero and exhausting it raises that fixed wording.
+    """
+    session = requests.Session()
+    # The pool only ever talks to one host, so the defaults (10/10) are ample; naming
+    # them makes that a decision rather than an accident.
+    adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
+    session.mount("https://", adapter)
+    return session
+
+
 class MSpaApiClient:
     def __init__(self, hass, account_email, password, coordinator, region="ROW", token=None, device_id=None):
         self.account_email = account_email
@@ -143,6 +177,7 @@ class MSpaApiClient:
                 "lock": asyncio.Lock(),      # Serializes authentication across coordinators
                 "api_lock": asyncio.Lock(),  # Serializes write commands across coordinators
                 "throttle": _MSpaThrottle(), # Proactive rate limiter for all HTTP calls
+                "session": _new_session(),   # Connection reuse — see _new_session
             }
 
         self._target_device_id = device_id  # If set, select this specific device on init
@@ -182,6 +217,16 @@ class MSpaApiClient:
     def _throttle(self) -> _MSpaThrottle:
         """Per-account rate limiter shared by all API clients for this account."""
         return self.hass.data["mspa_auth"][self._creds_key]["throttle"]
+
+    @property
+    def _session(self) -> requests.Session:
+        """Connection-pooling session shared by all API clients for this account.
+
+        Read through the store rather than held on the instance so a client created
+        before the store was populated cannot end up with a stale one, and so closing
+        the store's session on unload really does close the one in use.
+        """
+        return self.hass.data["mspa_auth"][self._creds_key]["session"]
 
     async def async_init(self):
         await self._do_async_init()
@@ -385,7 +430,7 @@ class MSpaApiClient:
 
         try:
             response = await self.hass.async_add_executor_job(
-                functools.partial(requests.post, token_request_url, headers=headers, json=payload, timeout=30)
+                functools.partial(self._session.post, token_request_url, headers=headers, json=payload, timeout=30)
             )
             _LOGGER.debug("DIAGNOSTIC: Authentication HTTP status code: %s", response.status_code)
 
@@ -458,7 +503,7 @@ class MSpaApiClient:
         _LOGGER.debug("send_device_command: %s, url: %s", desired_dict, url)
         await self._throttle.acquire()
         response = await self.hass.async_add_executor_job(
-            functools.partial(requests.post, url, headers=headers, json=payload)
+            functools.partial(self._session.post, url, headers=headers, json=payload)
         )
         response = response.json()
         if (response.get('message') != 'SUCCESS') and (not retry):
@@ -534,7 +579,7 @@ class MSpaApiClient:
         url = f"{self.base_url}/api/device/thing_shadow/"
         await self._throttle.acquire()
         response = await self.hass.async_add_executor_job(
-            functools.partial(requests.post, url, headers=headers, json=payload)
+            functools.partial(self._session.post, url, headers=headers, json=payload)
         )
         response = response.json()
         if not response.get("data") and not retry:
@@ -563,7 +608,7 @@ class MSpaApiClient:
         try:
             await self._throttle.acquire()
             response = await self.hass.async_add_executor_job(
-                functools.partial(requests.get, url, headers=headers, params=params, timeout=30)
+                functools.partial(self._session.get, url, headers=headers, params=params, timeout=30)
             )
             response_json = response.json()
             data = response_json.get("data")
@@ -586,7 +631,7 @@ class MSpaApiClient:
         try:
             await self._throttle.acquire()
             response = await self.hass.async_add_executor_job(
-                functools.partial(requests.get, url, headers=headers, timeout=30)
+                functools.partial(self._session.get, url, headers=headers, timeout=30)
             )
             _LOGGER.debug("DIAGNOSTIC: Device list HTTP status code: %s", response.status_code)
             _LOGGER.debug("DIAGNOSTIC: Device list raw response: %s", response.text)

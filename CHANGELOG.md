@@ -139,6 +139,14 @@ which changes nothing for anyone who had it on.
 
 ### Fixed
 
+- **Fewer dropped polls on a flaky connection.** Every call to the MSpa cloud opened a
+  new connection, which meant a fresh DNS lookup each time — around 2,900 a day at the
+  normal polling rate, each one a chance to fail. The integration now keeps one
+  connection open per account and reuses it, so a brief network or DNS hiccup no longer
+  has to land on a poll that would otherwise have succeeded. Nothing changes about how
+  often it polls or what it asks for; there is simply less to go wrong in between.
+
+
 - **No more deprecation warnings in the log after a restart.** The device-registry lookup
   used during the one-time migration of the old device identifier used a call that Home
   Assistant deprecated in 2026.8. The integration now uses the replacement where it

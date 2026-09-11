@@ -176,8 +176,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
         if not remaining:
             # Last entry unloaded — clean up services and cached auth
             _unregister_services(hass)
-            hass.data.pop("mspa_auth", None)
-            _LOGGER.debug("MSpa integration %s fully unloaded — services and auth cache cleared", DOMAIN)
+            auth_store = hass.data.pop("mspa_auth", None) or {}
+            # Close the pooled connections rather than leaving them to the garbage
+            # collector, which on a reload would otherwise strand a socket per account
+            # until it noticed. In the executor because close() does I/O.
+            for entry_data in auth_store.values():
+                session = entry_data.get("session")
+                if session is not None:
+                    await hass.async_add_executor_job(session.close)
+            _LOGGER.debug("MSpa integration %s fully unloaded — services, auth cache and connections cleared", DOMAIN)
         else:
             # Re-register services pointing at a still-active coordinator
             remaining_coordinator = next(iter(remaining.values()))
