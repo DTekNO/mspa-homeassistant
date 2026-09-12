@@ -2,6 +2,18 @@
 import logging
 from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
+from .thermal import (
+    A_ALPHA,
+    DEFAULT_A,
+    DEFAULT_TAU_H,
+    TAU_ALPHA,
+    ThermalModel,
+    a_from_heating,
+    blend,
+    implied_litres,
+    implied_loss_w_per_k,
+    tau_from_cooling,
+)
 from .predictor import (
     HEAT_BUCKET_LEARN_MAX,
     HEAT_BUCKET_LEARN_MIN,
@@ -296,6 +308,19 @@ def _error_against(estimate, actual_minutes):
 class MSpaUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from MSpa Hot Tub."""
 
+    # The thermal model's state, declared on the class as well as set in __init__.
+    #
+    # The class-level defaults are not decoration. Several test fixtures build a
+    # coordinator with `object.__new__` and populate it by hand, deliberately, to
+    # exercise the learning without an event loop — and every attribute added to
+    # __init__ has historically broken all of them at once until each fixture was
+    # found and edited. Declaring immutable defaults here means a new instance
+    # attribute cannot silently become thirty-four failures again.
+    thermal_a: float | None = None
+    thermal_tau_h: float | None = None
+    thermal_a_n: int = 0
+    thermal_tau_n: int = 0
+
     def __init__(self, hass: HomeAssistant, config_entry: Dict[str, Any]) -> None:
         """Initialize."""
         # Obfuscate sensitive data for logging
@@ -488,6 +513,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # cool-off release measures against this, so "Ready" is withdrawn once
         # the spa is no longer as warm as it was when it arrived.
         self.ready_latched_temp: float | None = None
+        # The thermal model's two parameters. `A` is the heater against the thermal
+        # mass; `tau` the time constant of the loss. They are learned separately and at
+        # different speeds because they describe different things — see
+        # docs/thermal-model.md. None until the first observation, at which point the
+        # seed is replaced outright rather than blended towards.
+        self.thermal_a: float | None = None
+        self.thermal_tau_h: float | None = None
+        self.thermal_a_n: int = 0
+        self.thermal_tau_n: int = 0
+
         self.scheduled_ready_at: datetime | None = None  # set by MSpaScheduledReadyAt entity
         # Target temperature the scheduler should heat to.  Exposed as a number entity
         # so the user can adjust it from the device panel without entering options.
@@ -1168,6 +1203,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                         stored.get("heat_rate_buckets_norm")
                         or [None, None, None])
                     self._prediction_history = stored.get("prediction_history", [])
+                    # The thermal model. Absent on a store written before it existed, or
+                    # on a deliberately cleared one — either way the seeds stand until
+                    # the first observation, which is the intended new-spa behaviour.
+                    self.thermal_a = stored.get("thermal_a")
+                    self.thermal_tau_h = stored.get("thermal_tau_h")
+                    self.thermal_a_n = stored.get("thermal_a_n", 0) or 0
+                    self.thermal_tau_n = stored.get("thermal_tau_n", 0) or 0
                     self._band_observations = stored.get("band_observations", [])
                     self._band_stats = stored.get("band_stats", {})
                     # Restore the bias as a stored value — never recompute it here.
@@ -1319,6 +1361,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             await self._rates_store.async_save({
                 "heat_rate": self.computed_heat_rate,
                 "cool_rate": self.computed_cool_rate,
+                # The thermal model. Two numbers and their sample counts — the whole
+                # of what it needs to survive a restart.
+                "thermal_a": self.thermal_a,
+                "thermal_tau_h": self.thermal_tau_h,
+                "thermal_a_n": self.thermal_a_n,
+                "thermal_tau_n": self.thermal_tau_n,
                 "heat_rate_buckets": self.heat_rate_buckets,
                 "heat_rate_buckets_norm": self.heat_rate_buckets_norm,
                 # What the three learned rates say about themselves: whether they still
@@ -3117,6 +3165,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # where `rate_at_zero_gap` is measured directly rather than extrapolated
                 # twenty-odd degrees beyond the data — that intercept is what carries the
                 # thermal mass, so it is also what the implied volume rests on.
+                # The thermal model learns from the same chord, one subtraction later.
+                # Every accepted crossing counts, not only a whole band, so `A` is
+                # available minutes into a run rather than hours.
+                if accepted and elapsed_hours > 0:
+                    self.learn_thermal_a(
+                        rate, (self._rate_last_temp + curr_temp) / 2.0,
+                        self._window_ambient())
+
                 if _left_the_band and elapsed_hours > 0:
                     # A whole band, entered and left at its edges, measured against the
                     # weather that prevailed while it was crossed. That is the observation
@@ -3182,6 +3238,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     delta = curr_temp - self._cool_last_temp
                     if delta < 0:  # temperature actually dropped
                         rate = -delta / elapsed_hours  # positive °C/h
+                        # Cooling is where tau is measured: no heater term, so the
+                        # sample cannot be contaminated by power or volume.
+                        self.learn_thermal_tau(
+                            self._cool_last_temp, curr_temp,
+                            self.ambient_temp, elapsed_hours)
                         if _MIN_COOL_RATE <= rate <= _MAX_COOL_RATE:
                             if self.computed_cool_rate is None:
                                 self.computed_cool_rate = rate
@@ -3340,6 +3401,84 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 )
         else:
             self._last_schedule_failure = None
+
+    def thermal_model(self) -> ThermalModel:
+        """The two-parameter model, seeded until this spa has measured its own.
+
+        Seeds are measurements from a real installation rather than guesses, so a new
+        spa starts somewhere physically sensible; both are replaced by the first
+        observation. See docs/thermal-model.md.
+        """
+        return ThermalModel(
+            self.thermal_a if self.thermal_a is not None else DEFAULT_A,
+            self.thermal_tau_h if self.thermal_tau_h is not None else DEFAULT_TAU_H,
+        )
+
+    def thermal_minutes(self, from_temp, to_temp, *, ambient=None) -> float | None:
+        """Minutes to heat, under the thermal model. None when out of reach."""
+        air = ambient if ambient is not None else self.ambient_temp
+        if air is None:
+            return None
+        return self.thermal_model().heating_minutes(from_temp, to_temp, air)
+
+    def learn_thermal_a(self, rate, water_mean, ambient) -> None:
+        """One heating crossing: A = rate + gap/tau.
+
+        Available from the first 0.5 °C step of a run rather than after a whole band,
+        which is what the session scalar was reaching for and never achieved because it
+        froze after its source bucket.
+        """
+        model = self.thermal_model()
+        sample = a_from_heating(rate, water_mean, ambient, model.tau_h)
+        if sample is None:
+            return
+        prev = self.thermal_a
+        self.thermal_a = blend(prev, sample, A_ALPHA)
+        self.thermal_a_n += 1
+        litres = implied_litres(self.thermal_a, self.heater_power_heat_w)
+        _LOGGER.info(
+            "Thermal A: sample %.3f (rate %.3f, gap %.1f, tau %.1f) → %.3f °C/h "
+            "[n=%d%s]", sample, rate, water_mean - ambient, model.tau_h,
+            self.thermal_a, self.thermal_a_n,
+            f", ≈{litres:.0f} L" if litres else "")
+
+    def learn_thermal_tau(self, from_temp, to_temp, ambient, hours) -> None:
+        """One cooling crossing.
+
+        The anchor of the whole model: no heater term, so this measurement cannot be
+        contaminated by heater power, water volume, or anything the user configured.
+        """
+        sample = tau_from_cooling(from_temp, to_temp, ambient, hours)
+        if sample is None:
+            return
+        self.thermal_tau_h = blend(self.thermal_tau_h, sample, TAU_ALPHA)
+        self.thermal_tau_n += 1
+        _LOGGER.info(
+            "Thermal tau: sample %.1f h (%.1f→%.1f °C over %.2f h at %.1f °C) → %.1f h "
+            "[n=%d]", sample, from_temp, to_temp, hours, ambient,
+            self.thermal_tau_h, self.thermal_tau_n)
+
+    def thermal_diagnostics(self) -> dict:
+        """What the model currently believes, for the diagnostic sensor."""
+        m = self.thermal_model()
+        air = self.ambient_temp
+        return {
+            "a_c_per_h": round(m.a, 4),
+            "tau_h": round(m.tau_h, 2),
+            "a_samples": self.thermal_a_n,
+            "tau_samples": self.thermal_tau_n,
+            "seeded_a": self.thermal_a is None,
+            "seeded_tau": self.thermal_tau_h is None,
+            "asymptote_c": round(m.asymptote(air), 2) if air is not None else None,
+            "implied_litres": (
+                round(implied_litres(m.a, self.heater_power_heat_w) or 0) or None),
+            "loss_w_per_k": (
+                round(implied_loss_w_per_k(m.a, m.tau_h, self.heater_power_heat_w) or 0, 1)
+                or None),
+            "chord_rates": (
+                [round(r, 3) for r in m.chord_rates([25.0, 33.5, 38.0], air)]
+                if air is not None else None),
+        }
 
     def _predictor(self, ambient=None) -> HeatPredictor:
         """The shared prediction model, built from current learned state.
