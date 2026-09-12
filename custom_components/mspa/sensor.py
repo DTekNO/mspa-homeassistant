@@ -1806,6 +1806,11 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
         from .predictor import ambient_rate_factor
         c = self.coordinator
         out = {
+            # The thermal model: two parameters, their sample counts, and the sanity
+            # checks they imply. This is the whole of what drives predictions now, so it
+            # is the first thing to look at when one looks wrong.
+            "thermal_model": (c.thermal_diagnostics()
+                              if hasattr(c, "thermal_diagnostics") else None),
             "weather_entity": c.weather_entity,
             # The configured thermometer and what it reads right now. Surfaced because
             # the alternative way to find out whether it is being read is to finish a

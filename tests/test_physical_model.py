@@ -443,9 +443,19 @@ class TestTheModelCanBeSwitchedWithoutMovingAnything:
             "options": {} if model is None else {"prediction_model": model}})()
         return c
 
-    def test_buckets_are_the_default(self):
+    def test_the_thermal_model_is_the_default(self):
+        """Changed from buckets on 12.09.2026. The seam is unmoved: same entity ids,
+        same meaning, only the arithmetic behind them differs."""
         c = self._coord()
-        assert c.prediction_model == "buckets"
+        assert c.prediction_model == "thermal"
+        # No frozen plan. Freezing existed because bucket rates were stale by
+        # construction; with air as a term there is nothing stale to hold steady.
+        assert c.uses_frozen_plan is False
+        assert c.heating_minutes(24.0, 39.5) == pytest.approx(
+            c.thermal_minutes(24.0, 39.5))
+
+    def test_buckets_remain_selectable_and_keep_their_frozen_plan(self):
+        c = self._coord("buckets")
         assert c.uses_frozen_plan is True
         assert c.heating_minutes(24.0, 39.5) == pytest.approx(
             c._predictor().heating_minutes(24.0, 39.5))
@@ -1666,7 +1676,9 @@ class TestBothModelsArePricedTheSameWay:
         c.prediction_bias = 1.0
         c._session_scalar = 1.0
         c._session_fresh_buckets = frozenset()
-        c.config_entry = type("E", (), {"options": {}})()
+        # Pinned to buckets: this test is about the bucket path taking the override,
+        # and the default is the thermal model since 12.09.2026.
+        c.config_entry = type("E", (), {"options": {"prediction_model": "buckets"}})()
         mild = c._heating_minutes_variant(28.5, 39.5, use_fits=False, ambient=17.0)
         cold = c._heating_minutes_variant(28.5, 39.5, use_fits=False, ambient=6.0)
         assert cold > mild, "a cold night must price the bucket run longer too"

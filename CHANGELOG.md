@@ -14,6 +14,36 @@ no longer carry the prediction bias, so Ready at and heat schedule times may shi
 slightly, generally later; and one redundant option has gone from the settings dialog,
 which changes nothing for anyone who had it on.
 
+### Changed
+
+- **Heat-up predictions now come from a two-parameter physical model.** The estimate used
+  to be built from three learned heating rates plus a stack of corrections — a scalar for
+  today's conditions, a per-band adjustment for outdoor temperature, a historical bias,
+  and a plan frozen at the start of each run and revised only at temperature boundaries.
+  Each of those existed to patch a model that had no outdoor temperature inside it.
+
+  The replacement is one equation: the water heats at a rate set by the heater, minus a
+  loss proportional to how far above the air it already is. Two numbers describe your
+  spa. One is the loss, which the integration measures **while the spa is cooling** —
+  where the heater is not involved at all, so it needs no assumption about power or water
+  volume. The other is the heater against the water it has to warm, measured live from
+  each run and updated within minutes of heating starting rather than hours.
+
+  The practical differences: outdoor temperature is now part of the calculation instead of
+  a correction applied afterwards, so a cold night is priced correctly from the first
+  estimate; the scheduler and the live estimate use exactly the same arithmetic, so they
+  cannot drift apart mid-run; and adding water — rain, a top-up — is picked up during the
+  next heat-up instead of contaminating the learned rates for weeks.
+
+  A new spa starts from seeded values and replaces them with its own measurements, so
+  estimates are sensible from the first heat-up. The **Ambient learning** diagnostic
+  sensor gains a `thermal_model` attribute showing both parameters, how many samples are
+  behind each, and the water volume and standing loss they imply — worth comparing
+  against your spa's specification.
+
+  The previous model remains selectable, and nothing about entity ids or attributes
+  changes.
+
 ### Added
 
 - **Ready at and Heat Schedule now have localised counterparts.** Four new sensors —

@@ -122,7 +122,18 @@ class MockCoordinator:
     # arithmetic would agree with itself while the integration did something else.
     prediction_model = MSpaUpdateCoordinator.prediction_model
     uses_frozen_plan = MSpaUpdateCoordinator.uses_frozen_plan
+    # The thermal model's state. Declared here because these mocks are not
+    # coordinator subclasses, so the class defaults on the real one do not
+    # reach them. Left unlearned so the scenarios run on the seeds, which is
+    # what a fresh installation does.
+    _thermal_fallback_active = False
+    thermal_a = None
+    thermal_tau_h = None
+    thermal_a_n = 0
+    thermal_tau_n = 0
     heating_minutes = MSpaUpdateCoordinator.heating_minutes
+    thermal_minutes = MSpaUpdateCoordinator.thermal_minutes
+    thermal_model = MSpaUpdateCoordinator.thermal_model
     live_ambient_for = MSpaUpdateCoordinator.live_ambient_for
     forecast_ambient_for = MSpaUpdateCoordinator.forecast_ambient_for
 
@@ -1380,6 +1391,9 @@ class TestFrozenSessionPlan:
     def _coord(self, *, water, elapsed_min, start_temp=33.0):
         c = MockCoordinator(water_temp=water, target_temp=39.5, heat_rate=1.0,
                             anchor_offset_minutes=0.0)
+        # Pinned to buckets: freezing is a bucket mechanism, and the default became the
+        # thermal model on 12.09.2026, which has nothing stale to hold steady.
+        c.config_entry = type("E", (), {"options": {"prediction_model": "buckets"}})()
         c.temp_anchor_temp = water
         c.temp_anchor_time = datetime.now(timezone.utc)
         c.heat_rate_buckets = [2.0, 2.0, 2.0]      # live rates, deliberately different

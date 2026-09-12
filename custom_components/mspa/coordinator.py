@@ -69,7 +69,9 @@ from .const import (
     CONF_OUTDOOR_SENSOR,
     CONF_PREDICTION_MODEL,
     DEFAULT_PREDICTION_MODEL,
+    PREDICTION_MODEL_BUCKETS,
     PREDICTION_MODEL_NEWTON,
+    PREDICTION_MODEL_THERMAL,
     CONF_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_TARGET_TEMP,
     AMBIENT_BASELINE_ALPHA,
@@ -316,6 +318,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # __init__ has historically broken all of them at once until each fixture was
     # found and edited. Declaring immutable defaults here means a new instance
     # attribute cannot silently become thirty-four failures again.
+    _thermal_fallback_active: bool = False
     thermal_a: float | None = None
     thermal_tau_h: float | None = None
     thermal_a_n: int = 0
@@ -518,6 +521,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # different speeds because they describe different things — see
         # docs/thermal-model.md. None until the first observation, at which point the
         # seed is replaced outright rather than blended towards.
+        self._thermal_fallback_active = False
         self.thermal_a: float | None = None
         self.thermal_tau_h: float | None = None
         self.thermal_a_n: int = 0
@@ -3511,8 +3515,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         current water temperature and the current outdoor temperature on every poll, so a
         frozen plan would be holding it back rather than steadying it, and a revision
         mechanism would be revising towards what it already says.
+
+        False for the thermal model for the same reason, and for one more. Freezing was
+        how the bucket model coped with rates that were stale by construction, and the
+        band-edge revision that went with it is what let the scheduler commit to a start
+        time and only discover eleven hours later that it was three hours wrong. The
+        thermal model has air as a term rather than a correction, so there is nothing
+        stale to hold steady — see docs/thermal-model.md.
         """
-        return self.prediction_model != PREDICTION_MODEL_NEWTON
+        return self.prediction_model == PREDICTION_MODEL_BUCKETS
 
     def heating_minutes(self, from_temp: float, to_temp: float,
                         *, ambient=None) -> float | None:
@@ -3529,6 +3540,28 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         Ready at is a broken dashboard. The fallback is logged on the way in and on the
         way out, never per poll.
         """
+        if self.prediction_model == PREDICTION_MODEL_THERMAL:
+            minutes = self.thermal_minutes(from_temp, to_temp, ambient=ambient)
+            if minutes is not None:
+                if self._thermal_fallback_active:
+                    self._thermal_fallback_active = False
+                    _LOGGER.info(
+                        "Prediction model: the thermal model can answer again "
+                        "(%.1f→%.1f °C)", from_temp or 0.0, to_temp or 0.0)
+                return minutes
+            # It declines for exactly two reasons: no outdoor reading at all, or a
+            # target beyond the asymptote. Both are real answers, but a blank Ready at
+            # is a broken dashboard, so the buckets carry it until conditions change.
+            if not self._thermal_fallback_active:
+                self._thermal_fallback_active = True
+                m = self.thermal_model()
+                _LOGGER.info(
+                    "Prediction model: the thermal model declines %.1f→%.1f °C (%s) "
+                    "— falling back to buckets", from_temp or 0.0, to_temp or 0.0,
+                    "no outdoor temperature" if self.ambient_temp is None else
+                    f"asymptote {m.asymptote(self.ambient_temp):.1f} °C "
+                    f"at outdoor {self.ambient_temp:.1f} °C")
+
         if self.prediction_model == PREDICTION_MODEL_NEWTON:
             minutes = self.newton_minutes(from_temp, to_temp, ambient=ambient)
             if minutes is not None:

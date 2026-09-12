@@ -146,7 +146,12 @@ CONF_OUTDOOR_SENSOR = "outdoor_sensor"
 CONF_PREDICTION_MODEL = "prediction_model"
 PREDICTION_MODEL_BUCKETS = "buckets"
 PREDICTION_MODEL_NEWTON = "newton"
-DEFAULT_PREDICTION_MODEL = PREDICTION_MODEL_BUCKETS
+# One equation, two parameters, learned live — see docs/thermal-model.md. The default,
+# because it is the only one of the three whose parameters this spa can measure for
+# itself from a standing start, and the only one where outdoor temperature is a term in
+# the equation rather than a correction bolted on outside it.
+PREDICTION_MODEL_THERMAL = "thermal"
+DEFAULT_PREDICTION_MODEL = PREDICTION_MODEL_THERMAL
 
 # Optional heat-schedule: calendar-driven automatic preheat scheduling.
 CONF_SCHEDULE_TARGET_TEMP = "schedule_target_temp"
