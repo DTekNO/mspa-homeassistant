@@ -60,6 +60,12 @@ Predictions re-derive from current water and current air on every poll.
 revision that went with it is what allowed a start time to be committed and then found
 three hours wrong eleven hours later, far too late to act on.
 
+*The one hold, and why it is not this:* R12 holds the displayed estimate for the ~90
+minutes before a run has measured anything. The frozen plan this rule forbids held a
+*measured* rate steady and revised it on a schedule; R12's hold ends the instant there
+is a measurement, and revises on evidence rather than at a band edge. Where R4 forbids
+holding a number that could be improved, R12 forbids publishing one that cannot.
+
 ## R5 — Plan with the forecast, looking ahead
 
 A prediction covering future hours uses the forecast for **those** hours, not the
@@ -126,6 +132,60 @@ in the model.
 
 *Why:* every term currently being removed was added because it was plausible.
 
+## R11 — A measurement must be longer than the noise in it
+
+Specifically: **a rate is learned from a chord of at least `THERMAL_CHORD_MIN_C`
+(1.5 °C), measured from a held anchor, and chords do not overlap.**
+
+*Why this exact rule:* the reading is quantised to 0.5 °C, so a single crossing is a rise
+known only to ±0.25 °C over 25–30 minutes — ±50% on the rate, blended into `A` at
+`A_ALPHA` and republished immediately. Replaying 11.09.2026, the first such chord read
+`A` = 1.46 against the run's settled 1.25, and opened the estimate 206 minutes fast.
+Over 1.5 °C the same quantisation is ±17%.
+
+*What it rejects:* re-anchoring at every crossing, which is three rates each measured
+over one band; and nesting, where a held anchor emits a point at every crossing so each
+one shares nearly all its data with the last. The bucket window does the second, and
+also re-anchors at every zone edge — so the short-chord noise it holds its anchor to
+avoid was re-injected four times a run. Scored over 11.09 and 03.09: mean absolute error
+38/41 min → 25/28, worst single step 169/137 min → 22/27.
+
+*Why 1.5 and not 2.0 or 3.0:* those score better still (20/25 and 19/22 MAE) and were
+rejected because the same points feed the end-of-run `τ` fit. 1.5 °C leaves 13 and 12
+points on the two runs, clearing `TAU_MIN_POINTS = 10`; 2.0 °C leaves 10 and 9, so the
+shorter run would silently stop learning `τ`. Buying three minutes of error by disabling
+half the model is not a trade — and it is the same failure mode R6 exists to prevent.
+
+## R12 — Do not publish an estimate that has measured nothing
+
+Two parts, and they are the same idea at two ends of a run.
+
+**Learning starts at an observed position.** A run opens somewhere inside a 0.5 °C band
+and that position is never observed, so any rate measured from it spans an unknown
+distance. The first crossing after the heater starts is anchored, not learned.
+
+**The displayed estimate is held until the first chord completes** — about 90 minutes.
+Before that the plan rests on the seed and on a position known to within half a band.
+Republishing it at every crossing shows movement where there is no new information: the
+estimate walks because the water advanced against a rate that has not changed, and a
+reader cannot tell that from a genuine revision. Released the moment `A` is learned, so
+it is inert on every run after the first.
+
+*Why:* holding also bounds the correction. Replaying 03.09.2026 with the estimate free,
+the seed plan and the first fitted plan disagreed by 123 minutes and the display crossed
+that in one step. Held, the same run steps 27 minutes. Mean absolute error is unchanged
+on both runs, so what this buys is specifically the worst case.
+
+*Related, and the same principle applied to position:* an extrapolation within the band
+is trusted for `_ANCHOR_MAX_AGE_BANDS` times the time a band should take at the rate
+being extrapolated, and past that the reported reading is used. On 10.09.2026 an anchor
+from 02:39 was still being projected at 18:50 — thirteen of those sixteen hours spent
+clamped to the band floor — and the plan was built on a position 0.9 °C too cold. A plain
+age cap is wrong here: crossings during a genuine cooling dwell are around three hours
+apart, so any cap short enough to catch sixteen hours also fires inside an ordinary
+dwell. What separates the cases is how far past its own prediction the model has run.
+
+
 ---
 
 ## Checking a change against these
@@ -140,3 +200,5 @@ in the model.
 8. Does it blend away a seed? → R8
 9. Does it invent a number rather than decline? → R9
 10. Does it add a parameter? → R10
+11. Does it learn from a span no longer than the noise in it? → R11
+12. Does it publish a number the run has not measured? → R12

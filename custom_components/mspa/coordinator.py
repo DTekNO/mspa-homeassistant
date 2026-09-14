@@ -7,6 +7,7 @@ from .thermal import (
     DEFAULT_A,
     DEFAULT_TAU_H,
     TAU_ALPHA,
+    THERMAL_CHORD_MIN_C,
     ThermalModel,
     a_at_fixed_tau,
     fit_run,
@@ -365,6 +366,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # instance, so the fixtures that build coordinators with object.__new__ would all
     # append to one list — which is exactly what happened, and what the tests caught.
     _thermal_points: list | None = None
+    # Crossings of the chord being measured, oldest first. Same reasoning as above.
+    _thermal_chord: list | None = None
+    _thermal_hold_finish: datetime | None = None
+    _thermal_hold_target: float | None = None
     thermal_a: float | None = None
     thermal_tau_h: float | None = None
     thermal_a_n: int = 0
@@ -569,6 +574,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # seed is replaced outright rather than blended towards.
         self._thermal_fallback_active = False
         self._thermal_points: list[tuple[float, float]] = []
+        self._thermal_chord: list[tuple[float, float, float | None]] = []
+        self._thermal_hold_finish: datetime | None = None
+        self._thermal_hold_target: float | None = None
         self.thermal_a: float | None = None
         self.thermal_tau_h: float | None = None
         self.thermal_a_n: int = 0
@@ -1380,8 +1388,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.reanchor_for_direction_change()
             if heater_now_active and self.heating_since is None:
                 self.heating_since = datetime.now(timezone.utc)
+                # After heating_since, so the hold is priced from the same position the
+                # scheduler just handed over — the re-anchored one, not the raw reading.
+                self.begin_thermal_hold(self.scheduling_temp(), new_target)
             elif not heater_now_active:
                 self.heating_since = None
+                self.release_thermal_hold()
             if heater_now_active and not self._heat_was_active:
                 delta_to_target = abs((new_target or 0) - (curr_temp or 0))
                 if delta_to_target > _NEW_SESSION_DELTA:
@@ -3068,6 +3080,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono
                     self._seed_window_ambient()
+                    # The thermal chord starts here too, and for the same reason the
+                    # bucket window does: this crossing is the first observed position
+                    # of the run. Anchoring one crossing later instead would discard a
+                    # measured half-degree for nothing.
+                    self.anchor_thermal_chord(now_mono, curr_temp)
                     return
                 # Temperature has changed — elapsed time since the window anchor
                 # is the true duration of the whole boundary-to-boundary span.
@@ -3280,13 +3297,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # where `rate_at_zero_gap` is measured directly rather than extrapolated
                 # twenty-odd degrees beyond the data — that intercept is what carries the
                 # thermal mass, so it is also what the implied volume rests on.
-                # The thermal model learns from the same chord, one subtraction later.
-                # Every accepted crossing counts, not only a whole band, so `A` is
-                # available minutes into a run rather than hours.
+                # The thermal model measures its own chord. It used to share the bucket
+                # window's, which meant sharing a definition neither of them wanted: the
+                # bucket needs a chord that ends where its band ends, and the thermal fit
+                # needs one long enough that 0.5 °C of quantisation is not half the
+                # signal. See record_thermal_crossing.
                 if accepted and elapsed_hours > 0:
-                    self.learn_from_crossing(
-                        rate, (self._rate_last_temp + curr_temp) / 2.0,
-                        self._window_ambient())
+                    self.record_thermal_crossing(now_mono, curr_temp)
 
                 if _left_the_band and elapsed_hours > 0:
                     # A whole band, entered and left at its edges, measured against the
@@ -3315,6 +3332,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._rate_last_time = None
             self._rate_prev_temp = None
             self._rate_first_step = False
+            # A chord that straddles the heater going off and coming back on is not a
+            # heating measurement, so drop the partial one rather than let the next run
+            # complete it.
+            self._thermal_chord = []
 
     def _track_cooling_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the passive cooling rate from temperature drops.
@@ -3634,6 +3655,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
         self.thermal_a = blend(self.thermal_a, sample, A_ALPHA)
         self.thermal_a_n += 1
+        # There is something measured now, so the opening estimate stops being held.
+        self.release_thermal_hold()
         litres = implied_litres(self.thermal_a, self.heater_power_heat_w)
         _LOGGER.info(
             "Thermal A: %.3f °C/h from %d crossing(s) (rate %.3f at gap %.1f, "
@@ -3673,6 +3696,114 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     def reset_thermal_run(self) -> None:
         """Start a fresh set of crossings. `A` and `tau` carry over; the points do not."""
         self._thermal_points = []
+        self._thermal_chord = []
+        self.release_thermal_hold()
+
+    def release_thermal_hold(self) -> None:
+        """Stop holding the opening estimate. Idempotent."""
+        self._thermal_hold_finish = None
+        self._thermal_hold_target = None
+
+    def thermal_hold_finish(self, target) -> datetime | None:
+        """The finish time to keep showing while the run has measured nothing, or None.
+
+        Between the heater starting and the first chord completing — about ninety
+        minutes, three crossings — the plan rests on `DEFAULT_A` and on a position known
+        only to within half a band. Nothing in that window is evidence, so republishing
+        on every crossing shows movement where there is no new information: the estimate
+        walks because the water temperature advanced against a rate that has not
+        changed, and a reader cannot tell that from a genuine revision.
+
+        Holding also bounds the correction. Replaying 03.09.2026 with the estimate free,
+        the seed plan and the first fitted plan disagreed by 123 minutes and the display
+        crossed that gap in one step at the moment of the fit. Held, the same run steps
+        27 minutes, because the held value was already most of the way there. 11.09.2026
+        trades the other way — 15 minutes free against 22 held — and mean absolute error
+        is unchanged on both runs, so what this buys is specifically the worst case.
+
+        Released the moment `A` is learned, so it is inert on every run after the first
+        and never applies to a spa that has heated once before. R3 is not at risk: the
+        scheduler plans while the heater is off and there is no hold then.
+        """
+        if self._thermal_hold_finish is None:
+            return None
+        if self.thermal_a is not None or self.heating_since is None:
+            self.release_thermal_hold()
+            return None
+        if target is not None and self._thermal_hold_target is not None and (
+                abs(float(target) - self._thermal_hold_target) > 1e-9):
+            # The setpoint moved, so the held plan is a plan to somewhere else.
+            self.release_thermal_hold()
+            return None
+        return self._thermal_hold_finish
+
+    def begin_thermal_hold(self, from_temp, target) -> None:
+        """Fix the opening estimate for the run about to start. See thermal_hold_finish."""
+        if (self.prediction_model != PREDICTION_MODEL_THERMAL
+                or self.thermal_a is not None
+                or from_temp is None or target is None
+                or float(target) <= float(from_temp)):
+            return
+        minutes = self.heating_minutes(float(from_temp), float(target))
+        if minutes is None:
+            return
+        self._thermal_hold_finish = (
+            datetime.now(timezone.utc) + timedelta(minutes=minutes))
+        self._thermal_hold_target = float(target)
+        _LOGGER.info(
+            "Thermal: holding the opening estimate at %s (%.1f→%.1f °C on the seed "
+            "rate) until the first %.1f °C chord completes",
+            self._thermal_hold_finish.isoformat(timespec="minutes"),
+            float(from_temp), float(target), THERMAL_CHORD_MIN_C)
+
+    def anchor_thermal_chord(self, when_mono: float, temp) -> None:
+        """Begin measuring a chord here, discarding whatever was being measured.
+
+        Called at the first crossing after the heater starts. Everything before that
+        crossing is unusable: the run opened somewhere inside a 0.5 °C band and the
+        position was never observed, so a rate measured from it spans an unknown
+        distance. The crossing is the first instant the water temperature is a fact.
+        """
+        if temp is None:
+            return
+        self._thermal_chord = [(when_mono, float(temp), self._window_ambient())]
+
+    def record_thermal_crossing(self, when_mono: float, temp) -> None:
+        """Add a crossing, and learn once the chord has grown past THERMAL_CHORD_MIN_C.
+
+        The anchor is *held*: the gap between crossings is used, not skipped, so a
+        1.5 °C chord is one rate measured over three crossings rather than three rates
+        measured over one each. When it completes it is handed to `learn_from_crossing`
+        and the current crossing becomes the anchor of the next one.
+
+        Chords therefore do not overlap, and that is deliberate. The bucket window it
+        replaces held its anchor to a zone edge and emitted a point at every crossing
+        inside it, so each point shared nearly all of its data with the one before —
+        nested evidence, counted once per crossing, with the shortest and least
+        representative span weighted exactly like the longest. Worse, every zone edge
+        re-anchored and emitted a fresh 0.5 °C chord, so the noise the hold exists to
+        remove was re-injected four times a run.
+        """
+        if temp is None:
+            return
+        if not self._thermal_chord:
+            self.anchor_thermal_chord(when_mono, temp)
+            return
+        t0, w0, _ = self._thermal_chord[0]
+        self._thermal_chord.append((when_mono, float(temp), self._window_ambient()))
+        if abs(float(temp) - w0) < THERMAL_CHORD_MIN_C - 1e-9:
+            return
+        hours = (when_mono - t0) / 3600.0
+        if hours <= 0:
+            self.anchor_thermal_chord(when_mono, temp)
+            return
+        airs = [a for _, _, a in self._thermal_chord if a is not None]
+        self.learn_from_crossing(
+            (float(temp) - w0) / hours,
+            (w0 + float(temp)) / 2.0,
+            sum(airs) / len(airs) if airs else None,
+        )
+        self.anchor_thermal_chord(when_mono, temp)
 
     def thermal_diagnostics(self) -> dict:
         """What the model currently believes, for the diagnostic sensor."""

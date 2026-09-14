@@ -41,6 +41,26 @@ TAU_MIN_GAP_SPREAD_K = 12.0
 # Fewer points than this is a fit to noise however wide the spread looks.
 TAU_MIN_POINTS = 10
 
+# How far the water must rise before a crossing chord is worth learning from.
+#
+# The reading is quantised to 0.5 °C, so a single crossing is a rise of 0.5 °C known to
+# +/- 0.25 — a 50% error on the rate, over a span of 25-30 minutes. That noise does not
+# average out, because `A` is blended at A_ALPHA and the plan is republished from it
+# immediately. Replaying 11.09.2026 the first such chord read A = 1.46 against the run's
+# settled 1.25, and opened the estimate 206 minutes fast.
+#
+# Holding the anchor across three crossings measures the same rate over 1.5 °C, which
+# cuts the quantisation error to +/- 17%. Scored over both recorded September runs, mean
+# absolute error falls from 38/41 minutes to 25/28 and the worst single step from
+# 169/137 to 22/27.
+#
+# 2.0 and 3.0 °C score better still (20/25 and 19/22 MAE) and were rejected for a
+# specific reason: the same points feed the end-of-run `tau` fit, and a longer chord
+# thins them. 1.5 °C leaves 13 and 12 points on the two runs, clearing TAU_MIN_POINTS;
+# 2.0 °C leaves 10 and 9, so the shorter run would silently stop learning `tau` at all.
+# Buying three minutes of MAE by disabling half the model is not a trade.
+THERMAL_CHORD_MIN_C = 1.5
+
 # Below this the gap is small enough that measurement noise dominates the logarithm.
 _MIN_GAP_C = 1.0
 # A sample shorter than this is mostly quantisation: the reading moves in 0.5 °C steps.

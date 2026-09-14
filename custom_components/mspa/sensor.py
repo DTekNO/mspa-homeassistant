@@ -411,6 +411,17 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
         opening = coordinator.session_opening_eta()
         if opening is not None:
             return opening
+    # Before the run has measured anything, the opening estimate is held rather than
+    # recomputed at every crossing — see MSpaCoordinator.thermal_hold_finish. Returned
+    # ahead of the staleness overrun below on purpose: a held estimate is not drifting,
+    # so there is nothing for the overrun to communicate.
+    _hold = getattr(coordinator, "thermal_hold_finish", None)
+    held = _hold(target_temp) if callable(_hold) else None
+    if held is not None:
+        _LOGGER.debug("ready_at anchor: holding the opening estimate at %s",
+                      held.isoformat())
+        return held
+
     if plan is not None:
         mins = plan.heating_minutes(anc_temp, target_temp)
     else:

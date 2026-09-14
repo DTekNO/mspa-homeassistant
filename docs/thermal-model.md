@@ -104,6 +104,50 @@ The seed for `A` implies roughly 1450 litres at 2200 W, which is the right order
 six-person spa. Neither seed is special: the first cooling stretch replaces `τ`, and the
 first crossing of a heat-up replaces `A`.
 
+## What a measurement is
+
+A rate is measured over a **held chord of at least 1.5 °C** — three crossings — and
+chords do not overlap. The gap between crossings is used, not skipped: 20.0 → 21.5 is one
+rate over 1.5 °C, not three rates over 0.5 each.
+
+This is forced by the reading, not by the physics. The spa reports water temperature in
+0.5 °C steps, so a single crossing is a rise known to ±0.25 °C — ±50% on the rate. That
+noise does not average away, because `A` is blended at `A_ALPHA` and the plan is
+republished from it at once. Over 1.5 °C the same quantisation is ±17%.
+
+Two consequences worth stating plainly:
+
+* **The first crossing after the heater starts is anchored, not learned.** The run opened
+  somewhere inside a band and that position was never observed, so a rate measured from
+  it spans an unknown distance.
+* **Nothing is displayed until the first chord completes** — roughly 90 minutes. Before
+  that, the estimate would move only because the water advanced against a rate that had
+  not changed, which reads as a revision and is not one. See R12.
+
+Longer chords score better and are not used: 2.0 °C would leave fewer than
+`TAU_MIN_POINTS` points on a short run, so it would buy a few minutes of accuracy by
+silently switching `τ` learning off. R6 and R11 are the same rule seen from two ends.
+
+## Where the plan starts from
+
+The water temperature a plan is built from is `scheduling_temp()`, which extrapolates
+within the current 0.5 °C band from the crossing that entered it. That extrapolation is
+trusted for a bounded time — `_ANCHOR_MAX_AGE_BANDS` times the time one band should take
+at the rate being extrapolated — and past that the reported reading is used instead.
+
+The bound exists because the extrapolation clamps to one band, and a clamped number
+carries no sign of how long it has been clamped. On 10.09.2026 the water crossed down
+through 18.5 at 02:39, the reading sat there all day, and at 18:50 the projection was
+still running that 02:39 cooling rate sixteen hours later — returning the band floor,
+18.0, of which thirteen hours had been spent pinned there. The water crossed *up* through
+19.0 thirteen minutes after the heater fired, so the truth at handover was about 18.9.
+
+The bound is relative to the rate rather than a fixed age, because during a genuine
+cooling dwell crossings are around three hours apart — any fixed cap short enough to
+catch sixteen hours also fires inside an ordinary dwell, putting back the band-sized lump
+the extrapolation exists to remove. What separates the two cases is not elapsed time but
+how far past its own prediction the model has run.
+
 ## Bounds
 
 Both parameters are clamped, because a single bad sample should not be able to produce
