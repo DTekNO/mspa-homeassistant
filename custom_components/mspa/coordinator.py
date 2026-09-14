@@ -1127,6 +1127,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             forecast_air - measured_mean, 2)
                 self._prediction_history.append(result)
                 self._prediction_history = self._prediction_history[-10:]  # keep last 10
+                # The run is over, so its crossings are now a complete lever: this is
+                # the one moment tau is allowed to move. See finalise_thermal_run.
+                self.finalise_thermal_run()
                 self._prediction = None
                 self._shadow = None
                 ratio = self._bias_ratio(result)
@@ -3527,24 +3530,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._thermal_points = []
         self._thermal_points.append((gap, rate))
 
-        fitted_a, fitted_tau = fit_run(self._thermal_points)
-        if fitted_tau is not None:
-            prev = self.thermal_tau_h
-            self.thermal_tau_h = blend(prev, fitted_tau, TAU_ALPHA)
-            self.thermal_tau_n += 1
-            _LOGGER.info(
-                "Thermal tau: run slope over %d crossings spanning %.1f K → "
-                "%.1f h (sample %.1f) [n=%d]",
-                len(self._thermal_points),
-                max(g for g, _ in self._thermal_points)
-                - min(g for g, _ in self._thermal_points),
-                self.thermal_tau_h, fitted_tau, self.thermal_tau_n)
-
-        # A from the whole run at the tau now in force. Averaging the per-crossing value
-        # rather than taking the line's intercept means one crossing is enough and no
-        # slope is implied from a lever too short to carry one.
-        sample = (fitted_a if fitted_tau is not None
-                  else a_at_fixed_tau(self._thermal_points, self.thermal_model().tau_h))
+        # `tau` is deliberately NOT updated here. Mid-run it is fitted to a partial
+        # lever and gets it badly wrong: replaying 11.09.2026 from the seeds, the first
+        # update lands at 37 h against 66 h for the same run's complete crossings and
+        # 54-61 h measured from cooling — and it arrives as a 101-minute jump in the
+        # displayed finish. The whole run is the smallest honest lever, so the fit
+        # happens once, at the end, in finalise_thermal_run.
+        sample = a_at_fixed_tau(self._thermal_points, self.thermal_model().tau_h)
         if sample is None:
             return
         self.thermal_a = blend(self.thermal_a, sample, A_ALPHA)
@@ -3555,6 +3547,35 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             "tau %.1f) [n=%d%s]", self.thermal_a, len(self._thermal_points),
             rate, gap, self.thermal_model().tau_h, self.thermal_a_n,
             f", ≈{litres:.0f} L" if litres else "")
+
+    def finalise_thermal_run(self) -> None:
+        """Fit `tau` from the completed run, then clear its points — R6.
+
+        The whole run is the smallest lever that produces an honest slope. A partial one
+        is not merely noisier, it is biased: on 11.09.2026 the first twelve crossings
+        imply 37 h where all twenty imply 66 h, against 54-61 h measured independently
+        from cooling. So `tau` moves once per run and never during one, which also means
+        the displayed finish cannot jump because the model changed underneath it.
+        """
+        pts = self._thermal_points or []
+        _, fitted = fit_run(pts)
+        if fitted is None:
+            if pts:
+                gaps = [g for g, _ in pts]
+                _LOGGER.debug(
+                    "Thermal tau: run of %d crossings spanning %.1f K did not earn a "
+                    "fit — tau stays at %.1f h", len(pts), max(gaps) - min(gaps),
+                    self.thermal_model().tau_h)
+            self.reset_thermal_run()
+            return
+        self.thermal_tau_h = blend(self.thermal_tau_h, fitted, TAU_ALPHA)
+        self.thermal_tau_n += 1
+        gaps = [g for g, _ in pts]
+        _LOGGER.info(
+            "Thermal tau: run of %d crossings spanning %.1f K fitted %.1f h → %.1f h "
+            "[n=%d]", len(pts), max(gaps) - min(gaps), fitted,
+            self.thermal_tau_h, self.thermal_tau_n)
+        self.reset_thermal_run()
 
     def reset_thermal_run(self) -> None:
         """Start a fresh set of crossings. `A` and `tau` carry over; the points do not."""

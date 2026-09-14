@@ -119,12 +119,31 @@ class TestLearningTauFromHeating:
         assert c.thermal_tau_h is None, "tau moved on a 2 K spread"
         assert c.thermal_tau_n == 0
 
-    def test_a_long_lever_recovers_tau(self):
+    def test_tau_does_not_move_during_a_run(self):
+        """Mid-run the lever is partial and the fit is biased, not merely noisy:
+        replaying 11.09.2026 the first twelve crossings imply 37 h where all twenty
+        imply 66 h. Holding tau also means the displayed finish cannot jump because the
+        model changed underneath it."""
+        c = _coord()
+        waters = [20.0 + 0.5 * i for i in range(40)]
+        self._run(c, self._synthetic(1.30, 55.0, waters))
+        assert c.thermal_tau_h is None, "tau moved before the run finished"
+        assert c.thermal_tau_n == 0
+
+    def test_the_completed_run_recovers_tau(self):
         c = _coord()
         waters = [20.0 + 0.5 * i for i in range(40)]     # 20 -> 39.5, ~19 K of gap
         self._run(c, self._synthetic(1.30, 55.0, waters))
+        c.finalise_thermal_run()
         assert c.thermal_tau_h == pytest.approx(55.0, rel=0.02)
-        assert c.thermal_tau_n > 0
+        assert c.thermal_tau_n == 1
+        assert c._thermal_points == [], "the points outlived the run"
+
+    def test_a_run_too_short_to_earn_a_fit_leaves_tau_alone(self):
+        c = _coord()
+        self._run(c, self._synthetic(1.30, 55.0, [20.0, 20.5, 21.0]))
+        c.finalise_thermal_run()
+        assert c.thermal_tau_h is None and c.thermal_tau_n == 0
 
     def test_a_recovers_alongside_it(self):
         c = _coord()
@@ -151,6 +170,7 @@ class TestLearningTauFromHeating:
         c = _coord()
         waters = [20.0 + 0.5 * i for i in range(40)]
         self._run(c, self._synthetic(1.30, 55.0, waters))
+        c.finalise_thermal_run()
         tau, a = c.thermal_tau_h, c.thermal_a
         c.reset_thermal_run()
         assert c._thermal_points == []
