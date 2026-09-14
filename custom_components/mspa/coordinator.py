@@ -1336,6 +1336,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.circulating_since = None
 
             heater_now_active = (heat_state == _HEAT_STATE_FULL)
+            if heater_now_active and not self._heat_was_active:
+                # Strictly before heating_since is set below, or scheduling_temp's
+                # stale-direction guard fires and there is nothing left to carry over.
+                # R3: the estimate must not step at handover merely because the heater
+                # changed state.
+                self.reanchor_for_direction_change()
             if heater_now_active and self.heating_since is None:
                 self.heating_since = datetime.now(timezone.utc)
             elif not heater_now_active:
@@ -1676,6 +1682,37 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.temp_anchor_target   = new_target
         self.temp_anchor_rising   = rising
         self._anchor_prev_reading = new_temp
+
+    def reanchor_for_direction_change(self) -> None:
+        """Carry the extrapolated position across a change of heating direction — R3.
+
+        The water does not move when the heater switches on; only the direction it is
+        about to move in does. But `scheduling_temp`'s guard on a stale direction
+        discards the whole extrapolation and falls back to the reported reading, which
+        throws away the position as well.
+
+        Measured on 10.09.2026: the scheduler planned from 18.0 °C, extrapolated down
+        through a thirteen-hour dwell. The instant the heater fired the guard returned
+        the raw 18.5, and the predicted finish jumped 24 minutes earlier — a handover
+        discontinuity between two callers of the same model, which is exactly what R3
+        exists to prevent.
+
+        So at the moment of the change the current estimate becomes the new anchor: the
+        position is kept, the direction is refreshed, and the guard no longer has a
+        stale anchor to reject. Called from the heater transition, before
+        `heating_since` is set, so the extrapolation still sees the old direction.
+        """
+        est = self.scheduling_temp()
+        if est is None:
+            return
+        prev = self.temp_anchor_temp
+        self.temp_anchor_time = datetime.now(timezone.utc)
+        self.temp_anchor_temp = est
+        self.temp_anchor_rising = True
+        _LOGGER.debug(
+            "Re-anchored at %.3f °C for the start of heating (was %.3f) — the "
+            "extrapolated position carries over so the estimate does not step",
+            est, prev if prev is not None else float("nan"))
 
     def shadow_eta(self):
         """Ready time from the shadow curve, or None outside a session.

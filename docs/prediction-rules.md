@@ -42,7 +42,15 @@ The scheduler, the live estimate and every replan call the same function with th
 parameters. There is no separate scheduling path.
 
 *Test:* at the instant a schedule hands over to heating, the predicted finish must not
-move. A jump at handover means two methods exist.
+move. A jump at handover means two methods exist — or, as on 10.09.2026, one method
+being fed two different answers to "how warm is the water".
+
+That case is worth keeping as the worked example. The scheduler planned from 18.0 °C,
+extrapolated down through a thirteen-hour dwell. The moment the heater fired,
+`scheduling_temp`'s guard on a stale *direction* discarded the whole extrapolation and
+returned the raw 18.5 reading, and the predicted finish jumped 24 minutes earlier. The
+water had not moved; only the direction it was about to move in had. The fix carries the
+position across the transition and refreshes only the direction.
 
 ## R4 — No frozen plans, no deferred revisions
 

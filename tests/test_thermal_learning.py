@@ -230,3 +230,77 @@ class TestDiagnostics:
     def test_no_air_means_no_chords_rather_than_wrong_ones(self):
         d = _coord(ambient_temp=None).thermal_diagnostics()
         assert d["chord_rates"] is None and d["asymptote_c"] is None
+
+
+class TestNoStepAtHandover:
+    """R3: the scheduler and Ready at share a method, so the predicted finish must not
+    move the instant the schedule hands over to heating.
+
+    Measured on 10.09.2026 before this was fixed: the scheduler planned from an
+    extrapolated 18.0 °C, and the moment the heater fired scheduling_temp's
+    stale-direction guard returned the raw 18.5 instead — 24 minutes of jump between
+    two callers of the same model.
+    """
+
+    def _coord_mid_dwell(self):
+        from datetime import datetime, timedelta, timezone
+        c = _coord()
+        now = datetime.now(timezone.utc)
+        c._last_data = {"water_temperature": "18.5", "filter": "on"}
+        c.temp_anchor_time = now - timedelta(hours=13)
+        c.temp_anchor_temp = 18.5
+        c.temp_anchor_rising = False
+        c.circulating_since = now - timedelta(hours=30)
+        c.heating_since = None
+        c.computed_cool_rate = 0.166
+        c._anchor_prev_reading = 18.5
+        c.temp_anchor_target = 39.0
+        # Once rising, scheduling_temp extrapolates at a bucket rate, so the bucket
+        # model's state has to be present even though nothing here is testing it.
+        c._band_stats = {}
+        c._band_observations = []
+        c.heat_rate_buckets = [1.14, 1.00, 0.89]
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c.ambient_baseline = 13.6
+        c.computed_heat_rate = 1.0
+        c.prediction_bias = 1.0
+        return c
+
+    def test_the_dwell_is_extrapolated_before_the_heater_starts(self):
+        c = self._coord_mid_dwell()
+        assert c.scheduling_temp() < 18.5, "the long dwell was not extrapolated at all"
+
+    def test_the_position_survives_the_direction_change(self):
+        """The water does not move when the heater switches on; only the direction
+        it is about to move in does."""
+        c = self._coord_mid_dwell()
+        before = c.scheduling_temp()
+        c.reanchor_for_direction_change()
+        from datetime import datetime, timezone
+        c.heating_since = datetime.now(timezone.utc)      # as the real transition does
+        after = c.scheduling_temp()
+        assert after == pytest.approx(before, abs=0.02), (
+            f"plan temperature stepped {before:.3f} -> {after:.3f} at handover")
+
+    def test_without_the_fix_the_guard_would_discard_it(self):
+        """Pins the defect this exists for: set heating_since without re-anchoring and
+        the guard falls back to the raw reading."""
+        from datetime import datetime, timezone
+        c = self._coord_mid_dwell()
+        before = c.scheduling_temp()
+        c.heating_since = datetime.now(timezone.utc)
+        assert c.scheduling_temp() == 18.5
+        assert before < 18.5
+
+    def test_the_new_anchor_faces_the_right_way(self):
+        c = self._coord_mid_dwell()
+        c.reanchor_for_direction_change()
+        assert c.temp_anchor_rising is True
+
+    def test_nothing_happens_when_there_is_no_estimate(self):
+        c = _coord()
+        c._last_data = {}
+        c.temp_anchor_temp = None
+        c.reanchor_for_direction_change()
+        assert c.temp_anchor_temp is None
