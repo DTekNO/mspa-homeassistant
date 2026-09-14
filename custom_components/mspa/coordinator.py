@@ -8,11 +8,12 @@ from .thermal import (
     DEFAULT_TAU_H,
     TAU_ALPHA,
     ThermalModel,
+    a_at_fixed_tau,
+    fit_run,
     a_from_heating,
     blend,
     implied_litres,
     implied_loss_w_per_k,
-    tau_from_cooling,
 )
 from .predictor import (
     HEAT_BUCKET_LEARN_MAX,
@@ -319,6 +320,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # found and edited. Declaring immutable defaults here means a new instance
     # attribute cannot silently become thirty-four failures again.
     _thermal_fallback_active: bool = False
+    # None, not [], and deliberately. A mutable class default is shared by every
+    # instance, so the fixtures that build coordinators with object.__new__ would all
+    # append to one list — which is exactly what happened, and what the tests caught.
+    _thermal_points: list | None = None
     thermal_a: float | None = None
     thermal_tau_h: float | None = None
     thermal_a_n: int = 0
@@ -522,6 +527,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # docs/thermal-model.md. None until the first observation, at which point the
         # seed is replaced outright rather than blended towards.
         self._thermal_fallback_active = False
+        self._thermal_points: list[tuple[float, float]] = []
         self.thermal_a: float | None = None
         self.thermal_tau_h: float | None = None
         self.thermal_a_n: int = 0
@@ -1332,6 +1338,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._session_scalar = 1.0
                     self._session_scalar_bucket = None
                     self._session_fresh_buckets = set()
+                    # A new run measures a new water volume, so its crossings start
+                    # fresh. `A` and `tau` carry over as the running estimate; only the
+                    # points this run will fit against are cleared.
+                    self.reset_thermal_run()
                     _LOGGER.debug(
                         "MSpa: new heating session (delta %.1f°C) — session scalar reset",
                         delta_to_target,
@@ -3173,7 +3183,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # Every accepted crossing counts, not only a whole band, so `A` is
                 # available minutes into a run rather than hours.
                 if accepted and elapsed_hours > 0:
-                    self.learn_thermal_a(
+                    self.learn_from_crossing(
                         rate, (self._rate_last_temp + curr_temp) / 2.0,
                         self._window_ambient())
 
@@ -3242,11 +3252,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     delta = curr_temp - self._cool_last_temp
                     if delta < 0:  # temperature actually dropped
                         rate = -delta / elapsed_hours  # positive °C/h
-                        # Cooling is where tau is measured: no heater term, so the
-                        # sample cannot be contaminated by power or volume.
-                        self.learn_thermal_tau(
-                            self._cool_last_temp, curr_temp,
-                            self.ambient_temp, elapsed_hours)
                         if _MIN_COOL_RATE <= rate <= _MAX_COOL_RATE:
                             if self.computed_cool_rate is None:
                                 self.computed_cool_rate = rate
@@ -3425,42 +3430,63 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return None
         return self.thermal_model().heating_minutes(from_temp, to_temp, air)
 
-    def learn_thermal_a(self, rate, water_mean, ambient) -> None:
-        """One heating crossing: A = rate + gap/tau.
+    def learn_from_crossing(self, rate, water_mean, ambient) -> None:
+        """One heating crossing. Both parameters come from here — R2, heating only.
 
-        Available from the first 0.5 °C step of a run rather than after a whole band,
-        which is what the session scalar was reaching for and never achieved because it
-        froze after its source bucket.
+        The run's crossings accumulate as (gap, rate) pairs. `A` is the intercept and is
+        constrained by a single point, so it updates every crossing. `tau` is the slope
+        and needs a lever: it updates only once the run has swung far enough in gap
+        (R6), because a short lever gives a confident wrong answer silently — fitted on
+        the first eight crossings of 11.09.2026 the slope says 18 h, and on all forty it
+        says 65.6 h.
         """
-        model = self.thermal_model()
-        sample = a_from_heating(rate, water_mean, ambient, model.tau_h)
+        if None in (rate, water_mean, ambient):
+            return
+        gap = water_mean - ambient
+        # R7: a crossing implying an impossible `A` is discarded here, before it can
+        # enter the run's points. Rejecting it later would be too late — it would
+        # already be inside the average and the slope.
+        if a_from_heating(rate, water_mean, ambient, self.thermal_model().tau_h) is None:
+            _LOGGER.debug(
+                "Thermal: crossing rejected (rate %.3f at gap %.1f implies an "
+                "impossible A)", rate, gap)
+            return
+        if self._thermal_points is None:
+            self._thermal_points = []
+        self._thermal_points.append((gap, rate))
+
+        fitted_a, fitted_tau = fit_run(self._thermal_points)
+        if fitted_tau is not None:
+            prev = self.thermal_tau_h
+            self.thermal_tau_h = blend(prev, fitted_tau, TAU_ALPHA)
+            self.thermal_tau_n += 1
+            _LOGGER.info(
+                "Thermal tau: run slope over %d crossings spanning %.1f K → "
+                "%.1f h (sample %.1f) [n=%d]",
+                len(self._thermal_points),
+                max(g for g, _ in self._thermal_points)
+                - min(g for g, _ in self._thermal_points),
+                self.thermal_tau_h, fitted_tau, self.thermal_tau_n)
+
+        # A from the whole run at the tau now in force. Averaging the per-crossing value
+        # rather than taking the line's intercept means one crossing is enough and no
+        # slope is implied from a lever too short to carry one.
+        sample = (fitted_a if fitted_tau is not None
+                  else a_at_fixed_tau(self._thermal_points, self.thermal_model().tau_h))
         if sample is None:
             return
-        prev = self.thermal_a
-        self.thermal_a = blend(prev, sample, A_ALPHA)
+        self.thermal_a = blend(self.thermal_a, sample, A_ALPHA)
         self.thermal_a_n += 1
         litres = implied_litres(self.thermal_a, self.heater_power_heat_w)
         _LOGGER.info(
-            "Thermal A: sample %.3f (rate %.3f, gap %.1f, tau %.1f) → %.3f °C/h "
-            "[n=%d%s]", sample, rate, water_mean - ambient, model.tau_h,
-            self.thermal_a, self.thermal_a_n,
+            "Thermal A: %.3f °C/h from %d crossing(s) (rate %.3f at gap %.1f, "
+            "tau %.1f) [n=%d%s]", self.thermal_a, len(self._thermal_points),
+            rate, gap, self.thermal_model().tau_h, self.thermal_a_n,
             f", ≈{litres:.0f} L" if litres else "")
 
-    def learn_thermal_tau(self, from_temp, to_temp, ambient, hours) -> None:
-        """One cooling crossing.
-
-        The anchor of the whole model: no heater term, so this measurement cannot be
-        contaminated by heater power, water volume, or anything the user configured.
-        """
-        sample = tau_from_cooling(from_temp, to_temp, ambient, hours)
-        if sample is None:
-            return
-        self.thermal_tau_h = blend(self.thermal_tau_h, sample, TAU_ALPHA)
-        self.thermal_tau_n += 1
-        _LOGGER.info(
-            "Thermal tau: sample %.1f h (%.1f→%.1f °C over %.2f h at %.1f °C) → %.1f h "
-            "[n=%d]", sample, from_temp, to_temp, hours, ambient,
-            self.thermal_tau_h, self.thermal_tau_n)
+    def reset_thermal_run(self) -> None:
+        """Start a fresh set of crossings. `A` and `tau` carry over; the points do not."""
+        self._thermal_points = []
 
     def thermal_diagnostics(self) -> dict:
         """What the model currently believes, for the diagnostic sensor."""

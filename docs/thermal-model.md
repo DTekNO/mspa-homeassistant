@@ -29,16 +29,14 @@ returning a large number.
 They behave differently, and that difference is the whole design.
 
 **`τ` is a property of the spa.** Insulation, cover, surface area. It moves with the
-seasons at most. Critically it can be measured **while the spa is cooling**, where the
-heater term is absent entirely:
+seasons at most. It is the **slope** of rate against gap, so it needs a run that swings
+far enough in gap to constrain a slope — see R6 in [the rules](prediction-rules.md).
 
-```
-dT/dt = −(T_water − T_air)/τ
-```
-
-That is the cleanest measurement in the system. It needs no assumption about heater
-power, water volume, or anything the user configured. The spa cools whenever it is not
-heating, so this evidence accumulates for free and continuously.
+Cooling would measure it more cleanly, since the heater term vanishes. That route is
+deliberately not used: most installations never let the tub cool for days, so a model
+calibrating from cooling would never calibrate at all. `tau_from_cooling` remains in the
+module as an *independent check* on a value learned from heating — two routes to one
+physical quantity, from data with no overlap.
 
 **`A` moves with the water level.** Rain adds water, surplus gets removed, and `A` moves
 with it — measured across five weeks of this installation's own traverses it ranged 1.23
@@ -50,21 +48,16 @@ slowly, which is why a rainy fortnight could contaminate the loss term for weeks
 
 ## The three rules
 
-**1. Learn.** Every 0.5 °C crossing while heating gives a rate and a gap. One
-subtraction gives an estimate of `A`:
+**1. Learn, from heating only.** Every 0.5 °C crossing gives a `(gap, rate)` pair.
+Across a run those pairs are a line: its **intercept is `A`** and its **slope is −1/τ**.
 
-```
-A = rate + gap/τ
-```
+`A` updates every crossing, because one point constrains an intercept. `τ` updates only
+once the run's crossings span at least `TAU_MIN_GAP_SPREAD_K` of gap, because a short
+lever gives a confident wrong answer: on 11.09.2026 the first eight crossings imply
+18 h and all forty imply 65.6 h.
 
-Every crossing while cooling gives an estimate of `τ`:
-
-```
-τ = Δt / ln( (T_start − T_air) / (T_end − T_air) )
-```
-
-Both are smoothed. `A` is smoothed fast because it is tracking today; `τ` slowly because
-it is tracking the spa.
+Both are smoothed into the running estimate — `A` fast because it tracks today, `τ`
+slowly because it tracks the spa.
 
 **2. Correct for temperature.** `T_air` is an input to the equation, not a correction
 bolted on outside it. When predicting hours ahead, use the forecast average over the
@@ -104,7 +97,7 @@ from a default and are replaced by measurement:
 
 | | seed | source |
 |---|---|---|
-| `τ` | 55 h | measured on this installation three ways from 101 cooling hours: per-step median 61.3, pooled 53.6, slope-through-origin 54.7 |
+| `τ` | 55 h | measured on this installation two independent ways: 101 cooling hours give 61.3 / 53.6 / 54.7 by three methods, and the forty crossings of the 11.09.2026 heat-up give 65.6 |
 | `A` | 1.30 °C/h | the mean of eight measured band traverses, which spanned 1.23–1.37 |
 
 The seed for `A` implies roughly 1450 litres at 2200 W, which is the right order for a

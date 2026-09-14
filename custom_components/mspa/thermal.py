@@ -30,6 +30,17 @@ A_MIN, A_MAX = 0.3, 4.0
 A_ALPHA = 0.35
 TAU_ALPHA = 0.10
 
+# R6: tau only updates from a run whose crossings span at least this much water/air gap.
+#
+# The number is measured, not chosen for neatness. Fitted on the first eight crossings of
+# the 11.09.2026 run — a 4.9 K spread — the slope gives tau = 18 h. The same run's forty
+# crossings, spanning 17.2 K, give 65.6 h, which agrees with an independent cooling
+# measurement. A short lever produces a confident wrong answer and does it silently, so
+# the guard is on the lever rather than on the result.
+TAU_MIN_GAP_SPREAD_K = 12.0
+# Fewer points than this is a fit to noise however wide the spread looks.
+TAU_MIN_POINTS = 10
+
 # Below this the gap is small enough that measurement noise dominates the logarithm.
 _MIN_GAP_C = 1.0
 # A sample shorter than this is mostly quantisation: the reading moves in 0.5 °C steps.
@@ -114,12 +125,71 @@ def a_from_heating(rate_c_per_h: float, water_mean: float, air: float,
     return a if A_MIN <= a <= A_MAX else None
 
 
+def fit_run(points):
+    """Fit `A` and `tau` from one run's (gap, rate) crossings — R2, heating only.
+
+    Returns `(a, tau_h)`. `tau_h` is None when the run has not yet swung far enough in
+    gap to constrain the slope (R6); `a` is still returned, because the intercept is
+    constrained by a single point and is the parameter that moves between runs.
+
+    Both are None when there is nothing usable at all.
+    """
+    pts = [(g, r) for g, r in (points or []) if g is not None and r is not None]
+    if not pts:
+        return None, None
+    n = len(pts)
+    if n == 1:
+        return (pts[0][1] if A_MIN <= pts[0][1] <= A_MAX else None), None
+    gaps = [g for g, _ in pts]
+    spread = max(gaps) - min(gaps)
+    sx = sum(gaps); sy = sum(r for _, r in pts)
+    sxx = sum(g * g for g in gaps); sxy = sum(g * r for g, r in pts)
+    den = n * sxx - sx * sx
+    if den <= 0:
+        return None, None
+    slope = (n * sxy - sx * sy) / den
+    a = (sy - slope * sx) / n
+
+    tau = None
+    if n >= TAU_MIN_POINTS and spread >= TAU_MIN_GAP_SPREAD_K and slope < 0:
+        t = -1.0 / slope
+        if TAU_MIN_H <= t <= TAU_MAX_H:
+            tau = t
+    if tau is None:
+        # Not enough lever for the slope, so do not let a bad slope drag the intercept
+        # with it: hold the intercept to what the points say at their own mean gap.
+        a = None
+    if a is not None and not (A_MIN <= a <= A_MAX):
+        a = None
+    return a, tau
+
+
+def a_at_fixed_tau(points, tau_h):
+    """`A` from one run's crossings with `tau` held — the every-crossing estimator.
+
+    Used while a run has not yet earned a `tau` of its own (R6). Averaging the
+    per-crossing `A` rather than fitting a line means one crossing is enough and no
+    slope is implied from a lever too short to support one.
+    """
+    if not points or not tau_h:
+        return None
+    vals = [r + g / tau_h for g, r in points
+            if g is not None and r is not None and A_MIN <= r + g / tau_h <= A_MAX]
+    return sum(vals) / len(vals) if vals else None
+
+
 def tau_from_cooling(from_temp: float, to_temp: float, air: float,
                      hours: float) -> float | None:
     """`tau` implied by one cooling observation.
 
-    No heater term, so this measurement is independent of heater power, water volume and
-    everything the user configured. It is the anchor the rest of the model hangs from.
+    **Deliberately not wired into learning** — see R2 in docs/prediction-rules.md. Most
+    installations never let the tub cool for long enough to produce one of these, so a
+    model that calibrated from cooling would never calibrate at all on a normal spa.
+    `tau` is learned from the slope of a heat-up instead.
+
+    Kept because it is the one measurement of `tau` with no heater term in it, which
+    makes it the independent check on a value learned from heating: two routes to the
+    same physical quantity, from data with no overlap.
     """
     if None in (from_temp, to_temp, air, hours):
         return None
