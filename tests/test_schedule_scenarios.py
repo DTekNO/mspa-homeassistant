@@ -128,11 +128,15 @@ class MockCoordinator:
     # what a fresh installation does.
     _thermal_fallback_active = False
     thermal_a = None
+    # No forecast in these scenarios, so the piecewise walk short-circuits
+    # and the flat air temperature is used — which is what they assert on.
+    _forecast_rows = []
     thermal_tau_h = None
     thermal_a_n = 0
     thermal_tau_n = 0
     heating_minutes = MSpaUpdateCoordinator.heating_minutes
     thermal_minutes = MSpaUpdateCoordinator.thermal_minutes
+    forecast_segments = MSpaUpdateCoordinator.forecast_segments
     thermal_model = MSpaUpdateCoordinator.thermal_model
     live_ambient_for = MSpaUpdateCoordinator.live_ambient_for
     forecast_ambient_for = MSpaUpdateCoordinator.forecast_ambient_for

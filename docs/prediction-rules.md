@@ -57,10 +57,18 @@ three hours wrong eleven hours later, far too late to act on.
 A prediction covering future hours uses the forecast for **those** hours, not the
 temperature outside now.
 
-Under the thermal model this is integration over the forecast. If a bucket-style model is
-ever used again, each band must be priced with the forecast average **for the period that
-band is expected to occupy** — computed by walking forward, not by averaging the whole
-run once.
+Under the thermal model this is a forward walk through the forecast's own blocks, each
+integrated in closed form at its own temperature and the water carried into the next.
+Boundaries are solved inside a block rather than apportioned across one: a run finishing
+ninety minutes into a six-hour block is charged ninety minutes of it, and a run beginning
+two hours into a block is charged the four that remain. If a bucket-style model is ever
+used again, each band must be priced the same way — with the forecast for the period that
+band is expected to occupy, walked forward, not averaged once over the whole run.
+
+A forecast that does not reach the finish returns no answer rather than an extrapolated
+one (R9), and a forecast whose first usable block is more than a couple of hours away is
+treated as no forecast at all — holding one instantaneous reading across a long gap is
+the failure this rule exists to prevent.
 
 *Why:* an overnight run starting at 22:00 and finishing at 09:00 is planned while the air
 is still falling and finishes after dawn. The reading at commit time describes neither

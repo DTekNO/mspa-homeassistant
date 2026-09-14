@@ -93,6 +93,11 @@ import time
 from homeassistant.const import ATTR_STATE, ATTR_TEMPERATURE
 
 
+# How far ahead a forecast's first usable row may sit before the current reading
+# stops being a reasonable stand-in for the interval. Beyond this there is no
+# usable forecast at all and the flat path answers instead.
+_FORECAST_MAX_BRIDGE_H = 2.0
+
 _LOGGER = logging.getLogger(__name__)
 
 # Rate-sampling constants (heating and cooling trackers).
@@ -3423,12 +3428,79 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self.thermal_tau_h if self.thermal_tau_h is not None else DEFAULT_TAU_H,
         )
 
+    def forecast_segments(self, start_utc=None, max_hours=48.0):
+        """The forecast as [(duration_hours, air_c)] from `start_utc` onward — R5.
+
+        Built from the forecast's own rows, so the segment lengths are whatever the
+        weather integration provides — hourly for most, six-hourly or daily for some.
+        The first segment is trimmed to begin at `start_utc` rather than at the row
+        boundary, which is the case the averaging approach gets wrong: a run beginning
+        two hours into a six-hour block should be priced on the four hours it will
+        actually spend there.
+
+        The current reading is prepended as a short bridging segment when the forecast's
+        first row starts later than now, so the opening minutes are priced on what is
+        outside rather than on what is expected an hour hence.
+        """
+        rows = getattr(self, "_forecast_rows", None)
+        if not rows:
+            return []
+        start = start_utc or dt_util.utcnow()
+        if not isinstance(start, datetime):
+            # Segments are placed in time, so without a real clock there are none to
+            # place. Callers fall back to a flat air temperature, which is the same
+            # thing this returns for an installation with no forecast at all.
+            return []
+        out, total = [], 0.0
+        for i, (when, temp) in enumerate(rows):
+            nxt = rows[i + 1][0] if i + 1 < len(rows) else None
+            end = nxt if nxt is not None else when + timedelta(hours=1)
+            if end <= start:
+                continue
+            begin = max(when, start)
+            hours = (end - begin).total_seconds() / 3600.0
+            if hours <= 0:
+                continue
+            if not out and begin > start and self.ambient_temp is not None:
+                # Bridge the gap between now and the first row we can use, but only a
+                # short one. A forecast whose first usable row is hours away is stale or
+                # misaligned, and holding the current reading across that gap would
+                # quietly price most of a run on a single instantaneous measurement —
+                # the very thing R5 exists to prevent.
+                bridge = (begin - start).total_seconds() / 3600.0
+                if bridge > _FORECAST_MAX_BRIDGE_H:
+                    return []
+                if bridge > 0:
+                    out.append((bridge, self.ambient_temp))
+                    total += bridge
+            out.append((hours, temp))
+            total += hours
+            if total >= max_hours:
+                break
+        return out
+
     def thermal_minutes(self, from_temp, to_temp, *, ambient=None) -> float | None:
-        """Minutes to heat, under the thermal model. None when out of reach."""
+        """Minutes to heat, under the thermal model.
+
+        Walks the forecast segment by segment where one is available (R5), so a run
+        spanning dawn is priced against the curve it will meet rather than against a
+        single average of it. Falls back to a flat air temperature when there is no
+        forecast, or when the run runs off the end of the one there is.
+
+        `ambient` overrides the air used for the flat fallback. It does not suppress the
+        piecewise walk: a caller passing a forecast mean wants the best answer
+        available, and segments are strictly better than their own average.
+        """
+        model = self.thermal_model()
+        segments = self.forecast_segments()
+        if segments:
+            minutes = model.heating_minutes_piecewise(from_temp, to_temp, segments)
+            if minutes is not None:
+                return minutes
         air = ambient if ambient is not None else self.ambient_temp
         if air is None:
             return None
-        return self.thermal_model().heating_minutes(from_temp, to_temp, air)
+        return model.heating_minutes(from_temp, to_temp, air)
 
     def learn_from_crossing(self, rate, water_mean, ambient) -> None:
         """One heating crossing. Both parameters come from here — R2, heating only.

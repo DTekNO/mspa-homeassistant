@@ -100,6 +100,50 @@ class ThermalModel:
             return None
         return self.tau_h * math.log((from_temp - air) / (to_temp - air)) * 60.0
 
+    def heating_minutes_piecewise(self, from_temp: float, to_temp: float,
+                                  air_segments) -> float | None:
+        """Minutes to heat, walking forward through a changing air temperature — R5.
+
+        `air_segments` is an iterable of `(duration_hours, air_c)` covering the run in
+        order, oldest first. Each is integrated in closed form at its own air
+        temperature and the water carried into the next, so a run that starts before
+        dawn and finishes in the afternoon is priced against the curve it will actually
+        meet rather than against one average of it.
+
+        Boundaries are handled by solving within a segment rather than by apportioning
+        an average across one. In each segment the time to reach the target is known
+        exactly; if it fits, the answer is that time plus everything already elapsed,
+        and if it does not, the water is advanced to the segment's end and the walk
+        continues. A run finishing ninety minutes into a six-hour block therefore costs
+        ninety minutes of that block, not a quarter of its average.
+
+        None when the run cannot finish inside the segments supplied — the caller knows
+        how far ahead its forecast reaches and a number beyond that would be invented.
+        """
+        if from_temp is None or to_temp is None:
+            return None
+        if to_temp <= from_temp:
+            return 0.0
+        water = from_temp
+        elapsed_h = 0.0
+        for hours, air in air_segments:
+            if hours is None or air is None or hours <= 0:
+                continue
+            s = self.asymptote(air)
+            if s > to_temp:
+                # Time to reach the target at this air temperature, if it fits here.
+                need = self.tau_h * math.log((s - water) / (s - to_temp))
+                if need <= hours:
+                    return (elapsed_h + need) * 60.0
+            if s > water:
+                # Advance to the end of the segment: exponential approach to `s`.
+                water = s - (s - water) * math.exp(-hours / self.tau_h)
+            # s <= water: the spa is losing ground in this segment; the water is held
+            # rather than allowed to fall, because the heater is on and the model's
+            # cooling branch is not what a stalled heat-up does.
+            elapsed_h += hours
+        return None
+
     def chord_rates(self, midpoints, air: float):
         """The bucket view: mean °C/h across each band, derived rather than stored.
 
