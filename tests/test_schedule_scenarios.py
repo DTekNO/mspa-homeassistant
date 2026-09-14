@@ -1256,10 +1256,17 @@ class TestSchedulingTemp:
         c._last_data["water_temperature"] = "unavailable"
         assert c.scheduling_temp() is None
 
-    def test_never_leaves_the_band_even_with_an_absurd_rate(self):
-        """Belt and braces: a corrupt rate must not move the estimate out of the band."""
+    def test_an_absurd_rate_is_refused_rather_than_clamped(self):
+        """A corrupt rate must not move the estimate out of the band.
+
+        It used to be clamped to the band edge and returned. Now the staleness guard
+        gets there first: at 99 °C/h a band takes eighteen seconds, so an anchor minutes
+        old is many bands past its own prediction and the projection is refused outright.
+        The reading is the stronger answer — 32.75 was the band edge asserted from a rate
+        already known to be nonsense, and only the clamp made it look reasonable.
+        """
         c = self._coord(computed_cool_rate=99.0)
-        assert c.scheduling_temp() == pytest.approx(32.75)
+        assert c.scheduling_temp() == pytest.approx(33.0)
 
 
 class TestStartTimeRampsInsteadOfLumping:

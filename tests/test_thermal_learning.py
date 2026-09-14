@@ -242,12 +242,21 @@ class TestNoStepAtHandover:
     two callers of the same model.
     """
 
-    def _coord_mid_dwell(self):
+    def _coord_mid_dwell(self, hours=2.0):
+        """A cooling dwell whose anchor is `hours` old.
+
+        Two hours by default, not the thirteen this was first written with. At
+        0.166 °C/h a band takes three hours, so thirteen is four bands of nothing
+        crossing and `scheduling_temp`'s staleness guard now — correctly — refuses to
+        extrapolate it at all. Two hours is a live dwell: the projection has travelled
+        a third of a degree and has not yet saturated, which is the state this class is
+        about. The thirteen-hour case has tests of its own below.
+        """
         from datetime import datetime, timedelta, timezone
         c = _coord()
         now = datetime.now(timezone.utc)
         c._last_data = {"water_temperature": "18.5", "filter": "on"}
-        c.temp_anchor_time = now - timedelta(hours=13)
+        c.temp_anchor_time = now - timedelta(hours=hours)
         c.temp_anchor_temp = 18.5
         c.temp_anchor_rising = False
         c.circulating_since = now - timedelta(hours=30)
@@ -292,6 +301,30 @@ class TestNoStepAtHandover:
         c.heating_since = datetime.now(timezone.utc)
         assert c.scheduling_temp() == 18.5
         assert before < 18.5
+
+    def test_a_dwell_past_the_staleness_cap_is_not_extrapolated(self):
+        """10.09.2026 itself: nothing crossed for sixteen hours, so there is no
+        projection left to carry over and the reading is all we have."""
+        c = self._coord_mid_dwell(hours=16.4)
+        assert c.scheduling_temp() == 18.5
+
+    def test_the_stale_case_still_does_not_step_at_handover(self):
+        """R3 holds either way. Where the extrapolation is refused, both sides of the
+        handover refuse it, so they agree on the reading instead of on a guess."""
+        from datetime import datetime, timezone
+        c = self._coord_mid_dwell(hours=16.4)
+        before = c.scheduling_temp()
+        c.reanchor_for_direction_change()
+        c.heating_since = datetime.now(timezone.utc)
+        assert c.scheduling_temp() == pytest.approx(before, abs=0.02)
+
+    def test_the_reanchor_cannot_launder_a_stale_projection(self):
+        """The defect the cap closes: re-anchoring stamps a fresh timestamp on the
+        carried-over value, so a stale projection would become permanently young."""
+        c = self._coord_mid_dwell(hours=16.4)
+        c.reanchor_for_direction_change()
+        assert c.temp_anchor_temp == pytest.approx(18.5), (
+            "the band floor was laundered into a fresh anchor")
 
     def test_the_new_anchor_faces_the_right_way(self):
         c = self._coord_mid_dwell()

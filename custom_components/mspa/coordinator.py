@@ -187,6 +187,42 @@ _HEAT_STATE_NAMES = {0: "off", 1: "idle", 2: "preheat", 3: "heating", 4: "standb
 # accurate to half of it.
 _TEMP_BAND_C = 0.5
 
+# How long an anchor may be extrapolated from, as a multiple of the time one band
+# should take at the rate being extrapolated.
+#
+# `extrapolate_within_band` projects from the crossing that entered the band and clamps
+# the result to one band, and the clamp reads as a safety margin. It is not one. Once the
+# projection saturates, the model expected a crossing that has not arrived — and the
+# longer it sits at the edge the more confident it looks, because a clamped number
+# carries no sign of how long it has been clamped.
+#
+# Measured on 10.09.2026: the water crossed *down* through 18.5 at 02:39 and the reading
+# then sat there all day. At 18:50, when the heater fired, the extrapolation was still
+# projecting that 02:39 cooling rate — sixteen hours and twenty-four minutes on, of which
+# thirteen were spent saturated — and returned the band floor, 18.0. The water crossed
+# *up* through 19.0 thirteen minutes later, so the true temperature at handover was about
+# 18.9. The plan was built on a position 0.9 °C too cold and stayed built on it.
+#
+# A plain age cap was tried first and is wrong. Crossings during a genuine cooling dwell
+# are around three hours apart (17:27, 20:54, 23:53, 02:39 on 09-10.09.2026), so any cap
+# short enough to catch sixteen hours also fires inside an ordinary dwell — putting back
+# the lump the extrapolation exists to remove. What separates the two cases is not
+# elapsed time but how far past its own prediction the model has run, which is why this
+# is a multiple of the band-crossing time rather than a constant.
+#
+# At 3x: a 0.166 °C/h cooling dwell is trusted for nine hours and 10.09 is still caught
+# with most of a factor of two to spare; a heat-up at 1.14 °C/h is trusted for 79 minutes
+# against crossings every twenty-five to thirty. 2x was tried and is too tight at the
+# heating end, where a 45-minute gap between crossings is ordinary.
+#
+# Past the cap the fallback is the reported reading, like every other guard in
+# `scheduling_temp`. The reading is biased by up to half a band in whichever direction
+# the water was last moving, and the band centre would be the unbiased choice; the
+# reading wins anyway because it keeps all six guards answering the same way, and a
+# guard that invents a number no other guard invents is harder to reason about than a
+# quarter-degree of bias.
+_ANCHOR_MAX_AGE_BANDS = 3.0
+
 # Maps coordinator _pending_changes keys (transformed names) to their raw API
 # command dict keys.  Used to prune _pending_raw_command incrementally as each
 # pending change is confirmed, so that a retry payload never re-sends fields
@@ -1701,6 +1737,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         position is kept, the direction is refreshed, and the guard no longer has a
         stale anchor to reject. Called from the heater transition, before
         `heating_since` is set, so the extrapolation still sees the old direction.
+
+        What it must not do is launder a stale extrapolation into a fresh anchor. That
+        18.0 was itself the product of a sixteen-hour projection, and re-anchoring on it
+        stamped a new timestamp on an old guess — so `scheduling_temp`'s own age guard,
+        which would otherwise have caught it at the next poll, never saw it again. The
+        age cap lives inside `scheduling_temp`, so the value carried over here is already
+        the reading in that case and nothing is laundered.
         """
         est = self.scheduling_temp()
         if est is None:
@@ -1859,6 +1902,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
           direction since, making the recorded direction stale.
         * **Direction unknown** — the anchor came from a restart or a jump of more than
           one band, not from an observed crossing.
+        * **Stale anchor** — nothing has crossed in `_ANCHOR_MAX_AGE_BANDS` times the
+          time a band should take at this rate.  Past that the clamp is the band edge
+          asserted on no evidence, and it looks more confident the longer it sits there.
+          This is the guard that 10.09.2026 was missing.
         * **No learned rate** — nothing to extrapolate along.
         """
         try:
@@ -1900,6 +1947,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         rate = (self._predictor().bucket_rate(anc_temp) if rising
                 else self.computed_cool_rate)
         elapsed_h = (datetime.now(timezone.utc) - anc_t).total_seconds() / 3600.0
+        if rate:
+            max_age_h = _ANCHOR_MAX_AGE_BANDS * _TEMP_BAND_C / abs(rate)
+            if elapsed_h > max_age_h:
+                _LOGGER.debug(
+                    "scheduling_temp: nothing has crossed in %.1f h at %.3f °C/h, where "
+                    "a band takes %.1f h — the projection has been pinned at the edge "
+                    "long enough to be a guess, so using the reading %.1f",
+                    elapsed_h, rate, _TEMP_BAND_C / abs(rate), reading)
+                return reading
         est = extrapolate_within_band(anc_temp, elapsed_h, rate, cooling=not rising)
         if est is None:
             return reading
