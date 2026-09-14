@@ -24,10 +24,11 @@ which changes nothing for anyone who had it on.
 
   The replacement is one equation: the water heats at a rate set by the heater, minus a
   loss proportional to how far above the air it already is. Two numbers describe your
-  spa. One is the loss, which the integration measures **while the spa is cooling** —
-  where the heater is not involved at all, so it needs no assumption about power or water
-  volume. The other is the heater against the water it has to warm, measured live from
-  each run and updated within minutes of heating starting rather than hours.
+  spa — the standing loss, and the heater against the water it has to warm — and both are
+  measured **while the spa is heating**. Nothing is learned from a cool-down, because a
+  spa that is covered, topped up or simply used every day never provides one, and a model
+  that quietly depends on days of idle cooling works well for the owner who has it and
+  not at all for the owner who does not.
 
   The practical differences: outdoor temperature is now part of the calculation instead of
   a correction applied afterwards, so a cold night is priced correctly from the first
@@ -36,7 +37,12 @@ which changes nothing for anyone who had it on.
   next heat-up instead of contaminating the learned rates for weeks.
 
   A new spa starts from seeded values and replaces them with its own measurements, so
-  estimates are sensible from the first heat-up. The **Ambient learning** diagnostic
+  estimates are sensible from the first heat-up. On that very first run you will see
+  **Ready at hold still for roughly the first ninety minutes** before stepping once. That
+  is deliberate, not a stall: the water is reported in half-degree steps, so until three
+  crossings have passed there is no rate measured from your spa, and an estimate that
+  moved before then would only be reacting to rounding. From the second run onwards there
+  is a learned rate to start from and the hold never appears again. The **Ambient learning** diagnostic
   sensor gains a `thermal_model` attribute showing both parameters, how many samples are
   behind each, and the water volume and standing loss they imply — worth comparing
   against your spa's specification.
