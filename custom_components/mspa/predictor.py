@@ -64,11 +64,17 @@ TEMP_BAND_C = 0.5
 def extrapolate_within_band(anchor_temp, elapsed_hours, rate_c_per_h, *, cooling):
     """True-temperature estimate now, from the crossing that entered the current band.
 
-    At a crossing the true temperature is the threshold between the two reported
-    values, which is what `anchor_temp` records.  Afterwards it keeps moving while the
-    reported value stays put until the next threshold is reached, so between crossings
-    the position is unobserved.  Extrapolating at the known rate recovers it, which
-    turns the scheduler's per-crossing lump into a smooth ramp.
+    At a crossing the water is exactly at the threshold between the two reported
+    values, which is what `anchor_temp` records — labelled by the upper of the two, so
+    a reading of R means the water is in [R, R+0.5).  Afterwards it keeps moving while
+    the reported value stays put until the next threshold is reached, so between
+    crossings the position is unobserved.  Extrapolating at the known rate recovers it,
+    which turns the scheduler's per-crossing lump into a smooth ramp.
+
+    The labelling matters more than it looks: a plan predicts "the display shows 39.0",
+    not "the water reaches 39.0 °C", so labelling the start the same way the target is
+    labelled makes the quantiser's unknown offset cancel between the two ends.  See
+    MSpaUpdateCoordinator._update_temp_anchor.
 
     **The clamp to one band is a deduction, not a safety margin.** The reading has not
     changed, therefore the next threshold has not been crossed, therefore the drift

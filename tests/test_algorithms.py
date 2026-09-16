@@ -351,8 +351,8 @@ class TestTempAnchorOnlyMovesOnRealChange:
     Regression for a bug shipped 2026-08-11 and caught 2026-08-12 by noticing that the
     Heat Schedule sensor and the coordinator logged start times 6 min apart 30 s apart.
     Change detection compared the raw reading against `temp_anchor_temp`, which
-    band-centre anchoring had made a *midpoint* — so it never matched, the anchor
-    re-fired every poll, and `temp_anchor_time` reset each time.
+    threshold anchoring had made something other than a reading — so it never matched,
+    the anchor re-fired every poll, and `temp_anchor_time` reset each time.
 
     Three things broke together, silently, and none was visible from outside:
       * the half-step correction decayed geometrically back to the raw reading
@@ -380,20 +380,33 @@ class TestTempAnchorOnlyMovesOnRealChange:
         assert c.temp_anchor_time is anchored_at, "anchor time reset without a change"
         assert c.temp_anchor_temp == anchored_temp, "anchor drifted without a change"
 
-    def test_crossing_anchors_at_the_midpoint_of_the_two_readings(self):
+    def test_crossing_anchors_at_the_upper_of_the_two_readings(self):
+        """The threshold, labelled the way the target is labelled — see
+        _update_temp_anchor. 32.5 -> 32.0 crossed the boundary named 32.5."""
         c = self._coord()
         c._update_temp_anchor(32.5, 39.5)
         c._update_temp_anchor(32.0, 39.5)
-        assert c.temp_anchor_temp == pytest.approx(32.25)
+        assert c.temp_anchor_temp == pytest.approx(32.5)
 
-    def test_midpoint_does_not_decay_over_repeated_polls(self):
-        """The half-step correction is the whole point; it must not bleed away."""
+    def test_both_directions_name_the_same_threshold(self):
+        """A reversal must not move the water. Up through 32.5 and back down through it
+        are the same physical boundary, so they anchor identically."""
+        up = self._coord()
+        up._update_temp_anchor(32.0, 39.5)
+        up._update_temp_anchor(32.5, 39.5)
+        down = self._coord()
+        down._update_temp_anchor(32.5, 39.5)
+        down._update_temp_anchor(32.0, 39.5)
+        assert up.temp_anchor_temp == pytest.approx(down.temp_anchor_temp) == 32.5
+
+    def test_the_anchor_does_not_decay_over_repeated_polls(self):
+        """The correction is the whole point; it must not bleed away."""
         c = self._coord()
         c._update_temp_anchor(32.5, 39.5)
         c._update_temp_anchor(32.0, 39.5)
         for _ in range(50):
             c._update_temp_anchor(32.0, 39.5)
-        assert c.temp_anchor_temp == pytest.approx(32.25)
+        assert c.temp_anchor_temp == pytest.approx(32.5)
 
     def test_direction_follows_the_crossing(self):
         c = self._coord()
@@ -418,7 +431,7 @@ class TestTempAnchorOnlyMovesOnRealChange:
         assert c.temp_anchor_time is not first
         assert c.temp_anchor_target == 38.0
 
-    def test_a_jump_of_more_than_one_band_is_not_midpointed(self):
+    def test_a_jump_of_more_than_one_band_has_no_threshold(self):
         """Two bands at once means a reading was missed, so the threshold is unknown."""
         c = self._coord()
         c._update_temp_anchor(32.5, 39.5)
@@ -427,8 +440,9 @@ class TestTempAnchorOnlyMovesOnRealChange:
         assert c.temp_anchor_rising is None
 
     def test_estimate_stays_inside_the_readings_own_band(self):
-        """With the midpoint correct, the clamp bounds the estimate to +/-0.25 of the
-        reading — which is the guard that was asked for, and which the bug defeated."""
+        """A reading of R means the water is in [R, R+0.5), so the clamp must keep the
+        estimate there however long the anchor has been sitting — the guard that was
+        asked for, and which the re-anchoring bug defeated."""
         c = self._coord()
         c._update_temp_anchor(32.5, 39.5)
         c._update_temp_anchor(32.0, 39.5)
@@ -436,8 +450,20 @@ class TestTempAnchorOnlyMovesOnRealChange:
         for hours in (0.0, 0.5, 1.0, 2.0, 100.0):
             est = extrapolate_within_band(
                 c.temp_anchor_temp, hours, 0.36, cooling=not c.temp_anchor_rising)
-            assert reading - 0.25 - 1e-9 <= est <= reading + 0.25 + 1e-9, (
+            assert reading - 1e-9 <= est <= reading + 0.5 + 1e-9, (
                 f"estimate {est} left the band of reading {reading} after {hours} h")
+
+    def test_the_plan_and_the_target_are_labelled_the_same_way(self):
+        """Why the upper edge and not the mean. A plan predicts "the display shows
+        39.5", which is the threshold labelled 39.5; anchoring the start on the same
+        labelling makes the quantiser's unknown offset cancel between the two ends.
+        The midpoint shifted the start by a quarter step and left the target alone,
+        over-stating every run by 12-13 minutes in one direction."""
+        c = self._coord()
+        c._update_temp_anchor(38.5, 39.5)
+        c._update_temp_anchor(39.0, 39.5)
+        # One more crossing reaches the target, so exactly half a degree remains.
+        assert 39.5 - c.temp_anchor_temp == pytest.approx(0.5)
 
 
 class TestBucketsLearnOverABoundedSpan:

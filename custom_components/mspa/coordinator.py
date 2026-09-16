@@ -1674,23 +1674,43 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             )
 
     def _update_temp_anchor(self, new_temp, new_target) -> None:
-        """Re-anchor when the reading or target changes, at the band centre.
+        """Re-anchor when the reading or target changes, at the threshold just crossed.
 
         Sensors use (anchor_time, anchor_temp, anchor_target) to measure elapsed
         progress between reported temperature steps without keeping per-sensor state,
         and `scheduling_temp` extrapolates from it.  Both depend on the anchor moving
         *only* at a real change.
 
-        A reading change is a band crossing, and at that instant the true temperature is
-        the threshold *between* the two reported values — half a step from either.
-        Recording the new reading verbatim carries a systematic error whose sign depends
-        on direction: 0.25 °C high when warming, 0.25 °C low when cooling. At ~1 °C/h
-        that is a quarter-hour of ETA each way, and a full half hour across a cool-down
-        followed by a heat-up, which is what made Ready at and the scheduler disagree by
-        ~20 min at a session start.
+        A reading change is a band crossing, so at that instant the water is exactly at
+        the threshold between the two reported values — an exact position, which is the
+        whole reason to anchor there rather than on the reading alone. What the anchor
+        records is that threshold **labelled by the upper of the two readings**: an
+        up-crossing 18.5 -> 19.0 and a down-crossing 19.0 -> 18.5 both anchor at 19.0,
+        because they are the same physical threshold approached from either side. A
+        reading of R therefore means the water is somewhere in [R, R+0.5).
+
+        **The label is a choice, and only one choice is consistent with the target.**
+        We never learn where the threshold sits on a calibrated thermometer, and we do
+        not need to: what a plan predicts is not "the water reaches 39.0 °C" but "the
+        display shows 39.0", which is a threshold event carrying the label 39.0. Label
+        the start the same way and whatever offset the device's quantiser applies is the
+        same constant at both ends of the plan, so it cancels exactly.
+
+        This used to record the midpoint, `(new + prev) / 2`, on the reasoning that the
+        threshold lies half a step from either reading. That is true only if the device
+        rounds rather than truncates, it is unknowable from the outside, and it is the
+        wrong question: the midpoint shifts the start of the plan by a quarter step and
+        leaves the target where it was, so the offset stops cancelling. Replayed against
+        the dwell before 11.09.2026 it over-stated the run by a steady 12-13 minutes —
+        a quarter step priced at the cold end of the curve, always the same sign.
+
+        The residual error is the gap term `(water - air) / tau`, which does want an
+        absolute temperature. A quarter step there is 0.25/55 = 0.005 °C/h against an
+        `A` near 1.25 — 0.4%, well inside the noise on any single crossing.
 
         **Change detection compares readings with readings.** `temp_anchor_temp` is a
-        midpoint, so testing the reading against it never matches: the anchor re-fired
+        threshold rather than a reading, so testing the reading against it never
+        matches: the anchor re-fired
         on every poll, halving its way back toward the raw reading and resetting
         `temp_anchor_time` each time. That silently defeated three things at once — the
         half-step correction decayed away, elapsed-time measurement never accumulated,
@@ -1711,7 +1731,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if (prev is not None and new_temp is not None
                 and abs(new_temp - prev) <= _TEMP_BAND_C + 1e-9
                 and new_temp != prev):
-            anchored = (new_temp + prev) / 2.0
+            # The upper of the two, not the mean — see the docstring. Both directions
+            # name the same threshold, so a reversal does not move the anchor.
+            anchored = max(new_temp, prev)
             rising = new_temp > prev
         now = datetime.now(timezone.utc)
         shadow = getattr(self, "_shadow", None)
