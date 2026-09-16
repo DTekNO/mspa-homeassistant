@@ -370,6 +370,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     _thermal_chord: list | None = None
     _thermal_hold_finish: datetime | None = None
     _thermal_hold_target: float | None = None
+    newton_ready_source: str | None = None
+    newton_start_source: str | None = None
+    newton_decline_reason: str | None = None
     thermal_a: float | None = None
     thermal_tau_h: float | None = None
     thermal_a_n: int = 0
@@ -621,6 +624,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # ending at the scheduled time, not the one ending when heating would finish —
         # so it records its own source rather than borrowing the other's.
         self.newton_start_ambient_source: str = "now"
+        # Which model actually produced each shadow value, and why the physical one
+        # declined if it did. See _shadow_minutes.
+        self.newton_ready_source: str | None = None
+        self.newton_start_source: str | None = None
+        self.newton_decline_reason: str | None = None
         self.measured_outdoor_temp: float | None = None
         self._session_air_sum: float = 0.0
         self._session_air_n: int = 0
@@ -2438,6 +2446,59 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         return newton_heating_minutes(
             from_temp, to_temp, amb, fit["tau_h"], fit["asymptote_lift_c"])
 
+    def _newton_decline_reason(self, to_temp, ambient) -> str:
+        """Why the physical model would not answer, in words a history row can keep."""
+        fit = self.newton_fit()
+        if fit is None:
+            return "no fit yet — the physical model needs recorded band traverses"
+        air = ambient if ambient is not None else self.effective_ambient()[0]
+        if air is None:
+            return "no outdoor temperature"
+        asymptote = air + fit["asymptote_lift_c"]
+        if to_temp is not None and asymptote <= to_temp:
+            return (f"asymptote {asymptote:.1f} °C is at or below the target "
+                    f"{to_temp:.1f} °C")
+        return "the physical model declined"
+
+    def _shadow_minutes(self, from_temp, to_temp, ambient):
+        """Minutes for a shadow row, and the name of the model that produced them.
+
+        The physical model first, then the same chain the shipping estimate uses. This
+        used to return None the moment Newton declined, on the reasoning that a gap in
+        the history is the finding and a fallback would erase it. That was right while
+        these were diagnostics only. It stops being right the moment the physical model
+        becomes selectable for planning: a start time that reads `unknown` is not a
+        finding to whoever is relying on it to heat the tub.
+
+        The finding is preserved instead of erased — `newton_*_source` names the model
+        behind every row and `newton_decline_reason` says why Newton stood down, so the
+        gap is still there in the history, just readable and no longer a blank state.
+
+        Returns (minutes, source, decline_reason). `source` is None only when nothing
+        could answer at all, which is the one case that still has to show as unknown.
+        """
+        if from_temp is None or to_temp is None:
+            return None, None, None
+        minutes = self.newton_minutes(from_temp, to_temp, ambient=ambient)
+        if minutes is not None:
+            return minutes, PREDICTION_MODEL_NEWTON, None
+        reason = self._newton_decline_reason(to_temp, ambient)
+        minutes = self.thermal_minutes(from_temp, to_temp, ambient=ambient)
+        if minutes is not None:
+            return minutes, PREDICTION_MODEL_THERMAL, reason
+        # Guarded: this is the last link in the chain and it reaches into bucket state
+        # that a shadow row has no business depending on. A diagnostic that goes
+        # unavailable because the thing it observes threw is a diagnostic that loses
+        # exactly the run worth looking at.
+        try:
+            minutes = self._predictor(ambient).heating_minutes(from_temp, to_temp)
+        except Exception:                                    # noqa: BLE001
+            _LOGGER.debug("Shadow fallback: the bucket model threw", exc_info=True)
+            minutes = None
+        if minutes is not None:
+            return minutes, PREDICTION_MODEL_BUCKETS, reason
+        return None, None, reason
+
     def _update_newton_shadow(self, current_temp, current_target) -> None:
         """Recompute the physical model's shadow of Ready at and of the planned start.
 
@@ -2446,12 +2507,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         model, and reproducing them here would hide exactly the wandering this is meant
         to expose. What is compared is the estimate, not the presentation of it.
 
-        Both go to None whenever the model declines — too few traverses to fit, or an
-        asymptote at or below the target, which on a cold night is a real answer. A gap
-        in the history is the finding; a fallback would erase it.
+        When the physical model declines — too few traverses to fit, or an asymptote at
+        or below the target, which on a cold night is a real answer — the row falls back
+        down the same chain the shipping estimate uses, and `newton_ready_source` /
+        `newton_start_source` name what actually produced it. They used to go to None
+        instead, because a gap in the history was the finding and a fallback would erase
+        it; the source attribute keeps the finding without leaving a user-facing start
+        time blank, which matters now the model is becoming selectable. See
+        _shadow_minutes.
         """
         self.newton_ready_at = None
         self.newton_start_at = None
+        self.newton_ready_source = None
+        self.newton_start_source = None
         # The target the shadow was aiming at, and the temperature it planned from.
         # Recorded because without them a Ready-at row cannot be read: the shipping
         # sensor shows the *scheduled time verbatim* while a schedule is pending, so the
@@ -2481,7 +2549,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.newton_ambient_source = f"forecast_{kind}"
             else:
                 ambient, self.newton_ambient_source = self.effective_ambient()
-            minutes = self.newton_minutes(plan_temp, target, ambient=ambient)
+            minutes, source, reason = self._shadow_minutes(plan_temp, target, ambient)
+            self.newton_ready_source = source
+            if reason is not None:
+                self.newton_decline_reason = reason
+            elif source == PREDICTION_MODEL_NEWTON:
+                self.newton_decline_reason = None
             if minutes is not None:
                 self.newton_ready_at = (
                     datetime.now(timezone.utc) + timedelta(minutes=minutes))
@@ -2509,8 +2582,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.newton_start_ambient_source = f"forecast_{start_kind}"
             else:
                 start_amb, self.newton_start_ambient_source = self.effective_ambient()
-            minutes = self.newton_minutes(
-                plan_temp, self.schedule_target_temp, ambient=start_amb)
+            minutes, source, reason = self._shadow_minutes(
+                plan_temp, self.schedule_target_temp, start_amb)
+            self.newton_start_source = source
+            if reason is not None:
+                self.newton_decline_reason = reason
             if minutes is not None:
                 self.newton_start_at = due - timedelta(minutes=minutes)
 

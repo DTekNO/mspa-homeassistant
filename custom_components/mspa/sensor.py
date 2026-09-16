@@ -17,6 +17,7 @@ from .const import (
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
     DEFAULT_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_LOOKAHEAD_DAYS,
+    PREDICTION_MODEL_NEWTON,
 )
 from .entity import MSpaSensorEntity, MSpaBinarySensorEntity
 from .predictor import (
@@ -2064,6 +2065,14 @@ class _MSpaNewtonShadowSensor(MSpaSensorEntity):
             # Which ambient priced this row: the instant, or a forecast mean over the
             # rest of the run. It changes what the number means, so it travels with it.
             "ambient_source": getattr(c, self._ambient_source_attr, "now"),
+            # Which model produced this row. "newton" is the physical model answering
+            # for itself; anything else means it declined and the row fell back down
+            # the chain, with `fallback_reason` saying why. A blank state now means
+            # nothing could answer at all, rather than "Newton could not".
+            "source": getattr(c, self._source_attr, None),
+            "fallback_reason": (
+                None if getattr(c, self._source_attr, None) == PREDICTION_MODEL_NEWTON
+                else getattr(c, "newton_decline_reason", None)),
             # The asymptote in absolute terms is what decides reachability, so it is the
             # number that explains a None.
             # What this row aimed at, and from where. A Ready-at row cannot be read
@@ -2110,6 +2119,7 @@ class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
     _shadow_name = "Newton ready at"
     _shadow_slug = "newton_ready_at"
     _ambient_source_attr = "newton_ambient_source"
+    _source_attr = "newton_ready_source"
     _compare_with = "Ready at"
     _attr_icon = "mdi:function-variant"
 
@@ -2148,6 +2158,7 @@ class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
     _shadow_name = "Newton start at"
     _shadow_slug = "newton_start_at"
     _ambient_source_attr = "newton_start_ambient_source"
+    _source_attr = "newton_start_source"
     _compare_with = "Heat Schedule — the 'Start at' time, not Ready at"
     _attr_icon = "mdi:function-variant"
 

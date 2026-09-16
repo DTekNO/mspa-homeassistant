@@ -319,7 +319,14 @@ class TestTheSpecMakesItCheckable:
 class TestTheShadowRunsInParallel:
     """The physical model computes the same two things the bucket model decides — when
     the water is ready, and when a scheduled run must start — and decides neither. What
-    these protect is that it stays a shadow, and that a gap in the record is readable.
+    these protect is that it stays a shadow, and that a row is readable.
+
+    A decline used to leave the state blank, on the reasoning that a gap in the history
+    is the finding. That holds while these are diagnostics and stops holding the moment
+    the model becomes selectable for planning: a start time reading `unknown` is not a
+    finding to whoever is relying on it to heat the tub. The row now falls back down the
+    same chain the shipping estimate uses and records which model answered, so the
+    finding survives as data rather than as absence.
     """
 
     def _coord(self, *, fitted=True, target=39.5, scheduled=None, triggered=False,
@@ -328,9 +335,22 @@ class TestTheShadowRunsInParallel:
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         c = object.__new__(MSpaUpdateCoordinator)
         c._band_observations = _traverses(n=40, noise=0.02) if fitted else []
-        # No buckets by default, so "not fitted" means nothing to fall back on either.
-        # Seeding is exercised in TestBucketsCanPrimeTheModel.
-        c.heat_rate_buckets = buckets
+        # The fallback chain runs thermal then buckets, so both need enough state to
+        # answer or decline honestly.
+        c._band_stats = {}
+        c._session_scalar = 1.0
+        c._session_fresh_buckets = frozenset()
+        c.prediction_bias = 1.0
+        c.computed_heat_rate = None
+        c.config_entry = type("E", (), {"options": {"heater_power_heat": 2200}})()
+        c._thermal_points = []
+        c.thermal_a = c.thermal_tau_h = None
+        c.forecast_segments = lambda: None
+        c.newton_ready_source = c.newton_start_source = None
+        c.newton_decline_reason = None
+        # Empty buckets by default, so "not fitted" means the chain has nothing to fall
+        # back on either. Seeding is exercised in TestBucketsCanPrimeTheModel.
+        c.heat_rate_buckets = buckets if buckets is not None else (None, None, None)
         c.ambient_baseline = 18.4
         c.ambient_temp = ambient
         c.scheduled_ready_at = scheduled
@@ -372,18 +392,45 @@ class TestTheShadowRunsInParallel:
         assert c.newton_start_at is None
         assert c.newton_ready_at is not None, "but it is still heating towards something"
 
-    def test_no_fit_leaves_a_gap_rather_than_a_guess(self):
+    def test_a_fit_answers_for_itself(self):
+        c = self._coord()
+        c._update_newton_shadow(24.0, 39.5)
+        assert c.newton_ready_source == "newton"
+        assert c.newton_decline_reason is None
+
+    def test_no_fit_falls_back_and_says_so(self):
         c = self._coord(fitted=False)
         c._update_newton_shadow(24.0, 39.5)
-        assert c.newton_ready_at is None and c.newton_start_at is None
+        assert c.newton_ready_at is not None, "a blank start time is not a finding"
+        assert c.newton_ready_source != "newton"
+        assert "no fit yet" in c.newton_decline_reason
 
-    def test_an_unreachable_target_leaves_a_gap_too(self):
+    def test_an_unreachable_target_falls_back_and_says_why(self):
         """A cold enough night puts the asymptote below the setpoint. That is a real
-        answer from the model and the history should show it as absence, not as a
-        substituted number from somewhere else."""
+        answer from the model, and it stays in the record — as a reason attached to a
+        usable number, rather than as an absence indistinguishable from a missing fit."""
         c = self._coord(ambient=-40.0)
         c._update_newton_shadow(24.0, 39.5)
+        assert c.newton_ready_source != "newton"
+        assert "asymptote" in c.newton_decline_reason
+
+    def test_the_two_declines_are_told_apart(self):
+        """The whole reason the reason is recorded: no fit and an unreachable target
+        looked identical from outside when both were a blank state."""
+        no_fit = self._coord(fitted=False)
+        no_fit._update_newton_shadow(24.0, 39.5)
+        cold = self._coord(ambient=-40.0)
+        cold._update_newton_shadow(24.0, 39.5)
+        assert no_fit.newton_decline_reason != cold.newton_decline_reason
+
+    def test_nothing_at_all_still_shows_as_unknown(self):
+        """The one case that must stay blank: no model could answer, so there is no
+        number to show and inventing one would be worse than the gap."""
+        c = self._coord(fitted=False, ambient=None)
+        c.effective_ambient = lambda: (None, "none")
+        c._update_newton_shadow(24.0, 39.5)
         assert c.newton_ready_at is None
+        assert c.newton_ready_source is None
 
     def test_a_pending_schedule_aims_at_the_schedule_target(self):
         """Mirroring the shipping sensor's choice of target, so the two series are
