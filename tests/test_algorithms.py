@@ -423,12 +423,20 @@ class TestTempAnchorOnlyMovesOnRealChange:
         assert c.temp_anchor_rising is None
         assert c.temp_anchor_temp == pytest.approx(32.0)
 
-    def test_target_change_re_anchors(self):
+    def test_target_change_keeps_the_position(self):
+        """Only the target moved, so the water did not. Re-anchoring on the raw reading
+        here discarded the extrapolated position at the worst moment: the scheduler
+        sets the setpoint one poll after the heater, and on 17.09.2026 that turned a
+        carried-over 17.86 back into 17.5 — twenty minutes off the handover."""
         c = self._coord()
-        c._update_temp_anchor(32.0, 39.5)
-        first = c.temp_anchor_time
-        c._update_temp_anchor(32.0, 38.0)
-        assert c.temp_anchor_time is not first
+        c._update_temp_anchor(32.5, 39.5)
+        c._update_temp_anchor(32.0, 39.5)                 # a crossing: position 32.5
+        first_time, first_temp, rising = (
+            c.temp_anchor_time, c.temp_anchor_temp, c.temp_anchor_rising)
+        c._update_temp_anchor(32.0, 38.0)                 # target only
+        assert c.temp_anchor_time is first_time
+        assert c.temp_anchor_temp == first_temp
+        assert c.temp_anchor_rising is rising
         assert c.temp_anchor_target == 38.0
 
     def test_a_jump_of_more_than_one_band_has_no_threshold(self):

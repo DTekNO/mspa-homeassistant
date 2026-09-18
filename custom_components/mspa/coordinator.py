@@ -1734,6 +1734,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
 
         prev = self._anchor_prev_reading
+        if new_temp == prev and new_temp is not None:
+            # Only the target moved. The water did not, so the position and the time it
+            # was observed stand; re-anchoring on the raw reading threw away the
+            # extrapolated position exactly when it mattered — the scheduler commands
+            # the setpoint one poll after the heater, and on 17.09.2026 that turned a
+            # carried-over 17.86 back into 17.5 and cost the handover twenty minutes.
+            self.temp_anchor_target = new_target
+            return
         anchored = new_temp
         rising = None
         if (prev is not None and new_temp is not None
@@ -3608,6 +3616,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.ready_latched = False
         self.ready_latched_temp = None
         self.near_target   = False
+        # Before the heater command, so the very first Ready at poll after firing
+        # already shows this — not a stale-anchor estimate while heat_state catches up.
+        self.adopt_thermal_hold(target_utc, target_temp)
         try:
             # Always confirm the setpoint at the scheduled time regardless of current
             # state — the setpoint must match the schedule target even when no heating
@@ -3795,7 +3806,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """Start a fresh set of crossings. `A` and `tau` carry over; the points do not."""
         self._thermal_points = []
         self._thermal_chord = []
-        self.release_thermal_hold()
+        # Deliberately not release_thermal_hold(). This runs on the same poll the hold
+        # is set — the heater transition begins the hold and then resets the run a few
+        # lines later — so releasing here killed every hold within microseconds of its
+        # creation. Measured 17.09.2026: hold logged 14:43:53, display walking away
+        # from it by 14:44:55. The hold ends when `A` is learned, the heater stops, or
+        # the target moves, and clearing the points is none of those.
 
     def release_thermal_hold(self) -> None:
         """Stop holding the opening estimate. Idempotent."""
@@ -3835,12 +3851,36 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return None
         return self._thermal_hold_finish
 
+    def adopt_thermal_hold(self, finish_utc: datetime, target) -> None:
+        """Hold the opening estimate at a finish the scheduler has already committed to.
+
+        The scheduler fires because its plan says heating from now finishes at the
+        scheduled time. That number *is* the handover value — R3 says the live estimate
+        must show it, not a second opinion. Recomputing at the transition gave a second
+        opinion on 17.09.2026: the scheduler said 12:00, the transition said 12:18 from
+        the raw reading (the setpoint change one poll later had discarded the
+        extrapolated position), and the display showed 11:30 in between from a stale
+        anchor. Adopting the scheduler's finish makes all three the same number.
+        """
+        if (self.prediction_model != PREDICTION_MODEL_THERMAL
+                or self.thermal_a is not None or target is None):
+            return
+        self._thermal_hold_finish = finish_utc
+        self._thermal_hold_target = float(target)
+        _LOGGER.info(
+            "Thermal: holding the opening estimate at %s — the finish the scheduler "
+            "committed to — until the first %.1f °C chord completes",
+            finish_utc.isoformat(timespec="minutes"), THERMAL_CHORD_MIN_C)
+
     def begin_thermal_hold(self, from_temp, target) -> None:
         """Fix the opening estimate for the run about to start. See thermal_hold_finish."""
-        if (self.prediction_model != PREDICTION_MODEL_THERMAL
+        if (self._thermal_hold_finish is not None
+                or self.prediction_model != PREDICTION_MODEL_THERMAL
                 or self.thermal_a is not None
                 or from_temp is None or target is None
                 or float(target) <= float(from_temp)):
+            # A hold already set by the scheduler is the plan it committed to; a
+            # recomputation at the transition must not replace it — R3.
             return
         minutes = self.heating_minutes(float(from_temp), float(target))
         if minutes is None:

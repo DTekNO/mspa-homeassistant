@@ -154,6 +154,51 @@ class TestTheOpeningEstimateIsHeld:
         assert c._thermal_hold_finish is None
 
 
+class TestTheHoldSurvivesTheTransition:
+    """17.09.2026: the hold was logged at 14:43:53 and the display had left it by
+    14:44:55. The heater transition begins the hold and then, a few lines later on the
+    same poll, resets the run for the new session — and reset released the hold."""
+
+    def _held(self):
+        c = _coord()
+        c.heating_since = datetime.now(timezone.utc)
+        c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
+        c._thermal_hold_target = 39.0
+        return c
+
+    def test_resetting_the_run_does_not_release_it(self):
+        c = self._held()
+        c.reset_thermal_run()
+        assert c.thermal_hold_finish(39.0) is not None
+
+    def test_the_transition_does_not_overwrite_the_schedulers_hold(self):
+        """The scheduler's finish is the plan it committed to; a recomputation at the
+        transition — from a position the setpoint change may just have discarded — is
+        a second opinion and must lose."""
+        c = self._held()
+        c.config_entry = type("E", (), {"options": {
+            "heater_power_heat": 2200, "prediction_model": "thermal"}})()
+        theirs = c._thermal_hold_finish
+        c.begin_thermal_hold(17.5, 39.0)
+        assert c._thermal_hold_finish is theirs
+
+    def test_adopting_sets_exactly_the_schedulers_finish(self):
+        c = _coord()
+        c.config_entry = type("E", (), {"options": {
+            "heater_power_heat": 2200, "prediction_model": "thermal"}})()
+        c.heating_since = datetime.now(timezone.utc)
+        due = datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc)
+        c.adopt_thermal_hold(due, 39.0)
+        assert c.thermal_hold_finish(39.0) == due
+
+    def test_adopting_with_a_learned_rate_is_a_no_op(self):
+        c = _coord(thermal_a=1.25)
+        c.config_entry = type("E", (), {"options": {
+            "heater_power_heat": 2200, "prediction_model": "thermal"}})()
+        c.adopt_thermal_hold(datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc), 39.0)
+        assert c._thermal_hold_finish is None
+
+
 class TestBeginningTheHold:
 
     def _fresh(self):

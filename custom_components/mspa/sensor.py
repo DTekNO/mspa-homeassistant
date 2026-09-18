@@ -344,6 +344,19 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
     heating plus a 2-minute margin, the anchor is stale and the ETA is pushed
     forward proportionally to communicate slower-than-predicted heating.
     """
+    # Before anything anchor-based. While the run has measured nothing the estimate is
+    # held — at the finish the scheduler committed to, when it fired — so this must not
+    # depend on the anchor at all. On 17.09.2026 the anchor was still the 13:40 cooling
+    # crossing for the first poll after firing, because `heating_since` follows
+    # heat_state and the device took five seconds to report it, and the estimate showed
+    # 11:30 from 63 minutes of cooling counted as heating. See thermal_hold_finish.
+    _hold = getattr(coordinator, "thermal_hold_finish", None)
+    held = _hold(target_temp) if callable(_hold) else None
+    if held is not None:
+        _LOGGER.debug("ready_at anchor: holding the opening estimate at %s",
+                      held.isoformat())
+        return held
+
     anc_time = coordinator.temp_anchor_time
     anc_temp = coordinator.temp_anchor_temp
 
@@ -412,17 +425,6 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
         opening = coordinator.session_opening_eta()
         if opening is not None:
             return opening
-    # Before the run has measured anything, the opening estimate is held rather than
-    # recomputed at every crossing — see MSpaCoordinator.thermal_hold_finish. Returned
-    # ahead of the staleness overrun below on purpose: a held estimate is not drifting,
-    # so there is nothing for the overrun to communicate.
-    _hold = getattr(coordinator, "thermal_hold_finish", None)
-    held = _hold(target_temp) if callable(_hold) else None
-    if held is not None:
-        _LOGGER.debug("ready_at anchor: holding the opening estimate at %s",
-                      held.isoformat())
-        return held
-
     if plan is not None:
         mins = plan.heating_minutes(anc_temp, target_temp)
     else:
@@ -1204,8 +1206,12 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
             setpoint = float(c._last_data.get("target_temperature"))
         except (TypeError, ValueError):
             setpoint = None
+        # A completed thermal chord is the same kind of event as a shadow revision, and
+        # the same lesson applies. On 17.09.2026 the first chord moved the estimate
+        # three hours and the display crawled toward it for three hours, then the next
+        # chord pulled it back — what read as wobble was one honest step, drawn out.
         return (c.scheduled_ready_at, c.schedule_target_temp, setpoint,
-                c.shadow_revisions())
+                c.shadow_revisions(), getattr(c, "thermal_a_n", 0))
 
     def _slew_eta(self, raw_eta, now_utc=None):
         """Move the displayed ETA toward raw_eta, smoothly and coarsely.

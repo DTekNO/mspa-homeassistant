@@ -135,6 +135,32 @@ class TestTriggerFires:
         _run(c._check_schedule_trigger(38.0, None))
         c.api.set_temperature_setting.assert_called_once_with(39.0)
 
+    def test_firing_holds_the_finish_it_committed_to(self):
+        """R3 at the handover. The scheduler fires because its plan says heating from
+        now finishes at the scheduled time; the live estimate must show that number,
+        not recompute one. On 17.09.2026 the scheduler said 12:00 and Ready at showed
+        11:30 then 12:20 within a second of firing."""
+        due = _NOW_UTC + timedelta(minutes=30)
+        c = _coord(scheduled_ready_at=due, schedule_target_temp=39.0)
+        c.config_entry = type("E", (), {"options": {}})()   # thermal is the default
+        c.thermal_a = None
+        c._thermal_hold_finish = None
+        _run(c._check_schedule_trigger(38.0, None))
+        c.api.set_temperature_setting.assert_called_once_with(39.0)
+        assert c._thermal_hold_finish == due
+        assert c._thermal_hold_target == 39.0
+
+    def test_a_spa_with_a_learned_rate_does_not_hold(self):
+        """The hold covers the seed-only run. With `A` measured, the transition's own
+        estimate equals the scheduler's by construction, so there is nothing to hold."""
+        due = _NOW_UTC + timedelta(minutes=30)
+        c = _coord(scheduled_ready_at=due, schedule_target_temp=39.0)
+        c.config_entry = type("E", (), {"options": {}})()
+        c.thermal_a = 1.25
+        c._thermal_hold_finish = None
+        _run(c._check_schedule_trigger(38.0, None))
+        assert c._thermal_hold_finish is None
+
     def test_fires_when_target_time_passed(self):
         c = _coord(
             scheduled_ready_at=_NOW_UTC - timedelta(minutes=10),

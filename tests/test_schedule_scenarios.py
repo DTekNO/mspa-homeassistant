@@ -585,6 +585,23 @@ class TestEtaSlew:
         assert e._eta_display == revised, "a revision should be adopted, not ramped"
         assert shown == revised
 
+    def test_a_thermal_chord_snaps_rather_than_ramps(self):
+        """Same event, same lesson, new model. On 17.09.2026 the first chord moved the
+        estimate three hours and the display crawled toward it at a minute per minute
+        for three hours — then the next chord pulled it back the other way. What read
+        as wobble was one honest step, drawn out by the cap it should have bypassed."""
+        c = MockCoordinator(shadow_revisions=0)
+        c.thermal_a_n = 0
+        e = _readiness_sensor(c)
+        eta = self._BASE + timedelta(hours=12)
+        e._slew_eta(eta, now_utc=self._BASE)
+
+        revised = eta - timedelta(minutes=180)
+        c.thermal_a_n = 1                                 # the first chord completed
+        shown = e._slew_eta(revised, now_utc=self._BASE + timedelta(minutes=1))
+        assert e._eta_display == revised, "a chord should be adopted, not ramped"
+        assert shown == revised
+
     def test_drift_without_a_revision_still_ramps(self):
         """The cap still applies to everything that is not a revision."""
         c = MockCoordinator(shadow_revisions=1)
