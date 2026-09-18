@@ -61,6 +61,22 @@ TAU_MIN_POINTS = 10
 # Buying three minutes of MAE by disabling half the model is not a trade.
 THERMAL_CHORD_MIN_C = 1.5
 
+# Crossings after heater-on to discard before the first chord is anchored.
+#
+# The probe sits in the pump housing and sees heated water before the tub has mixed,
+# so the first band after heater-on runs far above the settled rate: 1.82 °C/h against
+# ~1.1 on 17.09.2026, 1.36 against 1.13 on 11.09. A chord anchored at the first crossing
+# includes that band, and on 17.09 it read A = 1.56 against the run's settled 1.26 — the
+# first learned estimate landed four hours early and the next fifteen hours were spent
+# walking it back.
+#
+# Replaying that run with the fixed hold: anchored at the 1st crossing, the first snap is
+# 259 minutes and the display ranges over six hours; at the 2nd, 119 and 232; at the 3rd,
+# 25 minutes and 149. The cost is time to the first learned estimate — about two hours,
+# five crossings, instead of ninety minutes — which the hold covers by showing the
+# scheduler's own finish until then.
+THERMAL_CHORD_SKIP_CROSSINGS = 2
+
 # Below this the gap is small enough that measurement noise dominates the logarithm.
 _MIN_GAP_C = 1.0
 # A sample shorter than this is mostly quantisation: the reading moves in 0.5 °C steps.

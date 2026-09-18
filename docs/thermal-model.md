@@ -117,10 +117,15 @@ republished from it at once. Over 1.5 °C the same quantisation is ±17%.
 
 Two consequences worth stating plainly:
 
-* **The first crossing after the heater starts is anchored, not learned.** The run opened
+* **The first three crossings after the heater starts are not learned from** — two are
+  discarded and the third anchors the chord. The probe sits in the pump housing and sees
+  heated water before the tub has mixed, so the first band after heater-on runs about 1.6×
+  the settled rate (1.82 against ~1.1 °C/h on 17.09.2026; 1.36 against 1.13 on 11.09), and
+  a chord that included it read `A` = 1.56 against a settled 1.26 — the first estimate four
+  hours early. And in any case the run opened
   somewhere inside a band and that position was never observed, so a rate measured from
   it spans an unknown distance.
-* **Nothing is displayed until the first chord completes** — roughly 90 minutes. Before
+* **Nothing is displayed until the first chord completes** — about two hours, five crossings. Before
   that, the estimate would move only because the water advanced against a rate that had
   not changed, which reads as a revision and is not one. See R12.
 

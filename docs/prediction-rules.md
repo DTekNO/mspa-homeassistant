@@ -60,7 +60,7 @@ Predictions re-derive from current water and current air on every poll.
 revision that went with it is what allowed a start time to be committed and then found
 three hours wrong eleven hours later, far too late to act on.
 
-*The one hold, and why it is not this:* R12 holds the displayed estimate for the ~90
+*The one hold, and why it is not this:* R12 holds the displayed estimate for the ~120
 minutes before a run has measured anything. The frozen plan this rule forbids held a
 *measured* rate steady and revised it on a schedule; R12's hold ends the instant there
 is a measurement, and revises on evidence rather than at a band edge. Where R4 forbids
@@ -162,9 +162,12 @@ Two parts, and they are the same idea at two ends of a run.
 
 **Learning starts at an observed position.** A run opens somewhere inside a 0.5 °C band
 and that position is never observed, so any rate measured from it spans an unknown
-distance. The first crossing after the heater starts is anchored, not learned.
+distance. The first three crossings after the heater starts are not learned from: two are
+discarded — the probe sits in the pump housing and the first band after heater-on runs about
+1.6× the settled rate, which put the first estimate of 17.09.2026 four hours early — and the
+third anchors the chord.
 
-**The displayed estimate is held until the first chord completes** — about 90 minutes.
+**The displayed estimate is held until the first chord completes** — about two hours, five crossings.
 Before that the plan rests on the seed and on a position known to within half a band.
 Republishing it at every crossing shows movement where there is no new information: the
 estimate walks because the water advanced against a rate that has not changed, and a

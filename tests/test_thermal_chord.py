@@ -18,7 +18,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-from custom_components.mspa.thermal import DEFAULT_A, THERMAL_CHORD_MIN_C
+from custom_components.mspa.thermal import (
+    DEFAULT_A, THERMAL_CHORD_MIN_C, THERMAL_CHORD_SKIP_CROSSINGS,
+)
 
 
 def _coord(**over):
@@ -29,6 +31,7 @@ def _coord(**over):
     c._window_amb_sum = 0.0
     c._thermal_points = []
     c._thermal_chord = []
+    c._thermal_crossings_seen = 0
     for k, v in over.items():
         setattr(c, k, v)
     return c
@@ -76,6 +79,64 @@ class TestTheChordIsHeldUntilItIsWorthLearningFrom:
     def test_the_anchor_carries_across_a_fit(self):
         c = _walk(_coord(), [20.0, 20.5, 21.0, 21.5, 22.0])
         assert c._thermal_chord[0][1] == 21.5, "the completed chord's end is the next anchor"
+
+
+class TestTheFirstBandsAreDiscarded:
+    """The probe sits in the pump housing and sees heated water before the tub has
+    mixed. On 17.09.2026 the first band after heater-on ran at 1.82 °C/h against a
+    settled ~1.1, the chord that included it read A = 1.56, and the first learned
+    estimate was four hours early. Replayed with the hold working: anchor at the 1st
+    crossing and the first snap is 259 minutes; at the 3rd it is 25."""
+
+    def _note(self, c, temps, minutes=27.0):
+        t = 0.0
+        for temp in temps:
+            c.note_thermal_crossing(t, temp); t += minutes * 60.0
+
+    def test_the_first_two_crossings_anchor_nothing(self):
+        c = _coord()
+        self._note(c, [18.0, 18.5])
+        assert c._thermal_chord == [] and c._thermal_points == []
+
+    def test_the_third_crossing_anchors(self):
+        c = _coord()
+        self._note(c, [18.0, 18.5, 19.0])
+        assert [w for _, w, _ in c._thermal_chord] == [19.0]
+
+    def test_the_first_chord_runs_from_the_third_crossing(self):
+        """19.0 -> 20.5 is the first 1.5 °C measured; 18.0 -> 19.0 never enters it."""
+        c = _coord()
+        self._note(c, [18.0, 18.5, 19.0, 19.5, 20.0, 20.5])
+        assert len(c._thermal_points) == 1
+        gap, rate = c._thermal_points[0]
+        assert rate == pytest.approx(1.5 / (3 * 27 / 60))
+        assert gap == pytest.approx(19.75 - 12.0)
+
+    def test_a_fast_first_band_does_not_reach_the_fit(self):
+        """The 17.09.2026 shape: 16.5 min for the first band, then ~25."""
+        c = _coord()
+        t = 0.0
+        for temp, mins in ((18.0, 0), (18.5, 16.5), (19.0, 21.5), (19.5, 25.0),
+                           (20.0, 24.5), (20.5, 27.0)):
+            t += mins * 60.0
+            c.note_thermal_crossing(t, temp)
+        gap, rate = c._thermal_points[0]
+        assert rate == pytest.approx(1.5 / ((25.0 + 24.5 + 27.0) / 60), rel=1e-6)
+
+    def test_the_count_resets_with_the_run(self):
+        c = _coord()
+        self._note(c, [18.0, 18.5, 19.0])
+        c.reset_thermal_run()
+        assert c._thermal_crossings_seen == 0 and c._thermal_chord == []
+
+    def test_it_is_two(self):
+        assert THERMAL_CHORD_SKIP_CROSSINGS == 2
+
+    def test_a_run_still_yields_enough_points_for_tau(self):
+        from custom_components.mspa.thermal import TAU_MIN_POINTS
+        c = _coord()
+        self._note(c, [19.0 + 0.5 * i for i in range(41)])      # 11.09.2026
+        assert len(c._thermal_points) >= TAU_MIN_POINTS
 
 
 class TestTheChordIsMeasuredFromAnObservedPosition:

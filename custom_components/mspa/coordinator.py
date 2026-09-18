@@ -8,6 +8,7 @@ from .thermal import (
     DEFAULT_TAU_H,
     TAU_ALPHA,
     THERMAL_CHORD_MIN_C,
+    THERMAL_CHORD_SKIP_CROSSINGS,
     ThermalModel,
     a_at_fixed_tau,
     fit_run,
@@ -368,6 +369,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     _thermal_points: list | None = None
     # Crossings of the chord being measured, oldest first. Same reasoning as above.
     _thermal_chord: list | None = None
+    _thermal_crossings_seen: int = 0
     _thermal_hold_finish: datetime | None = None
     _thermal_hold_target: float | None = None
     newton_ready_source: str | None = None
@@ -578,6 +580,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._thermal_fallback_active = False
         self._thermal_points: list[tuple[float, float]] = []
         self._thermal_chord: list[tuple[float, float, float | None]] = []
+        self._thermal_crossings_seen: int = 0
         self._thermal_hold_finish: datetime | None = None
         self._thermal_hold_target: float | None = None
         self.thermal_a: float | None = None
@@ -3186,11 +3189,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._rate_last_temp = curr_temp
                     self._rate_last_time = now_mono
                     self._seed_window_ambient()
-                    # The thermal chord starts here too, and for the same reason the
-                    # bucket window does: this crossing is the first observed position
-                    # of the run. Anchoring one crossing later instead would discard a
-                    # measured half-degree for nothing.
-                    self.anchor_thermal_chord(now_mono, curr_temp)
+                    # The thermal model counts this crossing too, but does not anchor
+                    # on it — see note_thermal_crossing for why the first bands after
+                    # heater-on are discarded rather than measured.
+                    self.note_thermal_crossing(now_mono, curr_temp)
                     return
                 # Temperature has changed — elapsed time since the window anchor
                 # is the true duration of the whole boundary-to-boundary span.
@@ -3409,7 +3411,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 # needs one long enough that 0.5 °C of quantisation is not half the
                 # signal. See record_thermal_crossing.
                 if accepted and elapsed_hours > 0:
-                    self.record_thermal_crossing(now_mono, curr_temp)
+                    self.note_thermal_crossing(now_mono, curr_temp)
 
                 if _left_the_band and elapsed_hours > 0:
                     # A whole band, entered and left at its edges, measured against the
@@ -3442,6 +3444,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # heating measurement, so drop the partial one rather than let the next run
             # complete it.
             self._thermal_chord = []
+            self._thermal_crossings_seen = 0
 
     def _track_cooling_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the passive cooling rate from temperature drops.
@@ -3806,6 +3809,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """Start a fresh set of crossings. `A` and `tau` carry over; the points do not."""
         self._thermal_points = []
         self._thermal_chord = []
+        self._thermal_crossings_seen = 0
         # Deliberately not release_thermal_hold(). This runs on the same poll the hold
         # is set — the heater transition begins the hold and then resets the run a few
         # lines later — so releasing here killed every hold within microseconds of its
@@ -3894,10 +3898,34 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._thermal_hold_finish.isoformat(timespec="minutes"),
             float(from_temp), float(target), THERMAL_CHORD_MIN_C)
 
+    def note_thermal_crossing(self, when_mono: float, temp) -> None:
+        """Every accepted crossing while heating arrives here.
+
+        The first THERMAL_CHORD_SKIP_CROSSINGS are discarded, the next anchors the chord,
+        and the rest measure it. The discard is not caution: the probe sits in the pump
+        housing and sees heated water before the tub has mixed, so the first band after
+        heater-on runs about 1.6x the settled rate, and a chord that includes it is wrong
+        by that much. On 17.09.2026 it read A = 1.56 against a settled 1.26 and put the
+        first estimate four hours early. See THERMAL_CHORD_SKIP_CROSSINGS for the replay.
+        """
+        if temp is None:
+            return
+        self._thermal_crossings_seen += 1
+        if self._thermal_crossings_seen <= THERMAL_CHORD_SKIP_CROSSINGS:
+            _LOGGER.debug(
+                "Thermal: crossing %d of %d after heater-on discarded (%.1f °C) — the "
+                "probe is still reading unmixed water",
+                self._thermal_crossings_seen, THERMAL_CHORD_SKIP_CROSSINGS, float(temp))
+            return
+        if self._thermal_crossings_seen == THERMAL_CHORD_SKIP_CROSSINGS + 1:
+            self.anchor_thermal_chord(when_mono, temp)
+            return
+        self.record_thermal_crossing(when_mono, temp)
+
     def anchor_thermal_chord(self, when_mono: float, temp) -> None:
         """Begin measuring a chord here, discarding whatever was being measured.
 
-        Called at the first crossing after the heater starts. Everything before that
+        Called by note_thermal_crossing once the unmixed bands have passed. Everything before that
         crossing is unusable: the run opened somewhere inside a 0.5 °C band and the
         position was never observed, so a rate measured from it spans an unknown
         distance. The crossing is the first instant the water temperature is a fact.

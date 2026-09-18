@@ -38,9 +38,11 @@ which changes nothing for anyone who had it on.
 
   A new spa starts from seeded values and replaces them with its own measurements, so
   estimates are sensible from the first heat-up. On that very first run you will see
-  **Ready at hold still for roughly the first ninety minutes** before stepping once. That
-  is deliberate, not a stall: the water is reported in half-degree steps, so until three
-  crossings have passed there is no rate measured from your spa, and an estimate that
+  **Ready at hold still at the time the scheduler planned for, for roughly the first two
+  hours,** before stepping once. That
+  is deliberate, not a stall: the water is reported in half-degree steps, so until five
+  crossings have passed there is no rate measured from your spa (the first two are
+  discarded — the probe sees heated water before the tub has mixed), and an estimate that
   moved before then would only be reacting to rounding. From the second run onwards there
   is a learned rate to start from and the hold never appears again. The **Ambient learning** diagnostic
   sensor gains a `thermal_model` attribute showing both parameters, how many samples are
