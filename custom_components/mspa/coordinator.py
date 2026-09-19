@@ -3798,11 +3798,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
         self.thermal_tau_h = blend(self.thermal_tau_h, fitted, TAU_ALPHA)
         self.thermal_tau_n += 1
+        # `A` must move with `tau`. Every crossing this run learned `A` as
+        # rate + gap/tau at the *old* tau, so the two are a pair — the collinear pair
+        # the fit finds, not two independent truths. Moving tau alone left `A` describing
+        # a slope the model no longer has. Measured 18.09.2026: tau moved 55 → 30.7 with
+        # A left at 1.243, and that pair predicted the run it was fitted on at 1995
+        # minutes against 1411 actual — 584 long — where the same A at the old tau was
+        # 26 short and the joint fit 67 long. Re-derive `A` at the tau we are keeping.
+        joint_a = a_at_fixed_tau(pts, self.thermal_tau_h)
+        if joint_a is not None:
+            self.thermal_a = joint_a
         gaps = [g for g, _ in pts]
         _LOGGER.info(
             "Thermal tau: run of %d crossings spanning %.1f K fitted %.1f h → %.1f h "
-            "[n=%d]", len(pts), max(gaps) - min(gaps), fitted,
-            self.thermal_tau_h, self.thermal_tau_n)
+            "[n=%d]; A re-derived at that tau → %.3f °C/h", len(pts),
+            max(gaps) - min(gaps), fitted, self.thermal_tau_h, self.thermal_tau_n,
+            self.thermal_a if self.thermal_a is not None else float("nan"))
         self.reset_thermal_run()
 
     def reset_thermal_run(self) -> None:

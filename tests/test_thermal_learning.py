@@ -337,3 +337,47 @@ class TestNoStepAtHandover:
         c.temp_anchor_temp = None
         c.reanchor_for_direction_change()
         assert c.temp_anchor_temp is None
+
+
+class TestTauAndAMoveTogether:
+    """`A` is learned all run as rate + gap/tau at the seed tau, so the two are a pair.
+    Moving tau alone at the end of the run left `A` describing a slope the model no
+    longer had. 18.09.2026: tau went 55 → 30.7 with `A` left at 1.243, and that pair
+    predicted the very run it was fitted on at 1995 minutes against 1411 actual."""
+
+    A_TRUE, TAU_TRUE, AIR = 1.20, 35.0, 12.0
+
+    def _run(self):
+        """A noise-free run at (A_TRUE, TAU_TRUE), learned crossing by crossing at the
+        seed tau of 55 — which is exactly how the live run was learned."""
+        c = _coord()
+        for gap in range(7, 26):                          # 19 points, 18 K of spread
+            rate = self.A_TRUE - gap / self.TAU_TRUE
+            c.learn_from_crossing(rate=rate, water_mean=self.AIR + gap, ambient=self.AIR)
+        assert c.thermal_a != pytest.approx(self.A_TRUE, abs=0.02), (
+            "the setup is wrong: A learned at tau=55 should be biased before finalise")
+        return c
+
+    def test_finalise_recovers_both_parameters(self):
+        c = self._run()
+        c.finalise_thermal_run()
+        assert c.thermal_tau_h == pytest.approx(self.TAU_TRUE, rel=0.02)
+        assert c.thermal_a == pytest.approx(self.A_TRUE, abs=0.02)
+
+    def test_the_stored_pair_predicts_the_run_it_was_fitted_on(self):
+        """The property that was violated: a pair fitted on a run must reproduce it."""
+        from custom_components.mspa.thermal import ThermalModel
+        c = self._run()
+        c.finalise_thermal_run()
+        truth = ThermalModel(self.A_TRUE, self.TAU_TRUE).heating_minutes(19.0, 37.0, self.AIR)
+        got = c.thermal_model().heating_minutes(19.0, 37.0, self.AIR)
+        assert got == pytest.approx(truth, rel=0.03)
+
+    def test_a_is_not_touched_when_tau_earns_no_fit(self):
+        """Too short a lever: tau stays, and so must A — nothing to re-derive it at."""
+        c = _coord()
+        for gap in range(10, 14):                         # 3 K of spread, 4 points
+            c.learn_from_crossing(rate=1.0, water_mean=self.AIR + gap, ambient=self.AIR)
+        before = c.thermal_a
+        c.finalise_thermal_run()
+        assert c.thermal_tau_h is None and c.thermal_a == before
