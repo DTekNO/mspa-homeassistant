@@ -1408,7 +1408,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.begin_thermal_hold(self.scheduling_temp(), new_target)
             elif not heater_now_active:
                 self.heating_since = None
-                self.release_thermal_hold()
+                if self._heat_was_active:
+                    # A genuine stop. Not the lag between the scheduler's setpoint
+                    # command and the device reporting `heating` — 30 s of `standby`
+                    # polls on 24.09.2026 15:12, during which this released the hold the
+                    # trigger had just set and the transition then priced a second
+                    # opinion. See thermal_hold_finish.
+                    self.release_thermal_hold()
             if heater_now_active and not self._heat_was_active:
                 delta_to_target = abs((new_target or 0) - (curr_temp or 0))
                 if delta_to_target > _NEW_SESSION_DELTA:
@@ -2068,6 +2074,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._last_computed_start_at = None
         self.ready_latched = False
         self.ready_latched_temp = None
+        # The hold was this schedule's commitment; there is no schedule now.
+        self.release_thermal_hold()
 
     # How many band traverses to keep. Three per full heat-up from cold, so roughly
     # sixty sessions — enough to span a year of weather, which is what a sensitivity
@@ -3861,12 +3869,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         position at heater-on is still known only to a band and the first bands after
         heater-on run far above the settled rate (24.09.2026: five bands at 1.4-1.8 °C/h
         against 0.9 settled). Until a chord has been measured there is nothing to say that
-        the scheduler did not already say. R3 is not at risk: the
-        scheduler plans while the heater is off and there is no hold then.
+        the scheduler did not already say.
+
+        Ends on: a chord this run, the target moving, a genuine heater stop (the
+        transition branch, only after the heater had been running), or the schedule
+        being cleared. Not on `heating_since is None`: between the trigger's setpoint
+        command and the device reporting `heating` there are ~30 s of idle polls, and
+        releasing there killed the scheduler's hold every time (24.09.2026 15:12:10).
+        R3 is not at risk: the scheduler plans while the heater is off and adopts its
+        own finish as the hold the moment it fires.
         """
         if self._thermal_hold_finish is None:
             return None
-        if self._thermal_points or self.heating_since is None:
+        if self._thermal_points:
             # A chord has completed *this run*, so there is something measured to show.
             # Not `thermal_a is not None`: that gated the hold to the one run after a
             # storage wipe, and on 24.09.2026 — A carried over from the run before — the

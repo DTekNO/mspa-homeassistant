@@ -231,7 +231,16 @@ class TestTheOpeningEstimateIsHeld:
         c.heating_since = datetime.now(timezone.utc)
         return c
 
-    def test_nothing_is_held_before_the_run_starts(self):
+    def test_a_hold_set_before_the_heater_engages_is_kept(self):
+        """The scheduler adopts its finish before commanding the heater, and the device
+        reports standby for ~30 s afterwards. Releasing on heating_since being None
+        killed every such hold in that window (24.09.2026 15:12:10)."""
+        c = _coord(heating_since=None)
+        c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
+        c._thermal_hold_target = 39.0
+        assert c.thermal_hold_finish(39.0) is not None
+
+    def test_nothing_is_held_when_nothing_was_set(self):
         assert _coord(heating_since=None).thermal_hold_finish(39.0) is None
 
     def test_the_hold_survives_while_nothing_has_been_measured(self):
@@ -265,12 +274,18 @@ class TestTheOpeningEstimateIsHeld:
         c._thermal_hold_target = 39.0
         assert c.thermal_hold_finish(40.0) is None
 
-    def test_the_heater_stopping_releases_it(self):
+    def test_clearing_the_schedule_releases_it(self):
+        """The hold was the schedule's commitment; cancel the schedule and it goes."""
         c = self._heating()
         c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
         c._thermal_hold_target = 39.0
-        c.heating_since = None
-        assert c.thermal_hold_finish(39.0) is None
+        c.scheduled_ready_at = datetime.now(timezone.utc) + timedelta(hours=20)
+        c.schedule_target_temp = 39.0
+        c._schedule_triggered = True
+        c.ready_latched = False
+        c._last_computed_start_at = None
+        c.clear_schedule("cancelled by user", 21.5)
+        assert c._thermal_hold_finish is None
 
     def test_a_spa_that_has_heated_before_holds_too(self):
         """A carried-over `A` does not make the opening honest: the position at heater-on
