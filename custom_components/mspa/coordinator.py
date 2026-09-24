@@ -115,6 +115,20 @@ _MIN_RATE_SAMPLE_HOURS = 3 / 60   # 3 minutes minimum between samples
 # behaviour, which tests pin at 5 and 10 minutes late.
 _SCHEDULE_STALE_AFTER = timedelta(hours=1)
 
+# A ready time must have been stable for this long before the scheduler may act on it.
+#
+# The datetime picker commits on every part. Setting the time first commits it with
+# today's date assumed, and on 24.09.2026 that read as "22:00 tonight": the scheduler saw
+# a start already in the past, fired within five seconds, and pushed the thermostat to
+# 39 - while the user was still typing the date. The entity's own debounce is a few
+# seconds and cannot cover a person taking half a minute over two fields. Ninety seconds
+# after the last change is short enough not to feel broken for a deliberate "start now"
+# and long enough that a half-entered value never reaches the heater.
+#
+# Only the trigger waits. The Heat schedule start sensor shows the plan immediately, and
+# a value restored at startup counts as settled - it was set long before.
+_SCHEDULE_SETTLE_S = 90
+
 # Soft start: the circulation pump must be running before the heater is commanded.
 # The spa refuses to heat without flow, and the MSpa Link app never issues a bare
 # heater-on — it starts the pump first.  Our climate entity, the heater switch, the
@@ -373,6 +387,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     _thermal_chord: list | None = None
     _thermal_crossings_seen: int = 0
     _thermal_hot_rejects: int = 0
+    scheduled_ready_set_at: datetime | None = None
     _thermal_hold_finish: datetime | None = None
     _thermal_hold_target: float | None = None
     newton_ready_source: str | None = None
@@ -593,6 +608,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.thermal_tau_n: int = 0
 
         self.scheduled_ready_at: datetime | None = None  # set by MSpaScheduledReadyAt entity
+        self.scheduled_ready_set_at: datetime | None = None  # when it last changed; None = settled
         # Target temperature the scheduler should heat to.  Exposed as a number entity
         # so the user can adjust it from the device panel without entering options.
         self.schedule_target_temp: float = float(
@@ -2070,6 +2086,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._schedule_triggered, self.ready_latched,
         )
         self.scheduled_ready_at = None
+        self.scheduled_ready_set_at = None
         self._schedule_triggered = False
         self._last_computed_start_at = None
         self.ready_latched = False
@@ -3560,6 +3577,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             )
             self.clear_schedule("stale target", current_temp)
             return
+        # Still being typed? See _SCHEDULE_SETTLE_S.
+        set_at = self.scheduled_ready_set_at
+        if set_at is not None:
+            age_s = (now_utc - set_at).total_seconds()
+            if age_s < _SCHEDULE_SETTLE_S:
+                _LOGGER.debug(
+                    "Heat schedule: ready time changed %.0f s ago — waiting for it to "
+                    "settle (%d s) before acting", age_s, _SCHEDULE_SETTLE_S)
+                return
+            self.scheduled_ready_set_at = None
 
         # Plan from the in-band estimate, not the quantised reading, so the start
         # ramps instead of lurching a whole band at each crossing.  Falls back to the

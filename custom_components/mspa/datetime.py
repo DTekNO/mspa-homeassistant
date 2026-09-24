@@ -124,6 +124,9 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
             water_str,
         )
         self.coordinator.scheduled_ready_at = value
+        # The scheduler waits _SCHEDULE_SETTLE_S from here before it may act: the
+        # picker commits each part separately, so this value may be half-entered.
+        self.coordinator.scheduled_ready_set_at = dt_util.utcnow()
         self.coordinator.ready_latched = False
         self.coordinator.ready_latched_temp = None
         self.coordinator._schedule_triggered = False
@@ -139,6 +142,7 @@ class MSpaScheduledReadyAt(MSpaDateTimeEntity, RestoreEntity):
             if restored is not None and restored > dt_util.now():
                 restored_future = True
                 self.coordinator.scheduled_ready_at = restored
+                self.coordinator.scheduled_ready_set_at = None   # long settled
                 sched_temp = getattr(self.coordinator, "schedule_target_temp", None)
                 _LOGGER.info(
                     "Heat schedule: restored from prior state → %s  [sched=%.1f°C]",

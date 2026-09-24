@@ -36,6 +36,7 @@ def _coord(**overrides) -> MSpaUpdateCoordinator:
     c._band_stats = {}
     c._band_observations = []
     c._last_computed_start_at = None
+    c.scheduled_ready_set_at = None
     c.ready_latched = False
     c.near_target = False
     c._last_data = {"heater": "off", "water_temperature": "38.0", "device_heat_perhour": 0}
@@ -163,6 +164,34 @@ class TestTriggerFires:
         c._thermal_hold_finish = None
         _run(c._check_schedule_trigger(38.0, None))
         assert c._thermal_hold_finish == due
+
+    def test_a_ready_time_still_settling_does_not_fire(self):
+        """24.09.2026 15:12: the picker committed the time with today's date assumed,
+        the scheduler fired within five seconds, and the thermostat went to 39 while
+        the user was still typing the date."""
+        c = _coord(scheduled_ready_at=_NOW_UTC + timedelta(minutes=30),
+                   schedule_target_temp=39.0)
+        c.scheduled_ready_set_at = _NOW_UTC - timedelta(seconds=5)
+        _run(c._check_schedule_trigger(38.0, None))
+        c.api.set_temperature_setting.assert_not_called()
+        assert c._schedule_triggered is False
+
+    def test_a_settled_ready_time_fires(self):
+        from custom_components.mspa.coordinator import _SCHEDULE_SETTLE_S
+        c = _coord(scheduled_ready_at=_NOW_UTC + timedelta(minutes=30),
+                   schedule_target_temp=39.0)
+        c.scheduled_ready_set_at = _NOW_UTC - timedelta(seconds=_SCHEDULE_SETTLE_S + 1)
+        _run(c._check_schedule_trigger(38.0, None))
+        c.api.set_temperature_setting.assert_called_once_with(39.0)
+        assert c.scheduled_ready_set_at is None, "settled once, not re-checked every poll"
+
+    def test_a_restored_ready_time_counts_as_settled(self):
+        """set_at is None after a restore — it was set long before the restart."""
+        c = _coord(scheduled_ready_at=_NOW_UTC + timedelta(minutes=30),
+                   schedule_target_temp=39.0)
+        c.scheduled_ready_set_at = None
+        _run(c._check_schedule_trigger(38.0, None))
+        c.api.set_temperature_setting.assert_called_once_with(39.0)
 
     def test_fires_when_target_time_passed(self):
         c = _coord(

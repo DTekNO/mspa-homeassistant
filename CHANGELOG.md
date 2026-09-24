@@ -54,6 +54,13 @@ which changes nothing for anyone who had it on.
 
 ### Added
 
+- **A newly set schedule waits 90 seconds before it can start heating.** The date and
+  time picker commits each part as you change it, so setting the time first briefly
+  reads as "today at that time" — and if that was already due, the heater started while
+  you were still typing the date. The scheduler now acts only on a ready time that has
+  been stable for a minute and a half. The Heat schedule start sensor still updates
+  immediately; only the trigger waits.
+
 - **Ready at and Heat Schedule now have localised counterparts.** Four new sensors —
   **Ready at time**, **Ready status**, **Heat schedule start** and **Heat schedule
   status** — show what the existing two show, but in your own time format, timezone and
