@@ -9,6 +9,8 @@ from .thermal import (
     TAU_ALPHA,
     THERMAL_CHORD_MIN_C,
     THERMAL_CHORD_SKIP_CROSSINGS,
+    THERMAL_HOT_CHORD_MAX_REJECTS,
+    THERMAL_HOT_CHORD_TOLERANCE,
     ThermalModel,
     a_at_fixed_tau,
     fit_run,
@@ -370,6 +372,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # Crossings of the chord being measured, oldest first. Same reasoning as above.
     _thermal_chord: list | None = None
     _thermal_crossings_seen: int = 0
+    _thermal_hot_rejects: int = 0
     _thermal_hold_finish: datetime | None = None
     _thermal_hold_target: float | None = None
     newton_ready_source: str | None = None
@@ -581,6 +584,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._thermal_points: list[tuple[float, float]] = []
         self._thermal_chord: list[tuple[float, float, float | None]] = []
         self._thermal_crossings_seen: int = 0
+        self._thermal_hot_rejects: int = 0
         self._thermal_hold_finish: datetime | None = None
         self._thermal_hold_target: float | None = None
         self.thermal_a: float | None = None
@@ -3445,6 +3449,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # complete it.
             self._thermal_chord = []
             self._thermal_crossings_seen = 0
+            self._thermal_hot_rejects = 0
 
     def _track_cooling_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the passive cooling rate from temperature drops.
@@ -3821,6 +3826,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._thermal_points = []
         self._thermal_chord = []
         self._thermal_crossings_seen = 0
+        self._thermal_hot_rejects = 0
         # Deliberately not release_thermal_hold(). This runs on the same poll the hold
         # is set — the heater transition begins the hold and then resets the run a few
         # lines later — so releasing here killed every hold within microseconds of its
@@ -3981,11 +3987,29 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self.anchor_thermal_chord(when_mono, temp)
             return
         airs = [a for _, _, a in self._thermal_chord if a is not None]
-        self.learn_from_crossing(
-            (float(temp) - w0) / hours,
-            (w0 + float(temp)) / 2.0,
-            sum(airs) / len(airs) if airs else None,
-        )
+        rate = (float(temp) - w0) / hours
+        mean = (w0 + float(temp)) / 2.0
+        air = sum(airs) / len(airs) if airs else None
+        # The first chord of a run is checked against the `A` carried in, because the
+        # hot phase after heater-on is not a fixed length — see THERMAL_HOT_CHORD_TOLERANCE.
+        # Only the first: once a chord has been accepted this run, the water is mixed.
+        if not self._thermal_points and air is not None:
+            sample = a_from_heating(rate, mean, air, self.thermal_model().tau_h)
+            carried = self.thermal_a if self.thermal_a is not None else DEFAULT_A
+            if (sample is not None
+                    and sample > carried * (1.0 + THERMAL_HOT_CHORD_TOLERANCE)
+                    and self._thermal_hot_rejects < THERMAL_HOT_CHORD_MAX_REJECTS):
+                self._thermal_hot_rejects += 1
+                _LOGGER.info(
+                    "Thermal: first chord %.1f→%.1f °C at %.2f °C/h implies A %.3f, "
+                    "%.0f%% above the carried %.3f — the probe is still reading unmixed "
+                    "water. Discarded (%d of %d), re-anchored; the opening estimate stays "
+                    "held", w0, float(temp), rate, sample,
+                    (sample / carried - 1.0) * 100, carried,
+                    self._thermal_hot_rejects, THERMAL_HOT_CHORD_MAX_REJECTS)
+                self.anchor_thermal_chord(when_mono, temp)
+                return
+        self.learn_from_crossing(rate, mean, air)
         self.anchor_thermal_chord(when_mono, temp)
 
     def thermal_diagnostics(self) -> dict:

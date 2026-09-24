@@ -20,6 +20,7 @@ import pytest
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
 from custom_components.mspa.thermal import (
     DEFAULT_A, THERMAL_CHORD_MIN_C, THERMAL_CHORD_SKIP_CROSSINGS,
+    THERMAL_HOT_CHORD_MAX_REJECTS, THERMAL_HOT_CHORD_TOLERANCE,
 )
 
 
@@ -32,6 +33,7 @@ def _coord(**over):
     c._thermal_points = []
     c._thermal_chord = []
     c._thermal_crossings_seen = 0
+    c._thermal_hot_rejects = 0
     for k, v in over.items():
         setattr(c, k, v)
     return c
@@ -137,6 +139,68 @@ class TestTheFirstBandsAreDiscarded:
         c = _coord()
         self._note(c, [19.0 + 0.5 * i for i in range(41)])      # 11.09.2026
         assert len(c._thermal_points) >= TAU_MIN_POINTS
+
+
+class TestAHotFirstChordIsDiscarded:
+    """24.09.2026: the skip cleared two bands, the hot phase ran five, and the first chord
+    read 1.475 °C/h — A = 1.67 against a carried 1.36 — so the first learned estimate
+    landed three hours early. The probe-housing effect can only make an early chord
+    faster, so a first chord this far above the carried A is that signature."""
+
+    def _chord(self, c, w0, minutes):
+        """One 1.5 °C chord from w0, taking `minutes`, fed as four crossings."""
+        t = 0.0
+        c.anchor_thermal_chord(t, w0)
+        for k in (1, 2, 3):
+            t += minutes * 60.0 / 3
+            c.record_thermal_crossing(t, w0 + 0.5 * k)
+
+    def test_todays_first_chord_is_rejected_and_the_hold_kept(self):
+        c = _coord(thermal_a=1.357)
+        c.heating_since = datetime.now(timezone.utc)
+        c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
+        c._thermal_hold_target = 39.0
+        self._chord(c, 19.0, 61.0)                        # 1.475 °C/h, as logged
+        assert c._thermal_points == [], "learned from unmixed water"
+        assert c.thermal_a == 1.357, "A moved on a rejected chord"
+        assert c._thermal_hot_rejects == 1
+        assert c.thermal_hold_finish(39.0) is not None, "hold released by a rejected chord"
+        assert c._thermal_chord[0][1] == 20.5, "not re-anchored at the chord's end"
+
+    def test_a_clean_first_chord_is_accepted(self):
+        """17.09.2026 with the skip: 1.18 °C/h, within 1% of the carried A."""
+        c = _coord(thermal_a=1.30)
+        self._chord(c, 19.0, 76.5)
+        assert len(c._thermal_points) == 1
+        assert c._thermal_hot_rejects == 0
+
+    def test_only_the_first_chord_is_checked(self):
+        """Once a chord is in, the water is mixed; a later fast chord is real data."""
+        c = _coord(thermal_a=1.30)
+        self._chord(c, 19.0, 76.5)                        # accepted
+        t0 = 3 * 76.5 * 60 / 3 * 3
+        for k in (1, 2, 3):
+            c.record_thermal_crossing(t0 + k * 15 * 60, 20.5 + 0.5 * k)   # 2.0 °C/h
+        assert len(c._thermal_points) == 2
+
+    def test_a_genuinely_fast_spa_still_learns_after_the_cap(self):
+        """Fresh install, spa a quarter faster than the seed: rejected N times, then taken."""
+        c = _coord()                                       # thermal_a None -> seed 1.30
+        for i in range(THERMAL_HOT_CHORD_MAX_REJECTS + 1):
+            c._thermal_chord = []
+            self._chord(c, 19.0 + 1.5 * i, 55.0)          # 1.64 °C/h every time
+        assert c._thermal_hot_rejects == THERMAL_HOT_CHORD_MAX_REJECTS
+        assert len(c._thermal_points) == 1, "the cap did not let the spa learn"
+
+    def test_the_tolerance_separates_the_record(self):
+        """+1% (four clean first chords) passes; +20% and +23% (the two hot ones) fail."""
+        assert 0.01 < THERMAL_HOT_CHORD_TOLERANCE < 0.20
+
+    def test_rejections_reset_with_the_run(self):
+        c = _coord(thermal_a=1.357)
+        self._chord(c, 19.0, 61.0)
+        c.reset_thermal_run()
+        assert c._thermal_hot_rejects == 0
 
 
 class TestTheChordIsMeasuredFromAnObservedPosition:

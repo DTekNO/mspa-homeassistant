@@ -77,6 +77,22 @@ THERMAL_CHORD_MIN_C = 1.5
 # scheduler's own finish until then.
 THERMAL_CHORD_SKIP_CROSSINGS = 2
 
+# The hot phase is not a fixed number of bands. 17.09.2026 ran two bands above the
+# settled rate; 24.09.2026 ran five (1.62, 1.54, 1.76, 1.58, 1.43 against 0.92 °C/h once
+# mixed), so a chord anchored after the skip still read 1.475 and implied A = 1.67
+# against a carried 1.36 — and the first learned estimate landed three hours early.
+#
+# What is fixed is the physics: the probe sits in the pump housing and sees heated
+# water before the tub has mixed, so the effect can only make an early chord read
+# *faster* than the bulk. A first chord whose implied `A` sits this far above the `A`
+# carried in from the run before is that signature, and is discarded (R7) and the chord
+# re-anchored, with the hold still showing the scheduler's finish. The four clean first
+# chords on record sit within 1% of their carried `A`; the two hot ones sit +20% and +23%.
+THERMAL_HOT_CHORD_TOLERANCE = 0.15
+# But only so many times. A fresh install whose spa really is a quarter faster than the
+# seed must still learn; after this many rejections the next chord is taken as it comes.
+THERMAL_HOT_CHORD_MAX_REJECTS = 3
+
 # Below this the gap is small enough that measurement noise dominates the logarithm.
 _MIN_GAP_C = 1.0
 # A sample shorter than this is mostly quantisation: the reading moves in 0.5 °C steps.
