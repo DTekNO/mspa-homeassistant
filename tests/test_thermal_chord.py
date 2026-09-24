@@ -208,11 +208,22 @@ class TestTheOpeningEstimateIsHeld:
         c.heating_since = None
         assert c.thermal_hold_finish(39.0) is None
 
-    def test_a_spa_that_has_heated_before_never_holds(self):
-        """Inert on every run after the first — there is a measured `A` to plan with."""
+    def test_a_spa_that_has_heated_before_holds_too(self):
+        """A carried-over `A` does not make the opening honest: the position at heater-on
+        is still a band and the first bands run hot. 24.09.2026 walked with A = 1.357."""
         c = self._heating(thermal_a=1.25)
+        c.config_entry = type("E", (), {"options": {
+            "heater_power_heat": 2200, "prediction_model": "thermal"}})()
         c.begin_thermal_hold(18.5, 39.0)
-        assert c._thermal_hold_finish is None
+        assert c._thermal_hold_finish is not None
+
+    def test_it_is_released_by_this_runs_first_chord_not_by_a_carried_rate(self):
+        c = self._heating(thermal_a=1.25)
+        c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
+        c._thermal_hold_target = 39.0
+        assert c.thermal_hold_finish(39.0) is not None, "released by a carried-over A"
+        c._thermal_points = [(8.0, 1.0)]                  # a chord landed this run
+        assert c.thermal_hold_finish(39.0) is None
 
 
 class TestTheHoldSurvivesTheTransition:
@@ -252,12 +263,13 @@ class TestTheHoldSurvivesTheTransition:
         c.adopt_thermal_hold(due, 39.0)
         assert c.thermal_hold_finish(39.0) == due
 
-    def test_adopting_with_a_learned_rate_is_a_no_op(self):
+    def test_adopting_with_a_learned_rate_still_holds(self):
         c = _coord(thermal_a=1.25)
         c.config_entry = type("E", (), {"options": {
             "heater_power_heat": 2200, "prediction_model": "thermal"}})()
-        c.adopt_thermal_hold(datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc), 39.0)
-        assert c._thermal_hold_finish is None
+        due = datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc)
+        c.adopt_thermal_hold(due, 39.0)
+        assert c._thermal_hold_finish == due
 
 
 class TestBeginningTheHold:

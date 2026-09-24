@@ -573,8 +573,13 @@ class TestEtaSlew:
         correction took three hours to show, and the next revision always overtook it:
         on 2026-08-19 the display sat 122 minutes behind a plan that had been right for
         an hour. The churn the cap exists to suppress is already suppressed here.
+
+        Bucket model only: the shadow curve steers the display under the frozen plan and
+        nothing else, so its revisions snap there and are ignored under the thermal model
+        (see the next test, and _replan_key).
         """
         c = MockCoordinator(shadow_revisions=1)
+        c.config_entry = type("E", (), {"options": {"prediction_model": "buckets"}})()
         e = _readiness_sensor(c)
         eta = self._BASE + timedelta(hours=12)
         e._slew_eta(eta, now_utc=self._BASE)
@@ -601,6 +606,20 @@ class TestEtaSlew:
         shown = e._slew_eta(revised, now_utc=self._BASE + timedelta(minutes=1))
         assert e._eta_display == revised, "a chord should be adopted, not ramped"
         assert shown == revised
+
+    def test_a_shadow_revision_does_not_snap_the_thermal_display(self):
+        """24.09.2026 13:51: "re-anchored at 20.0 °C — revision 1" snapped a thermal
+        estimate the shadow curve was not steering. Under the thermal model the shadow
+        is a recorder, not a driver, and must not enter the replan identity."""
+        c = MockCoordinator(shadow_revisions=1)          # default model: thermal
+        c.thermal_a_n = 3
+        e = _readiness_sensor(c)
+        eta = self._BASE + timedelta(hours=12)
+        e._slew_eta(eta, now_utc=self._BASE)
+        c._shadow_revisions = 2
+        e._slew_eta(eta - timedelta(minutes=180), now_utc=self._BASE + timedelta(minutes=1))
+        moved = (eta - e._eta_display).total_seconds() / 60
+        assert 0 < moved <= 1.0 + 1e-6, f"snapped or stood still: moved {moved:.1f} min"
 
     def test_drift_without_a_revision_still_ramps(self):
         """The cap still applies to everything that is not a revision."""

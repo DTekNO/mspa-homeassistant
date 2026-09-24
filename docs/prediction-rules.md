@@ -171,8 +171,9 @@ third anchors the chord.
 Before that the plan rests on the seed and on a position known to within half a band.
 Republishing it at every crossing shows movement where there is no new information: the
 estimate walks because the water advanced against a rate that has not changed, and a
-reader cannot tell that from a genuine revision. Released the moment `A` is learned, so
-it is inert on every run after the first.
+reader cannot tell that from a genuine revision. Released when the first chord of *this run* completes — every run, not only the first: a
+carried-over `A` does not make the opening honest, because the position at heater-on is
+still a band and the first bands after heater-on run hot.
 
 *Why:* holding also bounds the correction. Replaying 03.09.2026 with the estimate free,
 the seed plan and the first fitted plan disagreed by 123 minutes and the display crossed

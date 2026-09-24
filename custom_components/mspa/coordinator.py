@@ -3850,13 +3850,21 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         trades the other way — 15 minutes free against 22 held — and mean absolute error
         is unchanged on both runs, so what this buys is specifically the worst case.
 
-        Released the moment `A` is learned, so it is inert on every run after the first
-        and never applies to a spa that has heated once before. R3 is not at risk: the
+        Released when the first chord of *this run* completes. Every run, not only the
+        first: a carried-over `A` does not make the opening honest, because the water's
+        position at heater-on is still known only to a band and the first bands after
+        heater-on run far above the settled rate (24.09.2026: five bands at 1.4-1.8 °C/h
+        against 0.9 settled). Until a chord has been measured there is nothing to say that
+        the scheduler did not already say. R3 is not at risk: the
         scheduler plans while the heater is off and there is no hold then.
         """
         if self._thermal_hold_finish is None:
             return None
-        if self.thermal_a is not None or self.heating_since is None:
+        if self._thermal_points or self.heating_since is None:
+            # A chord has completed *this run*, so there is something measured to show.
+            # Not `thermal_a is not None`: that gated the hold to the one run after a
+            # storage wipe, and on 24.09.2026 — A carried over from the run before — the
+            # hold never existed and the display walked exactly as it had on 17.09.
             self.release_thermal_hold()
             return None
         if target is not None and self._thermal_hold_target is not None and (
@@ -3877,8 +3885,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         extrapolated position), and the display showed 11:30 in between from a stale
         anchor. Adopting the scheduler's finish makes all three the same number.
         """
-        if (self.prediction_model != PREDICTION_MODEL_THERMAL
-                or self.thermal_a is not None or target is None):
+        if self.prediction_model != PREDICTION_MODEL_THERMAL or target is None:
             return
         self._thermal_hold_finish = finish_utc
         self._thermal_hold_target = float(target)
@@ -3891,7 +3898,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """Fix the opening estimate for the run about to start. See thermal_hold_finish."""
         if (self._thermal_hold_finish is not None
                 or self.prediction_model != PREDICTION_MODEL_THERMAL
-                or self.thermal_a is not None
                 or from_temp is None or target is None
                 or float(target) <= float(from_temp)):
             # A hold already set by the scheduler is the plan it committed to; a

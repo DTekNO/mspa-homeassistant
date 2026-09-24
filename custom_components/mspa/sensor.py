@@ -1210,8 +1210,13 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
         # the same lesson applies. On 17.09.2026 the first chord moved the estimate
         # three hours and the display crawled toward it for three hours, then the next
         # chord pulled it back — what read as wobble was one honest step, drawn out.
+        # The shadow curve only drives the display under the frozen-plan (bucket)
+        # model; under the thermal model it still records revisions but must not snap a
+        # display it is not steering — 24.09.2026 13:51, "revision 1" snapped a thermal
+        # estimate for no reason of the thermal model's.
+        shadow = c.shadow_revisions() if getattr(c, "uses_frozen_plan", True) else 0
         return (c.scheduled_ready_at, c.schedule_target_temp, setpoint,
-                c.shadow_revisions(), getattr(c, "thermal_a_n", 0))
+                shadow, getattr(c, "thermal_a_n", 0))
 
     def _slew_eta(self, raw_eta, now_utc=None):
         """Move the displayed ETA toward raw_eta, smoothly and coarsely.

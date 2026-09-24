@@ -150,16 +150,19 @@ class TestTriggerFires:
         assert c._thermal_hold_finish == due
         assert c._thermal_hold_target == 39.0
 
-    def test_a_spa_with_a_learned_rate_does_not_hold(self):
-        """The hold covers the seed-only run. With `A` measured, the transition's own
-        estimate equals the scheduler's by construction, so there is nothing to hold."""
+    def test_a_spa_with_a_learned_rate_holds_too(self):
+        """Every run, not only the first after a wipe. This used to assert the opposite,
+        on the theory that with `A` measured the transition's estimate equals the
+        scheduler's. It does not: the position at heater-on is a band, the first bands
+        run hot, and on 24.09.2026 the display walked off the plan within four minutes
+        with A = 1.357 carried over. The rule is universal."""
         due = _NOW_UTC + timedelta(minutes=30)
         c = _coord(scheduled_ready_at=due, schedule_target_temp=39.0)
         c.config_entry = type("E", (), {"options": {}})()
         c.thermal_a = 1.25
         c._thermal_hold_finish = None
         _run(c._check_schedule_trigger(38.0, None))
-        assert c._thermal_hold_finish is None
+        assert c._thermal_hold_finish == due
 
     def test_fires_when_target_time_passed(self):
         c = _coord(

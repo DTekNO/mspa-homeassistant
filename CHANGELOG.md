@@ -43,8 +43,8 @@ which changes nothing for anyone who had it on.
   is deliberate, not a stall: the water is reported in half-degree steps, so until five
   crossings have passed there is no rate measured from your spa (the first two are
   discarded — the probe sees heated water before the tub has mixed), and an estimate that
-  moved before then would only be reacting to rounding. From the second run onwards there
-  is a learned rate to start from and the hold never appears again. The **Ambient learning** diagnostic
+  moved before then would only be reacting to rounding. The same hold applies at the start of every scheduled run, so what you see at handover is
+  the time the scheduler planned for until the spa has measured its own rate. The **Ambient learning** diagnostic
   sensor gains a `thermal_model` attribute showing both parameters, how many samples are
   behind each, and the water volume and standing loss they imply — worth comparing
   against your spa's specification.
