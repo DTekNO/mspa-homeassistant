@@ -1333,6 +1333,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             self._prediction.get("target_temp", 0),
                             self._prediction.get("start_time", "unknown"),
                         )
+                        self.restore_thermal_run(stored)
                     if isinstance(stored_buckets, list) and len(stored_buckets) == 3:
                         save_ts = stored.get("bucket_save_ts")
                         if save_ts is not None:
@@ -1474,12 +1475,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             await self._rates_store.async_save({
                 "heat_rate": self.computed_heat_rate,
                 "cool_rate": self.computed_cool_rate,
-                # The thermal model. Two numbers and their sample counts — the whole
-                # of what it needs to survive a restart.
+                # The thermal model. Two numbers and their sample counts are what it
+                # needs to survive a restart between runs; the run in progress also needs
+                # its chord points, or a restart mid-run costs it the end-of-run tau fit
+                # — see restore_thermal_run.
                 "thermal_a": self.thermal_a,
                 "thermal_tau_h": self.thermal_tau_h,
                 "thermal_a_n": self.thermal_a_n,
                 "thermal_tau_n": self.thermal_tau_n,
+                "thermal_points": list(self._thermal_points or []),
+                "thermal_crossings_seen": self._thermal_crossings_seen,
                 "heat_rate_buckets": self.heat_rate_buckets,
                 "heat_rate_buckets_norm": self.heat_rate_buckets_norm,
                 # What the three learned rates say about themselves: whether they still
@@ -3855,6 +3860,42 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             max(gaps) - min(gaps), fitted, self.thermal_tau_h, self.thermal_tau_n,
             self.thermal_a if self.thermal_a is not None else float("nan"))
         self.reset_thermal_run()
+
+    def restore_thermal_run(self, stored: dict) -> None:
+        """Bring back the run in progress: its chord points and where its skip stands.
+
+        `A` and `tau` are stored every poll and survive any restart, but the points a
+        run has measured lived only in memory, and `finalise_thermal_run` needs at least
+        TAU_MIN_POINTS of them spanning TAU_MIN_GAP_SPREAD_K. A restart mid-run — which
+        is what every hot deploy is — threw them away. On 25.09.2026 a restart at 08:42,
+        seventeen hours and nine chords in with 2.5 °C to go, left the run with nothing
+        to fit tau from.
+
+        Called only when an in-progress prediction was restored, so the points come back
+        with the run they belong to and never attach to a later one. The chord being
+        measured is not restored: its anchor is on the monotonic clock, which does not
+        survive a restart, so the next crossing starts a fresh chord — and because the
+        crossing count is restored too, it anchors at once rather than repeating the
+        skip that guards the start of a run.
+        """
+        pts = stored.get("thermal_points") or []
+        restored = []
+        for p in pts:
+            try:
+                g, r = p
+                restored.append((float(g), float(r)))
+            except (TypeError, ValueError):
+                continue
+        self._thermal_points = restored
+        try:
+            self._thermal_crossings_seen = int(stored.get("thermal_crossings_seen") or 0)
+        except (TypeError, ValueError):
+            self._thermal_crossings_seen = 0
+        self._thermal_chord = []
+        if restored:
+            _LOGGER.info(
+                "Thermal: restored %d chord point(s) of the run in progress",
+                len(restored))
 
     def reset_thermal_run(self) -> None:
         """Start a fresh set of crossings. `A` and `tau` carry over; the points do not."""

@@ -199,7 +199,8 @@ class TestPersistence:
         """If this grows, the model has stopped being simple."""
         import inspect
         src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
-        for key in ("thermal_a", "thermal_tau_h", "thermal_a_n", "thermal_tau_n"):
+        for key in ("thermal_a", "thermal_tau_h", "thermal_a_n", "thermal_tau_n",
+                    "thermal_points", "thermal_crossings_seen"):
             assert f'"{key}"' in src, key
 
     def test_a_store_without_the_keys_leaves_the_seeds_standing(self):
@@ -212,6 +213,55 @@ class TestPersistence:
         c.thermal_a_n = stored.get("thermal_a_n", 0) or 0
         assert c.thermal_model().a == DEFAULT_A
         assert c.thermal_diagnostics()["seeded_a"] is True
+
+
+class TestARunSurvivesARestart:
+    """25.09.2026 08:42: a restart seventeen hours and nine chords into a run, with
+    2.5 °C to go, left the run with nothing to fit tau from. Every hot deploy is a
+    restart, so this is the ordinary case, not the edge."""
+
+    STORED = {
+        "active_prediction": {"start_temp": 21.5, "target_temp": 39.0},
+        "thermal_points": [[8.8, 1.088], [10.6, 0.963], [12.8, 0.895]],
+        "thermal_crossings_seen": 12,
+    }
+
+    def test_points_come_back_as_pairs(self):
+        c = _coord()
+        c.restore_thermal_run(self.STORED)
+        assert c._thermal_points == [(8.8, 1.088), (10.6, 0.963), (12.8, 0.895)]
+
+    def test_the_skip_is_not_repeated(self):
+        """Twelve crossings in, the next crossing anchors a chord straight away."""
+        c = _coord()
+        c._window_amb_n = 0; c._window_amb_sum = 0.0
+        c.restore_thermal_run(self.STORED)
+        c.note_thermal_crossing(0.0, 36.5)
+        assert [w for _, w, _ in c._thermal_chord] == [36.5]
+
+    def test_the_chord_in_progress_is_not_restored(self):
+        """Its anchor is on the monotonic clock, which a restart resets."""
+        c = _coord()
+        c.restore_thermal_run({**self.STORED, "thermal_chord": [[1.0, 36.0, 12.0]]})
+        assert c._thermal_chord == []
+
+    def test_a_store_without_the_keys_restores_nothing(self):
+        c = _coord()
+        c.restore_thermal_run({"active_prediction": {"start_temp": 21.5}})
+        assert c._thermal_points == [] and c._thermal_crossings_seen == 0
+
+    def test_corrupt_points_are_skipped_not_fatal(self):
+        c = _coord()
+        c.restore_thermal_run({**self.STORED, "thermal_points": [[8.8, 1.088], "x", [1]]})
+        assert c._thermal_points == [(8.8, 1.088)]
+
+    def test_the_restored_points_feed_the_tau_fit(self):
+        """The point of the exercise: a run that spans a restart still earns its fit."""
+        c = _coord()
+        pts = [[g, 1.20 - g / 35.0] for g in range(7, 20)]        # 13 points, 12 K
+        c.restore_thermal_run({**self.STORED, "thermal_points": pts})
+        c.finalise_thermal_run()
+        assert c.thermal_tau_h == pytest.approx(35.0, rel=0.02)
 
 
 class TestDiagnostics:
