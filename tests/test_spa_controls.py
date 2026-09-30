@@ -22,7 +22,8 @@ from custom_components.mspa.sensor import (
 )
 from custom_components.mspa.const import (
     DEFAULT_PUMP_POWER,
-    DEFAULT_BUBBLE_POWER,
+    DEFAULT_BUBBLE_POWER_LEVELS,
+    DEFAULT_JET_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
     DEFAULT_HEATER_POWER_HEAT,
 )
@@ -179,10 +180,41 @@ class TestTotalPower:
         entry = _make_config_entry()
         assert _calculate_total_power(c, entry) == DEFAULT_PUMP_POWER
 
-    def test_bubble_on_adds_bubble_power(self):
-        c = _make_coord(bubble="on")
+    def test_bubble_level_defaults_are_proportional(self):
+        assert DEFAULT_BUBBLE_POWER_LEVELS == (375, 625, 900)
+
+    @pytest.mark.parametrize("level", [1, 2, 3])
+    def test_bubble_on_uses_proportional_default_power(self, level):
+        c = _make_coord(bubble="on", bubble_level=level)
         entry = _make_config_entry()
-        assert _calculate_total_power(c, entry) == DEFAULT_BUBBLE_POWER
+        assert _calculate_total_power(c, entry) == DEFAULT_BUBBLE_POWER_LEVELS[level - 1]
+
+    @pytest.mark.parametrize("level", [1, 2, 3])
+    def test_bubble_power_uses_configured_level(self, level):
+        c = _make_coord(bubble="on", bubble_level=level)
+        entry = _make_config_entry(options={f"bubble_power_level_{level}": 400 + level})
+        assert _calculate_total_power(c, entry) == 400 + level
+
+    def test_legacy_bubble_power_is_used_when_level_power_is_unset(self):
+        c = _make_coord(bubble="on", bubble_level=3)
+        entry = _make_config_entry(options={"bubble_power": 750})
+        assert _calculate_total_power(c, entry) == 750
+
+    def test_invalid_bubble_level_uses_level_one_power(self):
+        c = _make_coord(bubble="on", bubble_level="invalid")
+        entry = _make_config_entry(options={"bubble_power_level_1": 500})
+        assert _calculate_total_power(c, entry) == 500
+
+    def test_jet_on_adds_configured_jet_power(self):
+        c = _make_coord(jet="on")
+        entry = _make_config_entry(options={"jet_power": 350})
+        assert _calculate_total_power(c, entry) == 350
+
+    def test_jet_on_uses_default_jet_power(self):
+        c = _make_coord(jet="on")
+        entry = _make_config_entry()
+        assert DEFAULT_JET_POWER == 1100
+        assert _calculate_total_power(c, entry) == DEFAULT_JET_POWER
 
     def test_heater_preheat_state(self):
         c = _make_coord(heater="on", heat_state=2)

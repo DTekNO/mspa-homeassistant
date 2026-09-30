@@ -43,7 +43,10 @@
         "description": "Configure the power consumption values for accurate energy monitoring. These values are based on your hot tub model specifications but can be adjusted to match your actual measurements.",
         "data": {
           "pump_power": "Pump/Filter Power (Watts)",
-          "bubble_power": "Bubble Generator Power (Watts)",
+          "bubble_power_level_1": "Bubble Power - Level 1 (Watts)",
+          "bubble_power_level_2": "Bubble Power - Level 2 (Watts)",
+          "bubble_power_level_3": "Bubble Power - Level 3 (Watts)",
+          "jet_power": "Jet Power (Watts)",
           "heater_power_preheat": "Heater Preheat Power (Watts)",
           "heater_power_heat": "Heater Active Heating Power (Watts)",
           "track_temperature_unit": "Reset the spa's °C/°F after a power cut",
@@ -54,7 +57,10 @@
         },
         "data_description": {
           "pump_power": "Power consumption when the filter pump is running (typically 60W)",
-          "bubble_power": "Power consumption when bubbles are active (typically 900W)",
+          "bubble_power_level_1": "Power consumption at bubble level 1 (default: 375W)",
+          "bubble_power_level_2": "Power consumption at bubble level 2 (default: 625W)",
+          "bubble_power_level_3": "Power consumption at bubble level 3 (default: 900W)",
+          "jet_power": "Power consumption when jets are active (default: 1100W). Adjust for your model, or set to 0 if unsupported.",
           "heater_power_preheat": "Power consumption during preheat mode (typically 1500W)",
           "heater_power_heat": "Power consumption during active heating (typically 2000W)",
           "track_temperature_unit": "The spa forgets whether it is set to Celsius or Fahrenheit when it loses power. When it comes back online, set it again to match Home Assistant.",

@@ -883,7 +883,8 @@ The integration provides comprehensive power and energy monitoring for your hot 
 The integration provides the following power sensors that report real-time power consumption in watts:
 
 - **Pump Power**: Reports pump power consumption (default: 60W when running)
-- **Bubble Power**: Reports bubble blower power consumption (default: 900W when running)
+- **Bubble Power**: Reports bubble blower consumption for the active level (defaults: 375W, 625W, and 900W for levels 1-3)
+- **Jet Power**: Adds jet consumption when the jets are active (default: 1100W; adjust for your model or set to 0 if unsupported)
 - **Heater Power**: Reports heater power consumption based on heating state:
   - Preheat mode: 1500W (default)
   - Heating mode: 2000W (default)
@@ -911,7 +912,8 @@ The default power consumption values are based on typical MSpa specifications, b
 
 1. **Find your MSpa specifications**: Check your hot tub's manual or specification plate for the actual power ratings of:
    - Filter pump (typically 40-80W)
-   - Bubble blower (typically 800-1000W)
+    - Bubble blower at levels 1, 2, and 3 (typically 800-1000W; check your model's specifications)
+    - Jet pump, if supported by your model
    - Heater during preheat (typically 1200-1500W)
    - Heater during normal heating (typically 1800-2200W)
 
@@ -920,7 +922,8 @@ The default power consumption values are based on typical MSpa specifications, b
    - Click the **⚙️ cog wheel button** (Configure) on your MSpa integration
    - Enter the power consumption values for your specific model:
      - **Pump Power** (default: 60W)
-     - **Bubble Power** (default: 900W)
+      - **Bubble Power - Level 1**, **Level 2**, and **Level 3** (defaults: 375W, 625W, and 900W)
+      - **Jet Power** (default: 1100W; adjust for your model's specifications, or set to 0 if unsupported)
      - **Heater Power (Preheat)** (default: 1500W)
      - **Heater Power (Heat)** (default: 2000W)
    - Click **Submit**
@@ -935,6 +938,8 @@ The default power consumption values are based on typical MSpa specifications, b
 - Heater: 1500W (preheat) / 2000W (heating)
 
 These are used as defaults, but your model may differ.
+
+Bubble power is calculated from the current `bubble_level` reported by the spa. The defaults scale levels 1-3 proportionally to a 900W maximum; adjust them to your model's actual consumption. The API currently reports the selected level but not the maximum supported level, so the integration exposes levels 1-3. The Total Power sensor attributes include the active bubble level, configured wattage for each level, and active/configured jet power.
 
 ## Temperature Unit Control
 
