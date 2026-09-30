@@ -80,6 +80,9 @@ MIN_TEMP = 20
 # These are configurable per-device in the integration options
 DEFAULT_PUMP_POWER = 60  # Filter pump: 2000l/t, 60W, 12V
 DEFAULT_BUBBLE_POWER = 900  # Bubble generator: 900W (1.2HP)
+# Proportional defaults for three bubble levels, normalized to a 900W maximum.
+DEFAULT_BUBBLE_POWER_LEVELS = (375, 625, 900)
+DEFAULT_JET_POWER = 1100  # Typical jet pump power; configurable for each spa model
 DEFAULT_HEATER_POWER_PREHEAT = 1500  # Heating element: 1500W (preheat mode)
 DEFAULT_HEATER_POWER_HEAT = 2000  # Heating element in active heating (estimated)
 

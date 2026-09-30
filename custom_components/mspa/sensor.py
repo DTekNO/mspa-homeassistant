@@ -10,7 +10,8 @@ from homeassistant.util import dt as dt_util
 from .const import (
     DOMAIN,
     DEFAULT_PUMP_POWER,
-    DEFAULT_BUBBLE_POWER,
+    DEFAULT_BUBBLE_POWER_LEVELS,
+    DEFAULT_JET_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
     DEFAULT_HEATER_POWER_HEAT,
     CONF_SCHEDULE_TARGET_TEMP,
@@ -74,20 +75,37 @@ def _get_option_int(config_entry, key: str, default: int) -> int:
         return default
 
 
+def _get_bubble_level(data: dict) -> int:
+    """Return the reported bubble level within the levels this integration supports."""
+    try:
+        level = int(data.get("bubble_level", 1))
+    except (TypeError, ValueError):
+        level = 1
+    return max(1, min(3, level))
+
+
+def _get_bubble_power(config_entry, level: int) -> int:
+    """Return a level-specific wattage, falling back to the legacy shared option."""
+    level_default = DEFAULT_BUBBLE_POWER_LEVELS[level - 1]
+    legacy_power = _get_option_int(config_entry, "bubble_power", level_default)
+    return _get_option_int(config_entry, f"bubble_power_level_{level}", legacy_power)
+
+
 def _calculate_total_power(coordinator, config_entry) -> float:
     """Calculate total power consumption in watts from all active components."""
     total_power = 0
     data = coordinator._last_data
 
     pump_power = _get_option_int(config_entry, "pump_power", DEFAULT_PUMP_POWER)
-    bubble_power = _get_option_int(config_entry, "bubble_power", DEFAULT_BUBBLE_POWER)
     heater_preheat_power = _get_option_int(config_entry, "heater_power_preheat", DEFAULT_HEATER_POWER_PREHEAT)
     heater_heat_power = _get_option_int(config_entry, "heater_power_heat", DEFAULT_HEATER_POWER_HEAT)
 
     if data.get("filter") == "on":
         total_power += pump_power
     if data.get("bubble") == "on":
-        total_power += bubble_power
+        total_power += _get_bubble_power(config_entry, _get_bubble_level(data))
+    if data.get("jet") == "on":
+        total_power += _get_option_int(config_entry, "jet_power", DEFAULT_JET_POWER)
     if data.get("heater") == "on":
         heat_state = data.get("heat_state")
         if heat_state == 2:
@@ -2326,21 +2344,31 @@ class MSpaTotalPowerSensor(MSpaSensorEntity):
     def extra_state_attributes(self):
         """Return additional attributes showing breakdown of power usage."""
         pump_power = _get_option_int(self._config_entry, "pump_power", DEFAULT_PUMP_POWER)
-        bubble_power = _get_option_int(self._config_entry, "bubble_power", DEFAULT_BUBBLE_POWER)
+        data = self.coordinator._last_data
+        bubble_level = _get_bubble_level(data)
+        bubble_power = _get_bubble_power(self._config_entry, bubble_level)
+        bubble_on = data.get("bubble") == "on"
+        jet_power = _get_option_int(self._config_entry, "jet_power", DEFAULT_JET_POWER)
         heater_preheat_power = _get_option_int(self._config_entry, "heater_power_preheat", DEFAULT_HEATER_POWER_PREHEAT)
         heater_heat_power = _get_option_int(self._config_entry, "heater_power_heat", DEFAULT_HEATER_POWER_HEAT)
         
-        filter_on = self.coordinator._last_data.get("filter") == "on"
-        bubble_on = self.coordinator._last_data.get("bubble") == "on"
-        heater_on = self.coordinator._last_data.get("heater") == "on"
-        heat_state = self.coordinator._last_data.get("heat_state")
+        filter_on = data.get("filter") == "on"
+        jet_on = data.get("jet") == "on"
+        heater_on = data.get("heater") == "on"
+        heat_state = data.get("heat_state")
         
         return {
             "pump_power": pump_power if filter_on else 0,
             "bubble_power": bubble_power if bubble_on else 0,
+            "jet_power": jet_power if jet_on else 0,
             "heater_power": (heater_preheat_power if heat_state == 2 else heater_heat_power if heat_state == 3 else 0) if heater_on else 0,
             "configured_pump_power": pump_power,
             "configured_bubble_power": bubble_power,
+            "bubble_level": bubble_level,
+            "configured_bubble_power_level_1": _get_bubble_power(self._config_entry, 1),
+            "configured_bubble_power_level_2": _get_bubble_power(self._config_entry, 2),
+            "configured_bubble_power_level_3": _get_bubble_power(self._config_entry, 3),
+            "configured_jet_power": jet_power,
             "configured_heater_preheat_power": heater_preheat_power,
             "configured_heater_heat_power": heater_heat_power,
         }

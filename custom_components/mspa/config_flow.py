@@ -17,7 +17,8 @@ from .const import (
     REGIONS,
     COUNTRY_TO_REGION,
     DEFAULT_PUMP_POWER,
-    DEFAULT_BUBBLE_POWER,
+    DEFAULT_BUBBLE_POWER_LEVELS,
+    DEFAULT_JET_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
     DEFAULT_HEATER_POWER_HEAT,
     CONF_TRACK_TEMPERATURE_UNIT,
@@ -249,7 +250,8 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 # was set from outside the dialog and must survive a Submit — see async_step_init.
 # test_options_flow_key_list_matches_the_form keeps the two in step.
 OPTION_KEYS = frozenset({
-    "pump_power", "bubble_power", "heater_power_preheat", "heater_power_heat",
+    "pump_power", "bubble_power_level_1", "bubble_power_level_2",
+    "bubble_power_level_3", "jet_power", "heater_power_preheat", "heater_power_heat",
     CONF_TRACK_TEMPERATURE_UNIT, CONF_ALWAYS_ENFORCE_UNIT, CONF_RESTORE_STATE,
     CONF_WEATHER_ENTITY, CONF_SCHEDULE_TARGET_TEMP,
 })
@@ -278,8 +280,29 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 default=self.config_entry.options.get("pump_power", DEFAULT_PUMP_POWER),
             ): vol.All(int, vol.Range(min=0)),
             vol.Optional(
-                "bubble_power",
-                default=self.config_entry.options.get("bubble_power", DEFAULT_BUBBLE_POWER),
+                "bubble_power_level_1",
+                default=self.config_entry.options.get(
+                    "bubble_power_level_1",
+                    self.config_entry.options.get("bubble_power", DEFAULT_BUBBLE_POWER_LEVELS[0]),
+                ),
+            ): vol.All(int, vol.Range(min=0)),
+            vol.Optional(
+                "bubble_power_level_2",
+                default=self.config_entry.options.get(
+                    "bubble_power_level_2",
+                    self.config_entry.options.get("bubble_power", DEFAULT_BUBBLE_POWER_LEVELS[1]),
+                ),
+            ): vol.All(int, vol.Range(min=0)),
+            vol.Optional(
+                "bubble_power_level_3",
+                default=self.config_entry.options.get(
+                    "bubble_power_level_3",
+                    self.config_entry.options.get("bubble_power", DEFAULT_BUBBLE_POWER_LEVELS[2]),
+                ),
+            ): vol.All(int, vol.Range(min=0)),
+            vol.Optional(
+                "jet_power",
+                default=self.config_entry.options.get("jet_power", DEFAULT_JET_POWER),
             ): vol.All(int, vol.Range(min=0)),
             vol.Optional(
                 "heater_power_preheat",
