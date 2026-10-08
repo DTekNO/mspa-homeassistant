@@ -1,6 +1,9 @@
 # Nowcasting "Ready at"
 
-Agreed 08.10.2026. Nothing here is built yet.
+Agreed and built 08.10.2026. `custom_components/mspa/nowcast.py` is the arithmetic,
+free of Home Assistant so it can be replayed; the coordinator records the crossings and
+publishes the estimate; `tests/test_nowcast.py` and `tests/test_nowcast_wiring.py` are
+the tests, the second of which replays this run.
 
 ## The problem
 
@@ -66,7 +69,7 @@ get from an attribute, and `ready_status` already carries the words (`heating`,
 | `ready_at_time` | Keep. The single prediction. |
 | `ready_at` | Deprecate, then remove. |
 | `ready_status` | Keep. Carries the state words. |
-| `newton_ready_at`, `newton_start_at` | Remove. The shadow is unsound — see below. |
+| `newton_ready_at`, `newton_start_at` | **Removed.** The shadow is unsound — see below. |
 
 This repository has never removed or renamed an entity, and people have these on
 dashboards. So `ready_at` keeps working for at least one release, marked deprecated in
@@ -80,14 +83,72 @@ One entity, three regimes, with an attribute naming the active one.
 | Regime | When | Shows |
 |---|---|---|
 | `scheduled` | A schedule is pending, not yet heating | The scheduled ready time |
-| `opening` | Heating, window not yet usable | The held opening estimate |
+| `opening` | Heating, window not yet settled | The held opening estimate |
 | `nowcast` | Heating, window settled | The nowcast |
+| `fallback` | No outdoor temperature at all | The learned model |
+
+Each regime answers alone — no vote, no blend — and the `regime` attribute says which did.
 
 The hold is what prevents a jump at handover. That property came from the hold, not from
-the scheduler and the display sharing an engine, so the two may now differ freely. Release
-the hold after the window is settled, not after one chord.
+the scheduler and the display sharing an engine, so the two may now differ freely. It is
+released when the window **settles**, not when the first chord completes: a chord is
+1.5 °C of measured heating, which the opening bands can supply while the tub is still
+stratified and reading fast.
+
+`fallback` exists for one reason. The nowcast needs a gap, so without a weather entity it
+cannot answer at all, and a blank Ready at is a broken dashboard.
+
+### There is no slew
+
+The displayed estimate used to be rate-capped at a minute per wall-clock minute, with a
+deadband, a hysteresis latch and a replan snap. All of that existed because a bucket rate
+was weeks old, so every 0.5 °C crossing re-anchored a plan built from stale numbers: over
+an 11 h session on 06.08 the unsmoothed display changed 166 times, 39 of them in the worst
+hour, with 14 direction reversals.
+
+Every surviving regime is steady by construction. The nowcast moves only when a crossing
+completes, and then by the width of a four-boundary window rather than a single reading;
+the opening estimate is held constant by definition; the scheduled time is the time that
+was asked for. Smoothing them only delayed correct answers — 122 minutes behind a right
+answer on 19.08. **Removed.** Five-minute rounding stays, for a different reason than it
+was introduced for: a finish five hours out is not known to the minute.
 
 ## The algorithm
+
+### What it may read
+
+This is the part worth being strict about, because every previous version of Ready at
+was wrong in the same way: it answered from things learned on another day.
+
+**Only the current run's own rates, plus temperature.**
+
+| Input | Where from |
+|---|---|
+| Crossing times and water temperatures | Measured this run |
+| Outdoor temperature, time-weighted per interval | The weather entity, this run |
+| Hourly temperature forecast | The weather entity, for the hours ahead |
+| The asymptote lift | One carried constant — see above |
+
+Temperature is the only outside information admitted, and it is admitted because it is a
+*term in the equation* rather than a correction bolted on outside one. The lift is
+carried, but it is not information about today: it is a property of heater power and
+insulation, it is mass-independent, and a 20 % error in it costs eleven minutes.
+
+Nothing else may enter, and the list matters more than the principle:
+
+- not `A`, which is derived from the lift and the measured rate
+- not the three learned bucket rates, nor their normalised form
+- not the prediction bias
+- not the session condition scalar
+- not the ambient rate factor, nor the learned per-band ambient sensitivity
+- not the frozen session plan or its shadow revisions
+- not the device's own `device_heat_perhour`
+- not the prediction history
+
+Every one of those describes a tub as it was on some earlier day. This one is standing
+next to the tub.
+
+### The six steps
 
 1. On every poll while heating, record each 0.5 °C **crossing**: timestamp, water
    temperature, and the time-weighted outdoor temperature over the interval since the
@@ -99,19 +160,45 @@ the hold after the window is settled, not after one chord.
 6. Integrate `dT/dt = A − (T − T_air(t)) / tau` forward in one-minute steps, taking
    `T_air` from the hourly forecast, until the target is reached.
 
+Step 5 is an identity, not a fit. From `rate = A − gap/tau` with `A = lift/tau`,
+`rate = (lift − gap)/tau` and the inversion is exact.
+
 Step 6 is worth doing properly. On 08.10 the forecast walk moved the answer 29 minutes
 **earlier** than a flat air temperature, because a sunny afternoon outweighed the cold
-night for a run finishing in the evening. The sign is not guessable without the integral.
+night for a run finishing in the evening. The sign is not guessable without the integral,
+and it reverses if the warm hours fall the other way round.
+
+The projection is anchored on the newest **crossing**, not on the current reading: between
+boundaries the reading is known only to within half a degree, while a crossing time is
+exact. If the next boundary is overdue the shortfall is added, so a stalled heat-up pushes
+the finish out instead of leaving it to stand still.
 
 ## Exceptions
 
 These are most of the work.
 
 - **Settling after heater-on.** The probe sits in the pump housing and reads unmixed
-  water. Today's rule discards two crossings. After a *power restore* the whole tub is
-  stratified and the transient is far longer: on 08.10 it ran at least four crossings.
-  Gate on a test rather than a count — hold until successive band rates stop falling
-  faster than Newton allows, about 0.014 °C/h per crossing at a 21 K gap.
+  water. The old rule discarded two crossings. After a *power restore* the whole tub is
+  stratified and the transient is far longer: on 08.10 the first band ran at 4.945 °C/h
+  against a settled 1.2.
+
+  So it is a test, not a count: hold until the derived `tau` stops climbing, compared
+  between two **non-overlapping** windows. Newton's own effect is already inside the
+  formula, so a pair of windows whose `tau` has stopped climbing is a pair whose bands
+  are consistent with Newton. Two cheaper versions were measured and rejected — band
+  against band cannot see a transient through the sun on the cover (seven *settled* bands
+  on 08.10 ranged `tau` 22.9 to 33.6 at a constant gap), and windows shifted by one share
+  three of four boundaries, diluting a 30 % decay to 6 %. Non-overlapping windows show it
+  as 20 %, so the threshold sits at 12 %.
+
+  Replayed, the gate holds five windows back while `tau` climbs 18.0 → 24.4 → 26.1 →
+  28.4 → 29.0, and releases at the ninth crossing. Taken at the fourth it would have
+  published `A` = 3.06 °C/h — about 650 litres on a 2.2 kW heater — and put the finish
+  hours early.
+
+  Once settled it stays settled for the run. A tub does not re-stratify while the heater
+  runs, and a latch keeps the gate from flickering on a rate that later changes for an
+  honest reason. A real interruption resets the run instead.
 - **Before the window exists.** Show the scheduler's committed finish if there is one,
   otherwise a seeded estimate from the lift and a default tau.
 - **Discard the window** on a data gap, on any temperature drop (cold water added, or a
@@ -119,8 +206,10 @@ These are most of the work.
 - **Target change** keeps the window. The measured rate is still valid; only the
   destination moved.
 - **Quantisation.** Require the window to span a real 1.5 °C, not a sensor artefact.
-- **Guards.** If `rate <= 0`, or `tau` falls outside a plausible range, fall back to the
-  opening estimate rather than publishing a number.
+- **Guards.** If `rate <= 0`, if `tau` falls outside a plausible range, if the window has
+  no outdoor temperature to compute a gap from, or if the asymptote sits at or below the
+  target, publish nothing and let the regime below answer. A very large number would be
+  read as a prediction.
 
 ## Why tau cannot be fitted locally
 
@@ -222,7 +311,10 @@ scheduler uses it on the next run; under the current one it would crawl from 36.
 28 over several.
 
 **Migration needs no surgery.** On first load, `lift = thermal_a × thermal_tau_h`, which
-is 55.196 today and is the correct starting value.
+is 55.196 today and is the correct starting value. The lift is then an EMA at 0.25 over
+completed runs — slow, because a sample far from the carried value is more likely to be a
+bad run than a changed spa — while `tau` is adopted outright from each run, because
+averaging it across runs that described different tubs never made sense.
 
 ### Key by key
 
@@ -275,7 +367,41 @@ the measured tau implied about 1000.
 
 ## Validation
 
-Replay against recorded runs before shipping. The 08.10 run is the first validation set,
-and the predictions logged during it can be scored directly: crossings at 32.0, 32.5 and
-33.0 were called to within 5 minutes several hours ahead, against a learned-A estimate
-drifting 15 minutes further behind at each one.
+Replayed against the recorder's own history of the 08.10 run, in
+`tests/test_nowcast_wiring.py::TestTheRunItWasDesignedOn`. From the power coming back at
+07:30 UTC into a tub that had stood all night:
+
+| Crossing | Band °C/h | Window °C/h | tau | A | Settled | Finish, UTC |
+|---|---|---|---|---|---|---|
+| 07:36:46 | 4.945 | — | — | — | no | — |
+| 07:56:46 | 1.500 | — | — | — | no | — |
+| 08:17:46 | 1.429 | 1.912 | 18.02 | 3.063 | no | — |
+| 08:40:46 | 1.304 | 1.406 | 24.43 | 2.260 | no | — |
+| 09:05:16 | 1.224 | 1.314 | 26.14 | 2.112 | no | — |
+| 09:32:16 | 1.111 | 1.208 | 28.44 | 1.941 | no | — |
+| 09:56:47 | 1.224 | 1.184 | 28.95 | 1.907 | no | — |
+| 10:21:46 | 1.201 | 1.176 | 29.06 | 1.899 | **yes** | 17:29 |
+| 10:41:46 | 1.500 | 1.295 | 26.38 | 2.092 | yes | 16:44 |
+| 11:11:16 | 1.017 | 1.208 | 28.31 | 1.949 | yes | 17:11 |
+| 11:33:17 | 1.363 | 1.258 | 27.14 | 2.034 | yes | 16:51 |
+| 11:57:18 | 1.249 | 1.192 | 28.49 | 1.937 | yes | 17:02 |
+| 12:18:47 | 1.396 | 1.333 | 25.35 | 2.178 | yes | 16:22 |
+| 12:50:17 | 0.952 | 1.169 | 28.80 | 1.917 | yes | 17:01 |
+
+Three things to read out of it.
+
+The **settling gate is load-bearing**. Five windows pass before it releases, and every one
+of them is wrong; the first implies a heater driving about 650 litres. Published, it would
+have put the finish hours early and spent the rest of the day walking it back, which is
+the failure being replaced.
+
+The **settled window measures this water**. Every one puts `tau` between 25 and 29 h. The
+value in the store was 36.68, describing about 1257 litres against the roughly 1000
+actually in the tub. That is the whole case for taking `tau` from the run rather than
+averaging it across runs.
+
+The **residual scatter is real, not noise in the estimator**. The finishes sit in a
+forty-minute band around 17:00 UTC, against the learned model's 20:55. What moves them is
+single-band variation — 1.396 and 0.952 °C/h either side of 12:18, at a nearly constant
+gap — which is what the four-boundary window exists to average and what the `uv` column is
+being kept to explain.
