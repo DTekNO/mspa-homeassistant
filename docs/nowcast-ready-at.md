@@ -196,6 +196,73 @@ history ever has to be downloaded by hand.
 Revisit in a few weeks with real data. If either proves to matter, the forecast already
 carries both.
 
+## What happens to the stored coefficients
+
+The store does not need clearing. It needs re-parameterising.
+
+### From (A, tau) to (lift, tau)
+
+Today `A` and `tau` each carry their own memory: `A` is blended at 0.35 per chord across
+36 samples, `tau` is fitted once per run across 2. Nothing constrains their product. But
+the product is the one physically stable quantity — it is mass-independent — while each
+factor alone moves with the water level. The current scheme therefore puts a long memory
+on the two things that genuinely change, and lets the thing that does not change drift
+wherever those two happen to take it. That is why a refill takes several runs to work
+through.
+
+Invert it:
+
+- **`lift`** gets the long memory. It is a property of heater power and insulation, and a
+  refill does not touch it.
+- **`tau`** is taken fresh from each completed run, because that is what tracks the water.
+- **`A`** is no longer stored as a learned value at all. It is derived, `A = lift / tau`.
+
+Today's run measures a tau near 28 h on the new water level. Under this scheme the
+scheduler uses it on the next run; under the current one it would crawl from 36.68 toward
+28 over several.
+
+**Migration needs no surgery.** On first load, `lift = thermal_a × thermal_tau_h`, which
+is 55.196 today and is the correct starting value.
+
+### Key by key
+
+| Keys | Fate |
+|---|---|
+| `lift`, `lift_n` | **New.** The only thing the nowcast needs from the store. |
+| `thermal_tau_h`, `thermal_tau_n` | Keep, re-defined as the tau measured in the last completed run rather than a cross-run EMA. |
+| `thermal_a`, `thermal_a_n` | Retire as learned values. `A` becomes derived. |
+| `thermal_points`, `thermal_crossings_seen`, `active_prediction`, `temp_anchor_time`, `schedule_triggered` | Unchanged. Per-run working state. |
+| `prediction_history`, `band_observations`, `band_stats`, `bias_evaluation` | **Keep — these become the validation set.** See below. |
+| `prediction_bias`, `prediction_bias_applied` | Remove from the prediction path. |
+| `heat_rate`, `cool_rate`, `heat_rate_buckets*`, `bucket_shape*`, `band_ambient_k`, `ambient_ref_c`, `bucket_save_ts`, `ambient_baseline` | Keep for now as the no-air fallback. Off the main path. |
+| `newton_ready_at`, `newton_start_at`, `newton_fit`, `newton_implied_tub`, `newton_ambient_source` | Delete with the shadow sensors. |
+| `forecast_resolution`, `forecast_hours`, `schedule_ambient`, `schedule_ambient_kind` | Keep. Forecast diagnostics. |
+
+### The session records are the validation set
+
+`prediction_history` and `bias_evaluation` hold the initial estimate and the actual heat
+time for each completed session. They were collected to learn a bias. They are worth more
+than that now: they are the only record of how well anything predicted, and they are what
+the nowcast must be scored against before it ships.
+
+So keep collecting them, and repoint the scoring to compare the nowcast rather than the
+bucket variants.
+
+### But drop the bias itself
+
+`prediction_bias` is a multiplicative correction learned from how wrong the last sessions
+were. The nowcast must not have one. A systematic error in a model that measures the tub
+directly is a fault to find, not a coefficient to absorb it — and the existing bias was
+learned against the bucket model in any case. Keep recording the ratio if it is useful to
+watch; do not apply it.
+
+### Why the buckets stay a while longer
+
+The nowcast needs an outdoor temperature to compute a gap, so it cannot answer at all
+without one. Until it has a no-air mode, the bucket model remains the fallback for an
+installation with no weather entity. It leaves the main path immediately; it leaves the
+codebase later.
+
 ## The scheduler
 
 Unchanged in structure: it must still predict from learned values, because at the moment
