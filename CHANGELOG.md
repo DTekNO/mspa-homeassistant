@@ -7,13 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Ready at time is now nowcast from the run's own crossings.** Rate from a rolling
+  window over the last four 0.5 °C boundaries, inverted to a trajectory through one
+  carried constant, then walked forward over the hourly temperature forecast. No learned
+  rates reach it. A `regime` attribute says which of four produced the time: `nowcast`,
+  `opening` (held until the water has mixed), `scheduled`, or `fallback` (no weather
+  entity, so no gap to compute).
+- **The displayed estimate is no longer smoothed.** The rate cap, deadband and replan snap
+  have gone; a correction lands in one step.
+- **`tau` is taken from each completed run** rather than averaged across runs, so a refill
+  or a drain is believed immediately instead of over several sessions.
+- **Ready at time attributes.** Added `regime`, `nowcast_rate_c_per_h`, `nowcast_tau_h`,
+  `nowcast_a_c_per_h`, `nowcast_lift_c`, `nowcast_gap_c`, `nowcast_air_c`,
+  `nowcast_window_span_c`, `nowcast_window_hours`, `nowcast_crossings`,
+  `nowcast_settled`, `nowcast_asymptote_c`, `nowcast_forecast_held`. Removed
+  `effective_rate_deg_per_hour`, `computed_heat_rate_deg_per_hour`,
+  `computed_cool_rate_deg_per_hour`, `heat_rate_cold/mid/hot_deg_per_hour`,
+  `session_condition_scalar`, `prediction_bias`, `ambient_baseline_deg_c`,
+  `ambient_factor`, `device_rate_deg_per_hour`, `progress_deviation` and `plan_settled`.
+
 ### Added
+
+- **Crossing log.** Every 0.5 °C crossing is written to its own store with the
+  time-weighted outdoor temperature, UV index, wind and gust over the interval. Kept for
+  about three months, because the recorder purges states after ten days and keeps only
+  hourly statistics, which destroys the crossing times.
 
 - **Connectivity sensor.** A diagnostic binary sensor that reports whether the spa is
   still answering, and unlike every other entity it stays available when the spa is not,
   so an automation can trigger on it. Attributes carry `last_seen` and `offline_minutes`.
   Short gaps are ignored: the window is 10 minutes by default and configurable under
   Configure as "Call the spa offline after".
+
+### Removed
+
+- **Newton ready at and Newton start at.** Diagnostic shadow sensors from the physical
+  model's evaluation.
+
+### Deprecated
+
+- **Ready at** (`sensor.*_ready_at`), the compact text sensor. Use **Ready at time** and
+  its `compact` attribute, with **Ready status** for the words. It keeps working.
 
 ## [2026.9.1]
 

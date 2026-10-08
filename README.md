@@ -229,7 +229,8 @@ reason they exist. A condition written against the display text silently never f
 
 **Both pairs are complete.** Every attribute the old sensors publish is published by
 the replacements, under the same names with the same values — `ready_at`,
-`ready_at_kind`, `minutes_remaining`, `direction` and the rate diagnostics included.
+`ready_at_kind`, `minutes_remaining` and `direction` included, plus the nowcast
+diagnostics that only the replacement carries.
 The replacements own the implementation and the deprecated sensors read *them*, so the
 two cannot drift apart while both exist.
 
@@ -285,9 +286,11 @@ On a brand-new installation the integration has no observed heating or cooling r
 
 It updates continuously from observed data and corrects for changing conditions — season, ambient temperature, cover on or off, water fill level — without any configuration required.
 
-> **Experimental: the Newton diagnostic sensors.** Two diagnostic entities, **Newton ready at** and **Newton start at**, show what an alternative physical heating model would have predicted. They are there so the alternative can be watched against the model that actually runs your spa, and they decide nothing — your Ready at, your Heat schedule and when heating starts all come from the learned rates described above, exactly as before.
->
-> **Please don't build automations or dashboard cards on them yet.** They are unproven, they go blank whenever the model has too little data or says the target is out of reach, and they may change or disappear without notice. Once there is evidence they work, the improvement will arrive in the existing Ready at and Heat schedule sensors — so there will be nothing to rewire.
+> **The live Ready at time does not use those learned rates.** Everything described in
+> this section is how the integration predicts *before* a heat-up starts — which it has
+> to do from learning, because at the moment it decides when to start there is nothing to
+> measure. Once the spa is heating, the time you watch comes from the spa itself instead.
+> See [Nowcasting the live Ready at time](#nowcasting-the-live-ready-at-time).
 
 #### Online learning with exponential smoothing
 
@@ -368,7 +371,7 @@ So the weather model does its work exactly where it is needed — the pre-start 
 
 **Without a weather entity** the factor is `1.0` and estimates fall back to the plain learned rates. Nothing needs to be disabled.
 
-You can watch the correction in the `ambient_temp_deg_c`, `ambient_baseline_deg_c`, and `ambient_factor` attributes on the Ready at sensor.
+You can watch the correction in the `ambient_temp_deg_c`, `ambient_baseline_deg_c`, and `ambient_factor` attributes on the **Ambient learning** diagnostic sensor.
 
 #### Optional weather entity
 
@@ -451,9 +454,55 @@ Bucket rates loaded from storage decay gradually toward the global flat EMA over
 
 This prevents stale seasonal data — for example rates learned in summer — from permanently anchoring winter predictions.
 
+### Nowcasting the live Ready at time
+
+Everything above describes how the integration predicts **before** a heat-up starts. It
+has to do that from learning, because at the moment it decides when to start there is
+nothing to measure yet.
+
+Once the spa is heating, there is. The water temperature reports in 0.5 °C steps, and each
+of those **crossings** is an exact fact: a known temperature at a known time. Four of them
+span 1.5 °C, which is enough to measure a rate that means something — and that rate is
+this tub, today, at this water level, in this weather, with this cover. No learning can
+match it, and more to the point, learning can disagree with it badly. On 08.10.2026 a tub
+that had just been refilled to a lower level was measurably going to be ready in the early
+evening, while the learned model read 22:55 — because its parameters described a tub with
+about 260 litres more water in it.
+
+So the live estimate is built from the run's own crossings and nothing else that was
+learned on another day:
+
+1. The last four crossings give a **rate**, recomputed at every crossing. A rolling window,
+   so it self-corrects: a lower water level, a cold night, a sunny afternoon all arrive as
+   a changed rate without anything having to model them.
+2. One carried constant turns that rate into a **curve** — the height of the heater's
+   asymptote above the air. That number is a property of heater power and insulation and
+   survives a refill untouched, which is exactly why it is the one carried. It also barely
+   matters: a 20 % error in it costs about eleven minutes.
+3. The curve is then **walked forward hour by hour through the temperature forecast**, so a
+   run spanning dawn is priced against the weather it will actually meet. On 08.10 that
+   moved the answer 29 minutes earlier than a flat air temperature.
+
+Two things follow that are worth knowing about.
+
+**It is held at the start of a run.** The temperature probe sits in the pump housing and
+reads heated water before the tub has mixed, so the first bands after the heater engages
+run far too fast — 4.9 °C/h against a settled 1.2 on 08.10, after the tub had stood all
+night. Until successive windows agree that the water has mixed, Ready at time shows the
+estimate the scheduler committed to and the `nowcast_settled` attribute reads `false`.
+
+**It is not smoothed.** A correction lands in one step rather than crawling toward the
+right answer over the next hour. The window is wide enough that it does not twitch, so
+there is nothing left to smooth, and smoothing only ever delayed correct answers.
+
+**Without a weather entity** the nowcast cannot run at all — it needs the outdoor
+temperature to know how fast the spa is losing heat — and Ready at time falls back to the
+learned model, reporting `regime: fallback`.
+
 ### Sensor attributes
 
-The **Ready at** sensor exposes diagnostic attributes useful while the algorithm is still bedding in. The user-facing attributes (`direction`, `minutes_remaining`, `color`, `ready_at`) are at the top; the algorithm internals follow:
+The **Ready at time** sensor publishes the answer and, alongside it, everything the answer
+was built from. The user-facing attributes are at the top; the nowcast's working is below.
 
 | Attribute | Description |
 |---|---|
@@ -462,20 +511,32 @@ The **Ready at** sensor exposes diagnostic attributes useful while the algorithm
 | `color` | `green` (ready), `red` (heating), `light-blue` (cooling) — for Mushroom card |
 | `ready_at` | **ISO 8601 UTC timestamp of the time shown in the state** — the scheduled ready time while a schedule is pending, the live estimate once heating. `null` only when the state is `Ready` or unknown. Use this if you need a machine-readable timestamp rather than the state's display string. |
 | `ready_at_kind` | What `ready_at` means: `sched` (the time you asked for), `eta` (live prediction), `ready`, or `none` |
-| `effective_rate_deg_per_hour` | Rate being used for the current estimate |
-| `computed_heat_rate_deg_per_hour` | Learned EMA heating rate (`null` until first sample) |
-| `computed_cool_rate_deg_per_hour` | Learned EMA cooling rate (`null` until first sample) |
-| `heat_rate_cold_deg_per_hour` | Bucket rate for < 30 °C (`null` until first sample in range) |
-| `heat_rate_mid_deg_per_hour` | Bucket rate for 30–37 °C |
-| `heat_rate_hot_deg_per_hour` | Bucket rate for ≥ 37 °C |
-| `session_condition_scalar` | Empirical in-session correction factor from observed vs. stored rate (1.0 = neutral) |
-| `prediction_bias` | Historical bias correction (1.0 = no correction, >1.0 = predictions were too optimistic) |
-| `ambient_temp_deg_c` | Current outdoor temperature from the weather entity (`null` if not configured) |
-| `ambient_baseline_deg_c` | Learned seasonal baseline the correction is measured against |
-| `ambient_factor` | Weather-model rate multiplier for the bucket the water is currently in (1.0 = neutral) |
-| `device_rate_deg_per_hour` | Heating rate reported by the device itself (some models only) |
+| `compact` | The same moment as `"14:00"` or `"14:00 +3d"`, for somewhere a rendered timestamp will not fit |
+| `regime` | Which of four produced the time: `nowcast`, `opening`, `scheduled`, `fallback` |
 | `current_temperature` | Current water temperature |
 | `target_temperature` | Current set-point |
+| `circulating` | Whether the probe is reading tub water rather than the pump housing |
+| `temperature_basis` | What the reading describes, in words |
+| `ambient_temp_deg_c` | Current outdoor temperature from the weather entity (`null` if not configured) |
+| `integration_version` | The build actually running, including a hot-deploy commit |
+
+The nowcast's working, all of it measured during this heat-up except the lift:
+
+| Attribute | Description |
+|---|---|
+| `nowcast_settled` | Whether the water has mixed. `false` means the time shown is held, not measured |
+| `nowcast_crossings` | How many 0.5 °C boundaries this run has recorded |
+| `nowcast_rate_c_per_h` | Rate over the last four boundaries — a 1.5 °C span |
+| `nowcast_window_span_c` | How far the water actually moved across that window |
+| `nowcast_window_hours` | How long it took |
+| `nowcast_air_c` | Time-weighted outdoor temperature over the window |
+| `nowcast_gap_c` | How far the water sits above the air at the window's midpoint |
+| `nowcast_tau_h` | Time constant implied by that rate, in hours. Tracks the water level |
+| `nowcast_a_c_per_h` | Heater against the water, derived as `lift / tau` |
+| `nowcast_lift_c` | The one carried constant, `A × tau`. Survives a refill untouched |
+| `nowcast_lift_samples` | How many completed runs have contributed to it |
+| `nowcast_asymptote_c` | Temperature this heater could hold against this air, given forever |
+| `nowcast_forecast_held` | `true` if the run outlasts the forecast and its last hour was carried on |
 
 You can inspect these in **Developer Tools → States** to see how the algorithm is performing.
 
@@ -685,10 +746,15 @@ The sensor identifies its **context** before estimating anything — this matter
 | Context | When | Shows |
 |---------|------|-------|
 | **Schedule pending** | A future schedule is set but has not fired yet | The scheduled ready time — or `Ready` if the water is already at the scheduled temperature |
-| **Scheduled heating** | The schedule has fired and the spa is heating | A live ETA to the **scheduled** temperature, recalculated from actual progress rather than the original plan |
-| **Free** | No schedule set | An ETA to the current thermostat set-point, or `Ready` when at target |
+| **Scheduled heating** | The schedule has fired and the spa is heating | A live estimate to the **scheduled** temperature, measured from actual progress rather than the original plan |
+| **Free** | No schedule set | An estimate to the current thermostat set-point, or `Ready` when at target |
 
-Estimates are computed from a fixed (temperature, timestamp) anchor rather than being re-derived on every poll, so the displayed time holds steady while the water temperature is unchanged and moves only when there is genuinely new information.
+Live estimates are anchored on the last 0.5 °C crossing — a known temperature at a known
+time — rather than re-derived from the current reading on every poll, so the displayed time
+holds steady between crossings and moves only when there is genuinely new information. If
+the next crossing is overdue the estimate is pushed out, so a heat-up that stalls does not
+leave a finish time standing still. See
+[Nowcasting the live Ready at time](#nowcasting-the-live-ready-at-time).
 
 ### Attributes
 
@@ -698,6 +764,9 @@ Estimates are computed from a fixed (temperature, timestamp) anchor rather than 
 | `minutes_remaining` | Integer countdown (null when ready or unavailable) |
 | `color` | `green` (ready/at_target), `red` (heating), `light-blue` (cooling) |
 | `ready_at` | ISO 8601 timestamp of the estimated ready time (null when ready or unavailable) |
+
+**Ready at time** carries considerably more — the window, rate and parameters the estimate
+was measured from. See [Sensor attributes](#sensor-attributes).
 
 ## Heat Schedule Sensor
 
