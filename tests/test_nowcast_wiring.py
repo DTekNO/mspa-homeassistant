@@ -24,16 +24,17 @@ _NOW = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
 def _real_clock():
     """The harness stubs homeassistant, so `dt_util` is a MagicMock and `utcnow()`
     returns one. A crossing's wall clock is what the projection is anchored on, so it
-    has to be a real datetime here.
+    has to be a real datetime here, and `parse_datetime` has to parse.
 
     Restored afterwards. `dt_util` is a module-level singleton shared with every other
     test module, and leaving a frozen clock behind broke the forecast-walk tests, which
     build their rows from the real one.
     """
-    original = coord_mod.dt_util.utcnow
+    original = coord_mod.dt_util.utcnow, coord_mod.dt_util.parse_datetime
     coord_mod.dt_util.utcnow = lambda: _NOW
+    coord_mod.dt_util.parse_datetime = datetime.fromisoformat
     yield
-    coord_mod.dt_util.utcnow = original
+    coord_mod.dt_util.utcnow, coord_mod.dt_util.parse_datetime = original
 
 
 def _coord(**over):
@@ -520,3 +521,62 @@ class TestTheRunItWasDesignedOn:
         assert c._crossing_log[1]["secs"] == pytest.approx(364, abs=2)
         assert c._crossing_log[1]["rate"] == pytest.approx(4.945, rel=0.01), (
             "the stratified opening band is recorded, not hidden")
+
+
+class TestARestartMidRun:
+    """A hot deploy is a restart mid-run, and the crossings live on the monotonic clock.
+
+    Without the log the window would have to be collected again from scratch — about two
+    hours of showing the learned fallback, which is the one estimate this design exists to
+    stop showing.
+    """
+
+    def _logged(self, rates, *, age_min=5.0, start=30.0):
+        """A crossing log as a run would have written it, ending `age_min` ago."""
+        rows, w = [], start + 0.5 * len(rates)
+        t = _NOW - timedelta(minutes=age_min)
+        for r in reversed(rates):
+            rows.append({"t": t.isoformat(timespec="seconds"), "water": w,
+                         "air": 12.0, "rate": r})
+            t -= timedelta(hours=0.5 / r)
+            w -= 0.5
+        rows.append({"t": t.isoformat(timespec="seconds"), "water": w, "air": None})
+        return list(reversed(rows))
+
+    def test_the_window_comes_back_intact(self):
+        c = _coord(nowcast_lift_c=55.0, _crossing_log=self._logged([1.25] * 6))
+        c.restore_nowcast_run()
+        assert len(c._nowcast_crossings) == 7
+        win = nc.measure(c._nowcast_crossings)
+        assert win.rate == pytest.approx(1.25, rel=1e-3), "the intervals survived"
+        assert c._nowcast_mixed is True, "and so did the settled verdict"
+
+    def test_the_estimate_is_available_immediately(self):
+        c = _coord(nowcast_lift_c=55.0, _crossing_log=self._logged([1.25] * 6))
+        c.restore_nowcast_run()
+        assert c.nowcast(39.5) is not None
+        assert c.nowcast_finish(39.5) is not None
+
+    def test_a_stale_log_is_a_previous_run(self):
+        """Splicing a run from yesterday onto this one would measure a rate across the
+        gap between them."""
+        c = _coord(nowcast_lift_c=55.0,
+                   _crossing_log=self._logged([1.25] * 6, age_min=600.0))
+        c.restore_nowcast_run()
+        assert c._nowcast_crossings == []
+
+    def test_an_earlier_run_in_the_same_log_is_cut_away(self):
+        """The log is a rolling record, so it holds the run before this one too. The
+        window restarts at the gap between them — six hours with the heater off, which no
+        0.5 °C band takes."""
+        old = self._logged([1.25] * 6, age_min=600.0, start=20.0)
+        new = self._logged([1.25] * 5, age_min=5.0, start=30.0)
+        c = _coord(nowcast_lift_c=55.0, _crossing_log=old + new)
+        c.restore_nowcast_run()
+        assert all(x.water >= 30.0 for x in c._nowcast_crossings)
+        assert len(c._nowcast_crossings) == len(new)
+
+    def test_an_empty_log_leaves_the_run_empty(self):
+        c = _coord(nowcast_lift_c=55.0, _crossing_log=[])
+        c.restore_nowcast_run()
+        assert c._nowcast_crossings == [] and c._nowcast_mixed is False

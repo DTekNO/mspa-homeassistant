@@ -1320,7 +1320,7 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
         # learned is used. The three bucket rates, the session scalar, the ambient factor
         # and the prediction bias all left with the model that needed them, and the
         # progress deviation left with the frozen plan it was measured against.
-        out.update(c.nowcast_diagnostics())
+        out.update(c.nowcast_diagnostics(_relevant_target(c)))
         return out
 
     @property

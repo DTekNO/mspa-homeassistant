@@ -343,6 +343,14 @@ _LIFT_ALPHA = 0.25
 # rather than having the last reading stretched across it.
 _CROSSING_MAX_POLL_GAP_S = 3600.0
 
+# And longer than this between two 0.5 °C boundaries is not a slow band, it is two
+# different heating stretches with the heater off in between. Two hours across half a
+# degree is 0.25 °C/h — a stalled heater rather than a cold night, which this spa crosses
+# at 0.95 °C/h at worst. Used when rebuilding a window from the log after a restart: the
+# log is a rolling record and holds the run before this one too, and splicing them would
+# measure a rate across the gap between them.
+_CROSSING_MAX_INTERVAL_S = 7200.0
+
 # How many crossing rows to keep. At forty crossings a run and a couple of runs a week
 # this is roughly three months — enough to settle whether UV and wind matter, which is
 # the question it is being kept for, and small enough that the file stays trivial.
@@ -1460,6 +1468,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                             self._prediction.get("start_time", "unknown"),
                         )
                         self.restore_thermal_run(stored)
+                        self.restore_nowcast_run()
                     if isinstance(stored_buckets, list) and len(stored_buckets) == 3:
                         save_ts = stored.get("bucket_save_ts")
                         if save_ts is not None:
@@ -4117,6 +4126,67 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._cross_last_mono = None
         self._reset_crossing_conditions()
 
+    def restore_nowcast_run(self) -> None:
+        """Rebuild the window from the crossing log after a restart.
+
+        A hot deploy is a restart mid-run, and without this the live estimate drops to
+        the learned fallback for the two hours it takes to collect four fresh crossings —
+        which is the one estimate this whole design exists to stop showing.
+
+        The crossings themselves live on the monotonic clock, which does not survive a
+        restart. The *log* is written in wall-clock time, so the window is rebuilt from
+        it and re-based onto the new monotonic clock: every row's offset from now is
+        known exactly, so the intervals come back intact.
+
+        Only rows that plausibly belong to the run now in progress. The newest must be
+        recent; and from row to row the water must rise and the interval must be short
+        enough to be one band of one climb. The log is a rolling record and holds the run
+        before this one too, so without both tests a window could be spliced across the
+        hours the heater spent off between them.
+        """
+        rows = self._crossing_log or []
+        if not rows:
+            return
+        now, now_mono = dt_util.utcnow(), time.monotonic()
+        restored, last_at = [], None
+        for row in rows[-(2 * nc.WINDOW_BOUNDARIES + 2):]:
+            try:
+                when = dt_util.parse_datetime(row["t"])
+                water = float(row["water"])
+            except (KeyError, TypeError, ValueError):
+                restored, last_at = [], None
+                continue
+            if when is None:
+                restored, last_at = [], None
+                continue
+            air = row.get("air")
+            age = (now - when).total_seconds()
+            if restored and (water <= restored[-1].water
+                             or (now_mono - age) - restored[-1].mono
+                             > _CROSSING_MAX_INTERVAL_S):
+                # Not one climb, or not one stretch. Start again from here.
+                restored = []
+            restored.append(nc.Crossing(
+                now_mono - age, water, None if air is None else float(air)))
+            last_at = when
+        if not restored:
+            return
+        if (now - last_at).total_seconds() > _CROSSING_MAX_POLL_GAP_S:
+            _LOGGER.debug(
+                "Nowcast: the crossing log ends %.0f min ago — too old to be this run",
+                (now - last_at).total_seconds() / 60.0)
+            return
+        self._nowcast_crossings = restored
+        self._nowcast_last_at = last_at
+        self._cross_last_mono = restored[-1].mono
+        self._reset_crossing_conditions()
+        self._nowcast_mixed = nc.settled(restored, self.nowcast_lift())
+        _LOGGER.info(
+            "Nowcast: restored %d crossing(s) of the run in progress from the log "
+            "(%s at %.1f °C); the window is %s",
+            len(restored), last_at.isoformat(timespec="minutes"), restored[-1].water,
+            "measured" if self._nowcast_mixed else "not yet settled")
+
     def record_nowcast_crossing(self, when_mono: float, temp) -> None:
         """Every 0.5 °C boundary while heating, with the weather it was reached through.
 
@@ -4239,11 +4309,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             finish += now - due
         return finish
 
-    def nowcast_diagnostics(self) -> dict:
+    def nowcast_diagnostics(self, target=None) -> dict:
         """What the live estimate is built on, for the Ready at attributes.
 
         Everything here is measured this run or carried as the single constant. Nothing
         learned appears, because nothing learned is used.
+
+        `target` is the one the display is driving towards, so that
+        `nowcast_forecast_held` describes the projection actually on screen rather than a
+        second one to somewhere else.
         """
         crossings = self._nowcast_crossings or []
         win = nc.measure(crossings)
@@ -4274,7 +4348,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             out["nowcast_tau_h"] = round(params[0], 2)
             out["nowcast_a_c_per_h"] = round(params[1], 3)
             out["nowcast_asymptote_c"] = round(win.air + self.nowcast_lift(), 1)
-        projected = self.nowcast(self.scheduling_temp())
+        projected = self.nowcast(target) if target is not None else None
         if projected is not None:
             out["nowcast_forecast_held"] = projected.air_held
         return out
