@@ -19,7 +19,8 @@ telling it the answer.
 The live estimate is rebuilt from the current run's own observations. The scheduler keeps
 the learned model, because it has to predict before a single crossing exists.
 
-- One **Ready at** sensor. `newton_ready_at` and `newton_start_at` are removed.
+- One prediction sensor, `ready_at_time`. The shadow pair `newton_ready_at` and
+  `newton_start_at` are removed, and the display-string `ready_at` is deprecated.
 - Rate from a **rolling window over the last four crossing boundaries**, recomputed at
   every crossing.
 - Project with **Newton's law, integrated over the hourly temperature forecast**.
@@ -50,6 +51,29 @@ reachable target, far from the steep part of the curve. A seeded default refined
 completed run is sufficient. This is not learning in any meaningful sense.
 
 ## The sensor
+
+### Which entities survive
+
+`ready_at_time` is the one that stays. Its state is an ISO timestamp with
+`device_class: timestamp`, which the frontend already renders in each viewer's own
+format, and it already carries a `compact` attribute holding the same short string that
+`ready_at` publishes as its state. So the string sensor adds nothing a dashboard cannot
+get from an attribute, and `ready_status` already carries the words (`heating`,
+`scheduled`, `ready`).
+
+| Entity | Fate |
+|---|---|
+| `ready_at_time` | Keep. The single prediction. |
+| `ready_at` | Deprecate, then remove. |
+| `ready_status` | Keep. Carries the state words. |
+| `newton_ready_at`, `newton_start_at` | Remove. The shadow is unsound — see below. |
+
+This repository has never removed or renamed an entity, and people have these on
+dashboards. So `ready_at` keeps working for at least one release, marked deprecated in
+the changelog, and is removed in a later one. It must not disappear in the same change
+that rewrites the prediction underneath it.
+
+### Regimes
 
 One entity, three regimes, with an attribute naming the active one.
 
@@ -132,10 +156,40 @@ stores**:
 - `wind_speed` and `wind_gust_speed` — kept separately rather than reduced to one figure,
   since it is not known which correlates.
 
-These are written, never read by the model. A bounded append-only log of the last ~1000
-crossings in the rates store is enough for a couple of months of runs and costs a few tens
-of kilobytes. Each row needs timestamp, water, interval, time-weighted air, UV, wind,
-gust, and the derived rate and gap — everything required to redo the regression offline.
+These are written, never read by the model.
+
+### Saving it: a crossing log, not a timeseries
+
+The water sensor only changes at half-degree boundaries, so **the crossing list is already
+the full resolution of that measurement**. There is no finer signal to preserve and no
+need to log raw polls.
+
+It does have to be saved locally, though. Home Assistant's recorder purges states after
+`purge_keep_days` (ten by default) and keeps only hourly long-term statistics after that,
+which destroys the crossing *times* — the one quantity this entire method rests on. Ten
+days from now today's run is unanalysable.
+
+**Write it to its own store, not the rates store.** The rates store is rewritten on every
+poll; a thousand-row log there would mean rewriting roughly a hundred kilobytes every
+thirty seconds, about 300 MB a day onto the Pi's storage. A separate store written only
+when a crossing completes is about fifty writes a day.
+
+One row per crossing:
+
+| Field | Why |
+|---|---|
+| `t` | Crossing timestamp. The thing LTS destroys. |
+| `water` | Temperature at the crossing. |
+| `secs` | Interval since the previous crossing. |
+| `air` | Time-weighted outdoor temperature over the interval. |
+| `air_start`, `air_end` | So an alternative weighting can be tested later. |
+| `uv` | Solar proxy. |
+| `wind`, `gust` | Separate, until one is shown to matter. |
+| `rate`, `gap` | Derived, stored so a row stands alone. |
+
+Bound it at about a thousand rows. At forty crossings per run and a couple of runs a
+week that is roughly three months, which comfortably covers the question being asked.
+This replaces downloading history by hand.
 
 Revisit in a few weeks with real data. If either proves to matter, the forecast already
 carries both.
