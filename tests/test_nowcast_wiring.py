@@ -385,3 +385,138 @@ class TestReadingTheWeatherExtras:
         assert _read_weather_extras(
             self._hass({"uv_index": 1.0}, state="unavailable"),
             "weather.x") == (None, None, None)
+
+
+# ── The run this was designed on ──────────────────────────────────────────────
+
+_RUN_0810 = [
+    # 08.10.2026, UTC. The power came back at 07:30 after a PRCD trip and the
+    # integration restarted the heat-up into a tub that had been standing all night.
+    ("07:30:42", 28.0), ("07:36:46", 28.5), ("07:56:46", 29.0), ("08:17:46", 29.5),
+    ("08:40:46", 30.0), ("09:05:16", 30.5), ("09:32:16", 31.0), ("09:56:47", 31.5),
+    ("10:21:46", 32.0), ("10:41:46", 32.5), ("11:11:16", 33.0), ("11:33:17", 33.5),
+    ("11:57:18", 34.0), ("12:18:47", 34.5), ("12:50:17", 35.0),
+]
+_AIR_0810 = [
+    ("06:17:38", 7.2), ("07:15:26", 7.3), ("07:21:26", 7.4), ("07:33:26", 7.6),
+    ("07:39:26", 7.8), ("07:51:26", 8.1), ("07:57:26", 8.2), ("08:03:27", 8.3),
+    ("08:15:27", 8.7), ("08:21:27", 8.9), ("08:33:27", 9.2), ("08:45:27", 9.3),
+    ("08:57:28", 9.4), ("09:03:26", 9.6), ("09:15:27", 9.9), ("09:21:27", 10.1),
+    ("09:33:27", 10.2), ("09:45:27", 10.3), ("09:51:26", 10.4), ("10:03:27", 10.6),
+    ("10:15:26", 10.9), ("10:21:27", 11.3), ("10:33:29", 11.5), ("10:45:27", 11.6),
+    ("10:51:26", 11.8), ("11:15:27", 11.9), ("11:21:27", 12.1), ("11:33:28", 12.3),
+    ("11:45:27", 12.4), ("11:57:27", 12.5), ("12:03:27", 12.7), ("12:15:27", 13.0),
+]
+# The store's own values that morning. Their product is the lift, which is the whole
+# migration: nothing had to be edited for the nowcast to start from the right place.
+_LIFT_0810 = 1.5048 * 36.68
+_TARGET_0810 = 39.5
+
+
+def _at(hhmmss):
+    return datetime.fromisoformat("2026-10-08T" + hhmmss + "+00:00")
+
+
+class TestTheRunItWasDesignedOn:
+    """08.10.2026 replayed through the coordinator, from the recorder's own history.
+
+    A model that cannot reproduce a measurement already in hand is not worth deploying,
+    and this run is the one the design came out of: a tub refilled to a lower level, a
+    power cut at 22:08 the night before, and a learned model reading 22:55 local for
+    water that arrived in the early evening.
+
+    It also contains the thing the settling gate exists for. The first band after the
+    power came back ran at 4.9 °C/h — the probe sits in the pump housing and the tub had
+    been standing all night — against a settled rate near 1.2.
+    """
+
+    def _replay(self, upto=None):
+        """Feed the real crossings and the real air, polling every 30 s between them."""
+        c = _coord(nowcast_lift_c=_LIFT_0810, nowcast_lift_n=1,
+                   thermal_a=1.5048, thermal_tau_h=36.68)
+        air = [(_at(s), v) for s, v in _AIR_0810]
+
+        def air_at(when):
+            seen = air[0][1]
+            for t, v in air:
+                if t > when:
+                    break
+                seen = v
+            return seen
+
+        rows = _RUN_0810[:upto] if upto else _RUN_0810
+        t0, prev, trace = _at(rows[0][0]), None, []
+        for s, w in rows:
+            when = _at(s)
+            mono = (when - t0).total_seconds()
+            if prev is not None:
+                t = (prev - t0).total_seconds()
+                while t < mono:
+                    t = min(t + 30.0, mono)
+                    c.ambient_temp = air_at(t0 + timedelta(seconds=t))
+                    c.accumulate_nowcast_conditions(t)
+            coord_mod.dt_util.utcnow = lambda when=when: when
+            c.record_nowcast_crossing(mono, w)
+            trace.append((s, w, c._nowcast_mixed, c.nowcast(_TARGET_0810),
+                          c.nowcast_finish(_TARGET_0810)))
+            prev = when
+        return c, trace
+
+    def test_the_stratified_opening_is_kept_out(self):
+        """Five windows pass before the gate fires, and every one of them is wrong.
+
+        The derived `tau` climbs 18.0 → 24.4 → 26.1 → 28.4 → 29.0 as the tub mixes,
+        which is the climb the gate detects. Nothing is published through any of it.
+        """
+        _, trace = self._replay()
+        settled_at = [s for s, _w, mixed, _n, _f in trace if mixed]
+        assert settled_at[0] == "10:21:46", settled_at[:1]
+        assert all(n is None for _s, _w, mixed, n, _f in trace if not mixed)
+
+    def test_the_first_window_would_have_been_absurd(self):
+        """What the gate is worth. Taken at the fourth crossing the window implies
+        A = 3.06 °C/h on a 2.2 kW heater — about 650 litres of water — and a tau of 18 h.
+        Published, it would have put the finish hours early and then walked it back all
+        day, which is the failure the old design is being replaced for.
+        """
+        c, _ = self._replay(upto=4)
+        win = nc.measure(c._nowcast_crossings)
+        tau_h, a = nc.derive(win, _LIFT_0810)
+        assert a > 3.0 and tau_h < 20.0
+        assert c.nowcast(_TARGET_0810) is None, "and the gate refused it"
+
+    def test_the_settled_window_measures_this_water_not_the_stored_tub(self):
+        """The finding the whole redesign rests on. Every settled window puts `tau` near
+        28 h; the value carried in the store was 36.68, which described about 1257 litres
+        against the roughly 1000 actually in the tub after the refill.
+        """
+        _, trace = self._replay()
+        taus = [n.tau_h for _s, _w, mixed, n, _f in trace if mixed]
+        assert len(taus) == 7
+        assert all(24.0 < t < 30.0 for t in taus), taus
+        assert max(taus) < 36.68, "the stored tau described a fuller tub"
+
+    def test_it_agrees_with_what_the_tub_actually_did(self):
+        """Every settled crossing puts the finish inside a 40-minute band around 17:00
+        UTC — a tub at 28 °C at 07:30 reaching 39.5 in the early evening. The learned
+        model said 20:55 UTC that afternoon, which is nearly four hours later.
+
+        The residual scatter is the single-band noise the window exists to average: the
+        bands either side of 12:18 ran 1.40 and 0.95 °C/h, and that is real variation in
+        the sun on the cover rather than measurement error.
+        """
+        _, trace = self._replay()
+        finishes = [f for _s, _w, mixed, _n, f in trace if mixed]
+        assert len(finishes) == 7
+        for f in finishes:
+            assert abs((f - _at("17:00:00")).total_seconds()) < 2400, f.isoformat()
+        assert max(finishes) < _at("20:55:00"), "the learned model's answer"
+
+    def test_the_whole_run_is_in_the_crossing_log(self):
+        """Ten days from now the recorder will have purged the states and kept hourly
+        statistics, which destroys the crossing times this method rests on."""
+        c, _ = self._replay()
+        assert len(c._crossing_log) == len(_RUN_0810)
+        assert c._crossing_log[1]["secs"] == pytest.approx(364, abs=2)
+        assert c._crossing_log[1]["rate"] == pytest.approx(4.945, rel=0.01), (
+            "the stratified opening band is recorded, not hidden")
