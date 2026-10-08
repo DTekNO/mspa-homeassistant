@@ -316,149 +316,6 @@ class TestTheSpecMakesItCheckable:
         assert c.physical_constants()["heater_power_w"] == 2200
 
 
-class TestTheShadowRunsInParallel:
-    """The physical model computes the same two things the bucket model decides — when
-    the water is ready, and when a scheduled run must start — and decides neither. What
-    these protect is that it stays a shadow, and that a row is readable.
-
-    A decline used to leave the state blank, on the reasoning that a gap in the history
-    is the finding. That holds while these are diagnostics and stops holding the moment
-    the model becomes selectable for planning: a start time reading `unknown` is not a
-    finding to whoever is relying on it to heat the tub. The row now falls back down the
-    same chain the shipping estimate uses and records which model answered, so the
-    finding survives as data rather than as absence.
-    """
-
-    def _coord(self, *, fitted=True, target=39.5, scheduled=None, triggered=False,
-               ambient=12.0, buckets=None):
-        from datetime import datetime, timedelta, timezone
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        c = object.__new__(MSpaUpdateCoordinator)
-        c._band_observations = _traverses(n=40, noise=0.02) if fitted else []
-        # The fallback chain runs thermal then buckets, so both need enough state to
-        # answer or decline honestly.
-        c._band_stats = {}
-        c._session_scalar = 1.0
-        c._session_fresh_buckets = frozenset()
-        c.prediction_bias = 1.0
-        c.computed_heat_rate = None
-        c.config_entry = type("E", (), {"options": {"heater_power_heat": 2200}})()
-        c._thermal_points = []
-        c.thermal_a = c.thermal_tau_h = None
-        c.forecast_segments = lambda: None
-        c.newton_ready_source = c.newton_start_source = None
-        c.newton_decline_reason = None
-        # Empty buckets by default, so "not fitted" means the chain has nothing to fall
-        # back on either. Seeding is exercised in TestBucketsCanPrimeTheModel.
-        c.heat_rate_buckets = buckets if buckets is not None else (None, None, None)
-        c.ambient_baseline = 18.4
-        c.ambient_temp = ambient
-        c.scheduled_ready_at = scheduled
-        c.schedule_target_temp = target if scheduled else None
-        c._schedule_triggered = triggered
-        c.newton_ready_at = c.newton_start_at = None
-        c.scheduling_temp = lambda: 24.0
-        return c
-
-    def test_it_shadows_ready_at(self):
-        c = self._coord()
-        c._update_newton_shadow(24.0, 39.5)
-        assert c.newton_ready_at is not None
-        assert c.newton_start_at is None, "no schedule pending, so nothing to plan"
-
-    def test_it_shadows_the_planned_start_against_the_scheduled_time(self, monkeypatch):
-        """The same subtraction the trigger makes, so the two are differenceable.
-
-        `dt_util.as_utc` is stubbed out by conftest, so it is given a real one here — the
-        coordinator deliberately routes through it exactly as `_check_schedule_trigger`
-        does, rather than taking a shortcut that would drift from the code it shadows.
-        """
-        from datetime import datetime, timedelta, timezone
-        from custom_components.mspa import coordinator as mod
-        monkeypatch.setattr(mod.dt_util, "as_utc",
-                            lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc))
-        due = datetime.now(timezone.utc) + timedelta(hours=20)
-        c = self._coord(scheduled=due)
-        c._update_newton_shadow(24.0, 39.5)
-        minutes = c.newton_minutes(24.0, 39.5)
-        assert (due - c.newton_start_at).total_seconds() / 60 == pytest.approx(
-            minutes, rel=1e-6)
-
-    def test_a_fired_schedule_has_no_planned_start_left(self):
-        from datetime import datetime, timedelta, timezone
-        due = datetime.now(timezone.utc) + timedelta(hours=2)
-        c = self._coord(scheduled=due, triggered=True)
-        c._update_newton_shadow(24.0, 39.5)
-        assert c.newton_start_at is None
-        assert c.newton_ready_at is not None, "but it is still heating towards something"
-
-    def test_a_fit_answers_for_itself(self):
-        c = self._coord()
-        c._update_newton_shadow(24.0, 39.5)
-        assert c.newton_ready_source == "newton"
-        assert c.newton_decline_reason is None
-
-    def test_no_fit_falls_back_and_says_so(self):
-        c = self._coord(fitted=False)
-        c._update_newton_shadow(24.0, 39.5)
-        assert c.newton_ready_at is not None, "a blank start time is not a finding"
-        assert c.newton_ready_source != "newton"
-        assert "no fit yet" in c.newton_decline_reason
-
-    def test_an_unreachable_target_falls_back_and_says_why(self):
-        """A cold enough night puts the asymptote below the setpoint. That is a real
-        answer from the model, and it stays in the record — as a reason attached to a
-        usable number, rather than as an absence indistinguishable from a missing fit."""
-        c = self._coord(ambient=-40.0)
-        c._update_newton_shadow(24.0, 39.5)
-        assert c.newton_ready_source != "newton"
-        assert "asymptote" in c.newton_decline_reason
-
-    def test_the_two_declines_are_told_apart(self):
-        """The whole reason the reason is recorded: no fit and an unreachable target
-        looked identical from outside when both were a blank state."""
-        no_fit = self._coord(fitted=False)
-        no_fit._update_newton_shadow(24.0, 39.5)
-        cold = self._coord(ambient=-40.0)
-        cold._update_newton_shadow(24.0, 39.5)
-        assert no_fit.newton_decline_reason != cold.newton_decline_reason
-
-    def test_nothing_at_all_still_shows_as_unknown(self):
-        """The one case that must stay blank: no model could answer, so there is no
-        number to show and inventing one would be worse than the gap."""
-        c = self._coord(fitted=False, ambient=None)
-        c.effective_ambient = lambda: (None, "none")
-        c._update_newton_shadow(24.0, 39.5)
-        assert c.newton_ready_at is None
-        assert c.newton_ready_source is None
-
-    def test_a_pending_schedule_aims_at_the_schedule_target(self):
-        """Mirroring the shipping sensor's choice of target, so the two series are
-        answering the same question rather than two different ones."""
-        from datetime import datetime, timedelta, timezone
-        due = datetime.now(timezone.utc) + timedelta(hours=20)
-        hot = self._coord(scheduled=due, target=40.0)
-        hot._update_newton_shadow(24.0, 30.0)          # thermostat much lower
-        cool = self._coord(scheduled=due, target=32.0)
-        cool._update_newton_shadow(24.0, 30.0)
-        assert hot.newton_ready_at > cool.newton_ready_at
-
-    def test_the_shadow_drives_nothing(self):
-        """The guarantee that matters. `_check_schedule_trigger` computes its own start
-        from `_compute_heating_minutes`; nothing in the trigger or the Ready at path may
-        read the shadow."""
-        import inspect
-        from custom_components.mspa import coordinator as mod
-        for name in ("_check_schedule_trigger", "_compute_heating_minutes",
-                     "_heating_minutes_variant", "scheduling_temp"):
-            src = inspect.getsource(getattr(mod.MSpaUpdateCoordinator, name))
-            assert "newton" not in src.lower(), (
-                f"{name} must not consult the shadow model")
-        from custom_components.mspa import sensor as sensor_mod
-        assert "newton" not in inspect.getsource(
-            sensor_mod._compute_ready_at).lower()
-
-
 class TestTheModelCanBeSwitchedWithoutMovingAnything:
     """The seam that lets Ready at and the Heat schedule run on either model.
 
@@ -841,89 +698,6 @@ class TestTheSolarConfoundIsRecorded:
         assert "condition" not in inspect.getsource(predictor._usable_rows)
 
 
-class TestTheTwoNumbersAreComparable:
-    """`Newton start at` is a true shadow: same question, same scheduled time, both
-    timestamps, so the pair differences directly. `Newton ready at` is not — the shipping
-    Ready at shows the *scheduled time verbatim* while a schedule is pending, and shows
-    a string like "Ready" or "11:00 +2d" rather than an estimate at all.
-
-    That asymmetry is accepted rather than fixed: the raw estimate is the useful thing to
-    watch, and dressing it up as the display sensor would hide the wandering the shadow
-    exists to expose. What is not acceptable is a side-by-side number that answers a
-    different question, which is what shipped first.
-    """
-
-    def _coord(self, *, scheduled=True):
-        from datetime import datetime, timedelta, timezone
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        c = object.__new__(MSpaUpdateCoordinator)
-        c._band_observations = []
-        c._band_stats = {}
-        c.heat_rate_buckets = [1.24, 1.095, 0.878]
-        c.ambient_baseline = 18.41
-        c.ambient_temp = 15.0
-        c.computed_heat_rate = 0.972
-        c.prediction_bias = 1.0
-        c._session_scalar = 1.0
-        c._session_fresh_buckets = frozenset()
-        c._last_data = {}
-        c.newton_ready_at = c.newton_start_at = None
-        c.newton_target_temp = c.newton_plan_temp = None
-        c.scheduled_ready_at = (datetime.now(timezone.utc) + timedelta(hours=40)
-                                if scheduled else None)
-        c.schedule_target_temp = 39.5 if scheduled else None
-        c._schedule_triggered = False
-        c.scheduling_temp = lambda: 33.5
-        return c
-
-    def test_the_span_it_aimed_at_is_recorded(self):
-        """Otherwise a Ready-at row is unreadable: the target switches between the
-        thermostat's and the schedule's depending on whether a schedule is pending."""
-        c = self._coord()
-        c._update_newton_shadow(33.5, 34.0)
-        assert c.newton_target_temp == 39.5, "a pending schedule outranks the thermostat"
-        assert c.newton_plan_temp == 33.5
-
-    def test_the_side_by_side_number_answers_the_same_question(self):
-        """The bug this replaces. `_minutes_to_target` aims at the *thermostat*, so a spa
-        holding at temperature with a schedule set for the day after reported 0 against a
-        Newton estimate of five and a half hours — and the obvious reading of that pair
-        is that the physical model is broken."""
-        from custom_components.mspa.sensor import MSpaNewtonReadyAtSensor
-        c = self._coord()
-        c._update_newton_shadow(33.5, 34.0)
-        s = object.__new__(MSpaNewtonReadyAtSensor)
-        s.coordinator = c
-        shipping = s._shipping_equivalent()
-        buckets = c._predictor().heating_minutes(33.5, 39.5)
-        # Whole minutes: the attribute is rounded so it does not churn a recorder row on
-        # every poll, which for a multi-hour estimate costs nothing.
-        assert shipping == pytest.approx(buckets, abs=0.5)
-        assert shipping > 60, "a six-degree climb is hours, not zero"
-
-    def test_it_is_absent_rather_than_wrong_when_there_is_no_span(self):
-        from custom_components.mspa.sensor import MSpaNewtonReadyAtSensor
-        c = self._coord(scheduled=False)
-        c.newton_target_temp = c.newton_plan_temp = None
-        s = object.__new__(MSpaNewtonReadyAtSensor)
-        s.coordinator = c
-        assert s._shipping_equivalent() is None
-
-    def test_the_start_times_remain_directly_differenceable(self):
-        """The half that always was comparable, and the one that scores the planner."""
-        from custom_components.mspa.sensor import MSpaNewtonStartAtSensor
-        from datetime import timezone
-        from custom_components.mspa import coordinator as mod
-        c = self._coord()
-        mod.dt_util.as_utc = lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-        c._last_computed_start_at = c.scheduled_ready_at
-        c._update_newton_shadow(33.5, 34.0)
-        s = object.__new__(MSpaNewtonStartAtSensor)
-        s.coordinator = c
-        assert c.newton_start_at is not None
-        assert s._shipping_equivalent() is not None, "both are timestamps on one axis"
-
-
 class TestPlanningUsesTheForecast:
     """A schedule is committed hours before it runs, in weather that will have changed
     by the time it does. Planning from the instantaneous reading is out by +14% on an
@@ -1155,27 +929,6 @@ class TestTheLiveEtaUsesTheRestOfTheRun:
         late = self._coord(rows, ambient=0.0).live_ambient_for(39.0, 39.5)
         assert late[0] <= early[0] + 1e-9, (
             "a nearly-finished run must weigh the next hour, not the whole day")
-
-    def test_the_source_is_recorded_on_the_shadow(self):
-        """It changes what a row means, so it has to be in the history rather than
-        inferred from a date. Rows from before this existed, or from a spell when the
-        forecast was unavailable, were priced from a single instant."""
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
-        c = self._coord(self._rows(now, [9.0] * 30), ambient=3.0)
-        c.scheduled_ready_at = None
-        c.schedule_target_temp = None
-        c._schedule_triggered = False
-        c.newton_ready_at = c.newton_start_at = None
-        c.newton_target_temp = c.newton_plan_temp = None
-        c.newton_ambient_source = "now"
-        c.scheduling_temp = lambda: 30.0
-        c._update_newton_shadow(30.0, 39.5)
-        assert c.newton_ambient_source == "forecast_window"
-        c._forecast_rows = []
-        c._update_newton_shadow(30.0, 39.5)
-        assert c.newton_ambient_source == "now", "no forecast must say so, not pretend"
-
 
 class TestTheForecastIsHardenedAgainstWhateverArrives:
     """Home Assistant guarantees almost nothing about a forecast.
@@ -1557,78 +1310,6 @@ class TestNoReadingIsNotTheSameAsNoAnswer:
             "ambient_source"] == "now"
 
 
-class TestTheShadowDoesNotChurnTheRecorder:
-    """The shadow is recomputed on every coordinator poll — thirty seconds while the
-    heater runs, one second during a rapid-poll burst — and there is no separate timer.
-    The raw value is `now + minutes`, so it moved a second or two each time and wrote a
-    row for it, which is a lot of history for a diagnostic whose useful resolution is
-    minutes.
-    """
-
-    def _sensor(self, when):
-        from custom_components.mspa.sensor import MSpaNewtonReadyAtSensor
-        s = object.__new__(MSpaNewtonReadyAtSensor)
-        s.coordinator = type("C", (), {"newton_ready_at": when})()
-        return s
-
-    def test_a_steady_estimate_stops_moving(self):
-        """The point of it. A model that is holding steady still jitters a second or two
-        between polls, because the estimate is `now + minutes` and both sides move. Those
-        polls must produce one value, not one apiece."""
-        import random
-        from datetime import datetime, timedelta, timezone
-        rng = random.Random(4)
-        # Away from a rounding boundary — those sit every five minutes, so :31 is safely
-        # inside one.
-        base = datetime(2026, 10, 15, 6, 31, 0, tzinfo=timezone.utc)
-        seen = {self._sensor(base + timedelta(seconds=rng.uniform(-2, 2))).native_value
-                for _ in range(30)}
-        assert len(seen) == 1, f"{len(seen)} distinct values across 30 jittering polls"
-
-    def test_an_idle_spa_is_the_case_that_matters(self):
-        """Idle, the water temperature is fixed, so the remaining time is constant and the
-        estimate slides forward at exactly wall-clock rate. Rounding to the minute halved
-        the churn and no more — measured live at 1440 rows a day, none of them saying
-        anything. This is the case the quantum was chosen for, and the heat-up case
-        reasons the other way, which is how the first attempt got it wrong."""
-        from datetime import datetime, timedelta, timezone
-        from custom_components.mspa.sensor import _MSpaNewtonShadowSensor as S
-        base = datetime(2026, 10, 15, 6, 0, 0, tzinfo=timezone.utc)
-        # An hour of polling every 30s on an estimate that only moves because time does.
-        polls = list(range(0, 3600, 30))
-        seen = {self._sensor(base + timedelta(seconds=t)).native_value for t in polls}
-        # An hour spans one more boundary than it contains intervals, so 13 rather than
-        # 12. What matters is the ratio to the polls that produced them.
-        assert len(seen) <= 3600 // S._QUANTUM_S + 1, f"{len(seen)} rows an hour idle"
-        assert len(seen) * 8 < len(polls), (
-            f"{len(seen)} rows from {len(polls)} polls is not a meaningful reduction")
-
-    def test_a_long_heat_up_still_has_ample_resolution(self):
-        """The cost of the quantum, stated rather than assumed."""
-        from custom_components.mspa.sensor import _MSpaNewtonShadowSensor as S
-        points = 9 * 3600 // S._QUANTUM_S
-        assert points >= 100, f"only {points} points across a nine-hour run"
-
-    def test_it_rounds_rather_than_truncates(self):
-        """Truncating would bias every estimate early by up to the whole quantum, which
-        on a shadow being scored against the real thing is accuracy thrown away for
-        nothing."""
-        from datetime import datetime, timezone
-        up = self._sensor(datetime(2026, 10, 15, 6, 33, 0, tzinfo=timezone.utc))
-        down = self._sensor(datetime(2026, 10, 15, 6, 32, 0, tzinfo=timezone.utc))
-        assert up.native_value.minute == 35
-        assert down.native_value.minute == 30
-
-    def test_a_real_move_still_shows(self):
-        from datetime import datetime, timedelta, timezone
-        base = datetime(2026, 10, 15, 6, 30, 0, tzinfo=timezone.utc)
-        assert (self._sensor(base + timedelta(minutes=7)).native_value
-                != self._sensor(base).native_value)
-
-    def test_nothing_to_round_stays_nothing(self):
-        assert self._sensor(None).native_value is None
-
-
 class TestTheStorageFileExplainsItself:
     """The whole retrospective is meant to be readable in .storage without Home Assistant
     running. A number with no account of how it was made is not evidence.
@@ -1654,16 +1335,29 @@ class TestTheStorageFileExplainsItself:
                         if isinstance(k, ast.Constant)}
         raise AssertionError("no async_save({...}) found")
 
-    def test_the_shadow_values_are_persisted(self):
+    def test_the_nowcast_constant_is_persisted(self):
+        """`lift` is the only thing the nowcast carries between runs, so it is the only
+        thing whose loss would change what the live estimate says. `thermal_tau_h` goes
+        with it because it is now the last completed run's own measurement rather than a
+        cross-run average — see finalise_thermal_run."""
+        saved = self._saved()
+        for key in ("lift", "lift_n", "thermal_tau_h", "thermal_tau_n"):
+            assert key in saved, key
+
+    def test_the_retired_shadow_keys_are_gone(self):
+        """The shadow sensors were how the physical model was watched while it was being
+        evaluated. They were removed with the model they shadowed, and a store still
+        writing their keys would invite a reader to trust a number nothing produces."""
         saved = self._saved()
         for key in ("newton_ready_at", "newton_start_at", "newton_fit",
-                    "newton_implied_tub"):
-            assert key in saved, key
+                    "newton_implied_tub", "newton_ambient_source",
+                    "prediction_bias_applied"):
+            assert key not in saved, key
 
     def test_and_what_priced_them(self):
         saved = self._saved()
-        for key in ("newton_ambient_source", "schedule_ambient",
-                    "schedule_ambient_kind", "forecast_resolution", "forecast_hours"):
+        for key in ("schedule_ambient", "schedule_ambient_kind",
+                    "forecast_resolution", "forecast_hours"):
             assert key in saved, f"{key} — the file cannot explain itself without it"
 
     def test_the_history_carries_both_models_error(self):
@@ -1673,7 +1367,7 @@ class TestTheStorageFileExplainsItself:
         from custom_components.mspa.coordinator import MSpaUpdateCoordinator
         src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
         for key in ("estimated_minutes_newton", "newton_params",
-                    "newton_ambient_source", "error_minutes_newton",
+                    "ambient_source", "error_minutes_newton",
                     "error_minutes_biased"):
             assert f'"{key}"' in src, key
 
@@ -1965,229 +1659,6 @@ class TestTheOneShotRecordsWhatItNeedsTo:
             src = inspect.getsource(getattr(MSpaUpdateCoordinator, name))
             assert "read_outdoor_sensor" not in src, f"{name} consults it already"
 
-
-class TestBothStartTimesArePricedTheSameWay:
-    """The start-at shadow priced itself from the instantaneous reading while the shipping
-    planner used the forecast averaged across the run. Two different questions, and far
-    more visible here than anywhere else the same mistake was made: a schedule days out is
-    priced from weather days away, so an afternoon reading against a pre-dawn forecast put
-    the two start times hours apart. Observed at ten.
-    """
-
-    def _coord(self, *, air_now=20.0, forecast_c=5.0, days=1):
-        from datetime import datetime, timedelta, timezone
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        from custom_components.mspa import coordinator as mod
-        mod.dt_util.as_utc = lambda d: d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-        c = object.__new__(MSpaUpdateCoordinator)
-        c._band_observations = []
-        c._band_stats = {}
-        c.heat_rate_buckets = [1.24, 1.095, 0.878]
-        c.ambient_baseline = 15.9
-        c.ambient_temp = air_now
-        c.computed_heat_rate = 0.972
-        c.prediction_bias = 1.0
-        c._session_scalar = 1.0
-        c._session_fresh_buckets = frozenset()
-        c._last_data = {}
-        c._newton_fallback_active = False
-        c.config_entry = type("E", (), {"options": {}})()
-        now = datetime.now(timezone.utc)
-        c.scheduled_ready_at = now + timedelta(days=days)
-        c.schedule_target_temp = 39.0
-        c._schedule_triggered = False
-        c.newton_ready_at = c.newton_start_at = None
-        c.newton_target_temp = c.newton_plan_temp = None
-        c.newton_ambient_source = c.newton_start_ambient_source = "now"
-        c.scheduling_temp = lambda: 30.0
-        # A cold forecast, flat, so the window mean is unambiguous.
-        c._forecast_rows = [(now + timedelta(hours=i), forecast_c) for i in range(48)]
-        return c
-
-    def test_the_planned_start_uses_the_forecast_not_the_thermometer(self):
-        """A warm reading now must not shorten a run planned for a cold night."""
-        c = self._coord(air_now=20.0, forecast_c=5.0)
-        c._update_newton_shadow(30.0, 39.0)
-        cold = c.newton_start_at
-        warm = self._coord(air_now=20.0, forecast_c=20.0)
-        warm._update_newton_shadow(30.0, 39.0)
-        assert cold < warm.newton_start_at, (
-            "a colder forecast must start the heat-up earlier, whatever it is outside now")
-
-    def test_it_matches_what_the_shipping_planner_would_use(self):
-        """Same window, same figure — the two start times are only differenceable if the
-        ambient behind them is the same."""
-        c = self._coord(days=1)          # inside the 48-hour forecast
-        c._update_newton_shadow(30.0, 39.0)
-        due = c.scheduled_ready_at
-        expected = c.forecast_ambient_for(due, 30.0, 39.0)
-        assert expected is not None, "a schedule inside the forecast must be priced by it"
-        mins = c.newton_minutes(30.0, 39.0, ambient=expected[0])
-        assert abs((due - c.newton_start_at).total_seconds() / 60 - mins) < 1e-6
-
-    def test_each_shadow_records_its_own_source(self):
-        """They price different windows — the run ending at the scheduled time, and the
-        one ending when heating would finish — so one shared field described whichever
-        branch ran last."""
-        from custom_components.mspa.sensor import (
-            MSpaNewtonReadyAtSensor, MSpaNewtonStartAtSensor)
-        assert (MSpaNewtonReadyAtSensor._ambient_source_attr
-                != MSpaNewtonStartAtSensor._ambient_source_attr)
-        c = self._coord()
-        c._update_newton_shadow(30.0, 39.0)
-        for cls, want in ((MSpaNewtonReadyAtSensor, c.newton_ambient_source),
-                          (MSpaNewtonStartAtSensor, c.newton_start_ambient_source)):
-            s = object.__new__(cls)
-            s.coordinator = c
-            assert s.extra_state_attributes["ambient_source"] == want
-
-    def test_no_schedule_leaves_the_start_alone(self):
-        c = self._coord()
-        c.scheduled_ready_at = None
-        c.schedule_target_temp = None
-        c._update_newton_shadow(30.0, 39.0)
-        assert c.newton_start_at is None
-
-    def test_all_four_paths_use_the_same_temperature_component(self):
-        """Two questions, four answers, and each pair must share an ambient.
-
-        The *schedulers* both ask "when must this start to be ready at the scheduled
-        time", so both price the window ending at that time. The *planners* both ask
-        "when will it be ready if it runs from now", so both price the window ending when
-        heating would finish. Within each pair the ambient must be identical or the two
-        numbers are not differenceable; across the pairs it legitimately differs, because
-        they are different windows describing different runs.
-
-        Every one of these four has been wrong at some point, each found separately.
-        """
-        from datetime import datetime, timezone
-        from custom_components.mspa.sensor import _segmented_heating_minutes
-        c = self._coord(air_now=20.0, forecast_c=5.0, days=1)
-        plan, therm, sched = 30.0, 39.0, 39.0
-        due = c.scheduled_ready_at
-
-        planner_amb = c.live_ambient_for(plan, therm)[0]
-        scheduler_amb = c.forecast_ambient_for(due, plan, sched)[0]
-        assert planner_amb == pytest.approx(5.0), "the forecast, not the 20 C outside"
-        assert scheduler_amb == pytest.approx(5.0)
-
-        c._update_newton_shadow(plan, therm)
-
-        # 1. Newton planner
-        want = c.newton_minutes(plan, sched, ambient=planner_amb)
-        got = (c.newton_ready_at - datetime.now(timezone.utc)).total_seconds() / 60
-        assert got == pytest.approx(want, abs=5.0), "newton ready-at"
-
-        # 2. Newton scheduler
-        want = c.newton_minutes(plan, sched, ambient=scheduler_amb)
-        got = (due - c.newton_start_at).total_seconds() / 60
-        assert got == pytest.approx(want, abs=5.0), "newton start-at"
-
-        # 3. Bucket planner, through the seam the Ready at sensor uses
-        assert _segmented_heating_minutes(plan, therm, c) == pytest.approx(
-            c.heating_minutes(plan, therm, ambient=planner_amb)), "bucket ready-at"
-
-        # 4. Bucket scheduler. Async and side-effecting, so checked at the source: it
-        # must derive schedule_ambient from the scheduled time and pass it on.
-        import inspect
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        src = inspect.getsource(MSpaUpdateCoordinator._check_schedule_trigger)
-        assert "self.forecast_ambient_for(target_utc" in src
-        assert "ambient=self.schedule_ambient" in src
-
-    def test_each_shadow_names_what_it_shadows(self):
-        """One is a start and the other a finish, and they sit next to each other in the
-        panel. Differencing "Newton start at" against "Ready at" gives the length of the
-        heat-up — which looks like a ten-hour disagreement and is not one. Observed."""
-        from custom_components.mspa.sensor import (
-            MSpaNewtonReadyAtSensor, MSpaNewtonStartAtSensor)
-        c = self._coord()
-        c._update_newton_shadow(30.0, 39.0)
-        for cls, want in ((MSpaNewtonReadyAtSensor, "Ready at"),
-                          (MSpaNewtonStartAtSensor, "Heat Schedule")):
-            s = object.__new__(cls)
-            s.coordinator = c
-            assert want in s.extra_state_attributes["compare_with"]
-        assert "not Ready at" in MSpaNewtonStartAtSensor._compare_with
-
-    def test_the_thermometer_can_be_checked_before_a_run_not_after(self):
-        """The only other way to learn whether it is being read is to finish a heat-up
-        and look for the air keys, and a heat-up from cold is not a configuration test."""
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        from custom_components.mspa.sensor import MSpaAmbientLearningSensor
-        st = type("S", (), {"state": "11.5",
-                            "attributes": {"unit_of_measurement": "°C"}})()
-        c = object.__new__(MSpaUpdateCoordinator)
-        c.ambient_temp, c.ambient_baseline = 14.0, 15.9
-        c._band_stats, c._band_observations, c._prediction_history = {}, [], []
-        c.heat_rate_buckets = None
-        c.hass = type("H", (), {
-            "states": type("St", (), {"get": staticmethod(lambda e: st)})()})()
-        c.config_entry = type("E", (), {"options": {
-            "weather_entity": "weather.home",
-            "outdoor_sensor": "sensor.garden"}})()
-        s = object.__new__(MSpaAmbientLearningSensor)
-        s.coordinator = c
-        a = s.extra_state_attributes
-        assert a["outdoor_sensor"] == "sensor.garden"
-        assert a["outdoor_sensor_c"] == pytest.approx(11.5)
-
-    def test_a_named_but_unreadable_thermometer_is_distinguishable(self):
-        """Null against a name is an entity that is there and broken; null against no
-        name is one never chosen. Different problems, different fixes."""
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        from custom_components.mspa.sensor import MSpaAmbientLearningSensor
-        st = type("S", (), {"state": "unavailable", "attributes": {}})()
-        c = object.__new__(MSpaUpdateCoordinator)
-        c.ambient_temp, c.ambient_baseline = 14.0, 15.9
-        c._band_stats, c._band_observations, c._prediction_history = {}, [], []
-        c.heat_rate_buckets = None
-        c.hass = type("H", (), {
-            "states": type("St", (), {"get": staticmethod(lambda e: st)})()})()
-        c.config_entry = type("E", (), {"options": {"outdoor_sensor": "sensor.garden"}})()
-        s = object.__new__(MSpaAmbientLearningSensor)
-        s.coordinator = c
-        a = s.extra_state_attributes
-        assert a["outdoor_sensor"] == "sensor.garden" and a["outdoor_sensor_c"] is None
-
-    def test_the_measured_air_is_split_by_sun(self):
-        """Whether a garden thermometer's daylight readings are usable depends on where
-        it is mounted, which the integration cannot know. This one sits above a wood wall
-        that catches the morning sun, so warm air rises past it until the sun comes round
-        — worth +5 °C against the forecast at 09:00 and nothing at all overnight.
-        Recording the split lets that judgement be made by someone who has seen it."""
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        c = object.__new__(MSpaUpdateCoordinator)
-        for sun, temp in (("below_horizon", "12.0"), ("above_horizon", "20.0")):
-            st = {"sun.sun": type("S", (), {"state": sun, "attributes": {}})(),
-                  "sensor.g": type("S", (), {
-                      "state": temp, "attributes": {"unit_of_measurement": "°C"}})()}
-            c.hass = type("H", (), {"states": type("St", (), {
-                "get": staticmethod(lambda e: st.get(e))})()})()
-            c.config_entry = type("E", (), {"options": {"outdoor_sensor": "sensor.g"}})()
-            assert c.sun_is_up() is (sun == "above_horizon")
-            assert c.read_outdoor_sensor() == pytest.approx(float(temp))
-
-    def test_no_sun_entity_is_not_an_error(self):
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        c = object.__new__(MSpaUpdateCoordinator)
-        c.hass = type("H", (), {
-            "states": type("St", (), {"get": staticmethod(lambda e: None)})()})()
-        assert c.sun_is_up() is None, "absent, not False — False would claim it is night"
-
-    def test_both_means_are_kept_so_daylight_is_recoverable(self):
-        """Two means and two counts give all three regimes: whole run, dark, and the
-        daylight part by subtraction. Nothing is discarded on the integration's
-        judgement."""
-        import inspect
-        from custom_components.mspa.coordinator import MSpaUpdateCoordinator
-        src = inspect.getsource(MSpaUpdateCoordinator._async_update_data)
-        for key in ("measured_air_mean_c", "measured_air_samples",
-                    "measured_air_mean_dark_c", "measured_air_samples_dark"):
-            assert f'"{key}"' in src, key
-
-
-# ── Normalising learned bucket rates to a reference ambient ──────────────────
 
 class TestRateNormalisation:
     """The transform that stops a bucket storing the weather it was learned under."""

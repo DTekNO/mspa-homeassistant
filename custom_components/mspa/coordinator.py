@@ -6,7 +6,6 @@ from .thermal import (
     A_ALPHA,
     DEFAULT_A,
     DEFAULT_TAU_H,
-    TAU_ALPHA,
     THERMAL_CHORD_MIN_C,
     THERMAL_CHORD_SKIP_CROSSINGS,
     THERMAL_HOT_CHORD_MAX_REJECTS,
@@ -19,6 +18,7 @@ from .thermal import (
     implied_litres,
     implied_loss_w_per_k,
 )
+from . import nowcast as nc
 from .predictor import (
     HEAT_BUCKET_LEARN_MAX,
     HEAT_BUCKET_LEARN_MIN,
@@ -333,6 +333,58 @@ def _read_weather_entity(hass: HomeAssistant, entity_id: str | None) -> tuple[fl
 
 
 
+# How much of a completed run's measured lift to adopt. Slow, because the lift is the
+# one quantity that should not move: a refill does not change it, so a sample far from
+# the carried value is more likely to be a bad run than a changed spa.
+_LIFT_ALPHA = 0.25
+
+# How many crossing rows to keep. At forty crossings a run and a couple of runs a week
+# this is roughly three months — enough to settle whether UV and wind matter, which is
+# the question it is being kept for, and small enough that the file stays trivial.
+_CROSSING_LOG_MAX = 1000
+
+def _read_weather_extras(hass: HomeAssistant, entity_id: str | None):
+    """UV index, wind and gust from a weather entity, for the record only.
+
+    Returns `(uv_index, wind_m_s, gust_m_s)`, any of them None when absent. Separate
+    from `_read_weather_entity` rather than widening its tuple: that contract is read in
+    two places and asserted in tests, and nothing here is consumed by any model.
+
+    Solar gain and wind are deliberately not modelled — both are suspected to matter and
+    neither is understood well enough to include. These are written into every crossing
+    so that in a few weeks the question can be settled against data rather than guessed
+    at now. UV index rather than cloud cover, because it is closer to the energy actually
+    arriving; wind and gust kept apart, because it is not known which one correlates.
+    """
+    if not entity_id:
+        return None, None, None
+    state = hass.states.get(entity_id)
+    if state is None or state.state in ("unknown", "unavailable", ""):
+        return None, None, None
+    attrs = state.attributes
+
+    def _wind(raw):
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        unit = attrs.get("wind_speed_unit", "m/s")
+        if unit in ("km/h", "kph"):
+            return value / 3.6
+        if unit == "mph":
+            return value * 0.44704
+        if unit in ("kn", "knot", "knots"):
+            return value * 0.514444
+        return value
+
+    try:
+        uv = float(attrs["uv_index"])
+    except (KeyError, TypeError, ValueError):
+        uv = None
+    return uv, _wind(attrs.get("wind_speed")), _wind(attrs.get("wind_gust_speed"))
+
 def _round_or_none(value, digits: int = 1):
     """Round where there is something to round. Estimates are legitimately absent."""
     return None if value is None else round(float(value), digits)
@@ -390,13 +442,34 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     scheduled_ready_set_at: datetime | None = None
     _thermal_hold_finish: datetime | None = None
     _thermal_hold_target: float | None = None
-    newton_ready_source: str | None = None
-    newton_start_source: str | None = None
-    newton_decline_reason: str | None = None
     thermal_a: float | None = None
     thermal_tau_h: float | None = None
     thermal_a_n: int = 0
     thermal_tau_n: int = 0
+    # The nowcast's own state. The collections are None, not [], for the reason above;
+    # the methods that use them treat None as empty.
+    _nowcast_crossings: list | None = None
+    _nowcast_mixed: bool = False
+    _nowcast_last_at: datetime | None = None
+    nowcast_lift_c: float | None = None
+    nowcast_lift_n: int = 0
+    _cross_air_sum: float = 0.0
+    _cross_air_secs: float = 0.0
+    _cross_uv_sum: float = 0.0
+    _cross_uv_secs: float = 0.0
+    _cross_wind_sum: float = 0.0
+    _cross_gust_sum: float = 0.0
+    _cross_wind_secs: float = 0.0
+    _cross_air_start: float | None = None
+    _cross_last_mono: float | None = None
+    ambient_temp: float | None = None
+    ambient_wind: float | None = None
+    ambient_uv: float | None = None
+    ambient_gust: float | None = None
+    _crossing_store = None
+    _crossing_log: list | None = None
+    _crossing_log_loaded: bool = False
+    _crossing_log_dirty: bool = False
 
     def __init__(self, hass: HomeAssistant, config_entry: Dict[str, Any]) -> None:
         """Initialize."""
@@ -623,16 +696,47 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Last computed autonomous start time, tracked only to log meaningful shifts
         # in the planned start as outdoor conditions change while waiting.
         self._last_computed_start_at: datetime | None = None
-        # The physical model's shadow of the two things the bucket model decides: when
-        # the water will be ready, and when a scheduled heat-up has to start. Computed
-        # every poll, used for nothing, and exposed as sensor *states* rather than
-        # attributes so the recorder keeps their history — attribute history cannot be
-        # charted in the UI, and the whole point of these is to be reviewed after a run.
         self._newton_fallback_active = False
-        self.newton_ready_at: datetime | None = None
-        self.newton_start_at: datetime | None = None
-        self.newton_target_temp: float | None = None
-        self.newton_plan_temp: float | None = None
+
+        # ---- the nowcast -----------------------------------------------------
+        # The run's own 0.5 °C crossings, oldest first, and whether the tub has mixed.
+        # This is the whole input to the live estimate: no learned rate, no bias, no
+        # session scalar, nothing from another day except the one carried lift.
+        self._nowcast_crossings: list[nc.Crossing] = []
+        self._nowcast_mixed: bool = False
+        # The asymptote lift, `A * tau`. The only constant carried in, and the only one
+        # that can be: four crossings cannot measure both parameters. It is also the
+        # only one a refill does not disturb — see nowcast.py.
+        self.nowcast_lift_c: float | None = None
+        self.nowcast_lift_n: int = 0
+        # Conditions accumulated over the interval between crossings, time-weighted on
+        # the poll interval rather than counted per poll, so a slow cold hour outweighs
+        # a quick warm one.
+        self._cross_air_sum: float = 0.0
+        self._cross_air_secs: float = 0.0
+        self._cross_uv_sum: float = 0.0
+        self._cross_uv_secs: float = 0.0
+        self._cross_wind_sum: float = 0.0
+        self._cross_gust_sum: float = 0.0
+        self._cross_wind_secs: float = 0.0
+        self._cross_air_start: float | None = None
+        self._cross_last_mono: float | None = None
+        self.ambient_uv: float | None = None
+        self.ambient_gust: float | None = None
+        # The crossing log: its own store, written only when a crossing completes.
+        # Deliberately not the rates store, which is rewritten on every poll — a
+        # thousand-row log there would mean rewriting about a hundred kilobytes every
+        # thirty seconds, some 300 MB a day onto the Pi's storage. This is about fifty
+        # writes a day. And it has to be persisted here at all because the recorder
+        # purges states after `purge_keep_days` and keeps only hourly statistics after
+        # that, which destroys the crossing *times* — the one quantity the whole method
+        # rests on.
+        self._crossing_store = Store(
+            hass, version=1, key=f"{DOMAIN}_crossings_{device_id}")
+        self._crossing_log: list[dict] = []
+        self._crossing_log_loaded = False
+        self._crossing_log_dirty = False
+        self._nowcast_last_at: datetime | None = None
         # Hourly forecast as [(utc datetime, °C)], refreshed on a throttle. See
         # _refresh_forecast for why this is fetched rather than read off an attribute.
         self._forecast_rows: list = []
@@ -642,19 +746,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._forecast_failures = 0
         self.schedule_ambient: float | None = None
         self.schedule_ambient_kind: str | None = None
-        # Which ambient the last shadow was priced with. Recorded because it changes
-        # what the history means: rows from before the forecast was wired in, or from a
-        # spell when it was unavailable, were priced from a single instant.
-        self.newton_ambient_source: str = "now"
-        # The start-at shadow prices a different window from the ready-at one — the run
-        # ending at the scheduled time, not the one ending when heating would finish —
-        # so it records its own source rather than borrowing the other's.
-        self.newton_start_ambient_source: str = "now"
-        # Which model actually produced each shadow value, and why the physical one
-        # declined if it did. See _shadow_minutes.
-        self.newton_ready_source: str | None = None
-        self.newton_start_source: str | None = None
-        self.newton_decline_reason: str | None = None
         self.measured_outdoor_temp: float | None = None
         self._session_air_sum: float = 0.0
         self._session_air_n: int = 0
@@ -925,6 +1016,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._session_air_dark_sum += measured
                     self._session_air_dark_n += 1
             self.ambient_condition = _read_weather_condition(
+                self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
+            )
+            # Written into every crossing, read by nothing. See _read_weather_extras.
+            self.ambient_uv, wind, self.ambient_gust = _read_weather_extras(
                 self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
             )
 
@@ -1261,6 +1356,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Load persisted rates on the very first poll after startup/reload.
             if not self._rates_loaded:
                 self._rates_loaded = True
+                await self._load_crossing_log()
                 stored = await self._rates_store.async_load()
                 if stored:
                     self.computed_heat_rate = stored.get("heat_rate")
@@ -1323,6 +1419,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self.thermal_tau_h = stored.get("thermal_tau_h")
                     self.thermal_a_n = stored.get("thermal_a_n", 0) or 0
                     self.thermal_tau_n = stored.get("thermal_tau_n", 0) or 0
+                    # Absent on a store written before the nowcast existed, and that is
+                    # the whole migration: `nowcast_lift` falls back to the product of
+                    # the learned pair, which is the correct starting value.
+                    self.nowcast_lift_c = stored.get("lift")
+                    self.nowcast_lift_n = stored.get("lift_n", 0) or 0
                     self._band_observations = stored.get("band_observations", [])
                     self._band_stats = stored.get("band_stats", {})
                     # Restore the bias as a stored value — never recompute it here.
@@ -1505,6 +1606,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "thermal_tau_n": self.thermal_tau_n,
                 "thermal_points": list(self._thermal_points or []),
                 "thermal_crossings_seen": self._thermal_crossings_seen,
+                # The nowcast's one carried constant, and the only long memory in the
+                # design. `thermal_tau_h` above is now the last completed run's own
+                # measurement rather than a cross-run average, because tau is what
+                # tracks the water level; the lift is what survives a refill. See
+                # docs/nowcast-ready-at.md.
+                "lift": self.nowcast_lift_c,
+                "lift_n": self.nowcast_lift_n,
                 "last_seen": (self.last_seen_utc.isoformat()
                               if self.last_seen_utc else None),
                 "heat_rate_buckets": self.heat_rate_buckets,
@@ -1525,33 +1633,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "prediction_history": self._prediction_history,
                 "band_observations": self._band_observations,
                 "band_stats": self._band_stats,
+                # Recorded, never applied. A systematic error in a model that
+                # measures the tub directly is a fault to find, not a coefficient to
+                # absorb it — and this one was learned against the bucket model.
                 "prediction_bias": self.prediction_bias,
-                # Learned, not applied. See MSpaUpdateCoordinator.prediction_bias.
-                "prediction_bias_applied": False,
                 "bias_evaluation": self.bias_evaluation(),
                 "active_prediction": self._prediction,
                 # Persisted so a restart mid-scheduled-heating resumes as
                 # "Heating" instead of dropping back to pending and re-firing.
                 "schedule_triggered": self._schedule_triggered,
                 "ambient_baseline": self.ambient_baseline,
-                # Written so the shadow is legible in the storage file itself, not only
-                # through the sensors — the whole comparison should survive a restart and
-                # be readable without Home Assistant running.
-                "newton_ready_at": (
-                    self.newton_ready_at.isoformat()
-                    if self.newton_ready_at is not None else None
-                ),
-                "newton_start_at": (
-                    self.newton_start_at.isoformat()
-                    if self.newton_start_at is not None else None
-                ),
-                "newton_fit": self.newton_fit(),
-                "newton_implied_tub": self.physical_constants(),
-                # What the two shadow values above were priced with, so the file explains
-                # itself. The forecast can be absent for reasons that are not faults — no
-                # weather entity, an entity without an hourly forecast — and a reader
-                # months later cannot tell that from an outage without being told.
-                "newton_ambient_source": self.newton_ambient_source,
                 "forecast_resolution": self.forecast_resolution,
                 "forecast_hours": len(getattr(self, "_forecast_rows", []) or []),
                 "schedule_ambient": _round_or_none(self.schedule_ambient, 2),
@@ -1573,10 +1664,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Before the shadow and the trigger, both of which plan with it.
             await self._refresh_forecast()
 
-            # The physical model's shadow of the same two decisions, recomputed from
-            # the same inputs and driving nothing. Before the trigger so that a poll
-            # which fires the schedule still leaves a shadow of the plan it fired on.
-            self._update_newton_shadow(new_temp, new_target)
+            # The crossing log, written only on a poll that completed a crossing —
+            # about fifty writes a day rather than one every thirty seconds.
+            await self._save_crossing_log()
 
             # Trigger heating autonomously when the schedule window opens.
             # Must run BEFORE the auto-clear so the trigger fires even when the
@@ -1873,17 +1963,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         shadow = getattr(self, "_shadow", None)
         return shadow.eta if shadow is not None else None
 
-    def shadow_revisions(self):
-        """How many times the shadow curve has revised itself this session.
-
-        Part of the displayed ETA's replan identity: a revision is a deliberate,
-        infrequent correction and the display should adopt it rather than crawl toward
-        it.  None outside a session, which keeps the identity stable when there is no
-        shadow at all.
-        """
-        shadow = getattr(self, "_shadow", None)
-        return shadow.revisions if shadow is not None else None
-
     def session_plan(self) -> "HeatPredictor | None":
         """The rate curve frozen at session start, or None outside a session.
 
@@ -1926,37 +2005,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return started + timedelta(minutes=float(pred["estimated_minutes"]))
         except (KeyError, TypeError, ValueError):
             return None
-
-    def session_progress_deviation(self, at_temp, now=None):
-        """Minutes behind (positive) or ahead (negative) of the opening plan.
-
-        Measured, not predicted: elapsed time against what the frozen plan allowed to
-        reach the temperature now reached.  Separating this from the ETA is the point —
-        a session can be running 20 minutes behind while the finish estimate stays
-        stable, and conflating the two is what made the shipped ETA chase its own tail.
-
-        None until the session settles.  The opening crossings measure position within
-        the 0.5 °C band rather than heating — on 2026-08-12 the first degree "took"
-        7.6 minutes, an implied 7.9 °C/h that no heater here can produce — so a
-        deviation computed then reads tens of minutes ahead and means nothing.  The
-        same contamination is why the ETA holds through the settle period.
-        """
-        plan = self.session_plan()
-        pred = self._prediction
-        if plan is None or not pred or at_temp is None:
-            return None
-        if not self.session_settled(at_temp, now):
-            return None
-        try:
-            started = datetime.fromisoformat(pred["start_time"])
-            start_temp = float(pred["start_temp"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        allowed = plan.heating_minutes(start_temp, at_temp)
-        if allowed is None:
-            return None
-        elapsed = ((now or datetime.now(timezone.utc)) - started).total_seconds() / 60.0
-        return round(elapsed - allowed, 1)
 
     @property
     def fault_code(self) -> str | None:
@@ -2512,150 +2560,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         amb = ambient if ambient is not None else self.effective_ambient()[0]
         return newton_heating_minutes(
             from_temp, to_temp, amb, fit["tau_h"], fit["asymptote_lift_c"])
-
-    def _newton_decline_reason(self, to_temp, ambient) -> str:
-        """Why the physical model would not answer, in words a history row can keep."""
-        fit = self.newton_fit()
-        if fit is None:
-            return "no fit yet — the physical model needs recorded band traverses"
-        air = ambient if ambient is not None else self.effective_ambient()[0]
-        if air is None:
-            return "no outdoor temperature"
-        asymptote = air + fit["asymptote_lift_c"]
-        if to_temp is not None and asymptote <= to_temp:
-            return (f"asymptote {asymptote:.1f} °C is at or below the target "
-                    f"{to_temp:.1f} °C")
-        return "the physical model declined"
-
-    def _shadow_minutes(self, from_temp, to_temp, ambient):
-        """Minutes for a shadow row, and the name of the model that produced them.
-
-        The physical model first, then the same chain the shipping estimate uses. This
-        used to return None the moment Newton declined, on the reasoning that a gap in
-        the history is the finding and a fallback would erase it. That was right while
-        these were diagnostics only. It stops being right the moment the physical model
-        becomes selectable for planning: a start time that reads `unknown` is not a
-        finding to whoever is relying on it to heat the tub.
-
-        The finding is preserved instead of erased — `newton_*_source` names the model
-        behind every row and `newton_decline_reason` says why Newton stood down, so the
-        gap is still there in the history, just readable and no longer a blank state.
-
-        Returns (minutes, source, decline_reason). `source` is None only when nothing
-        could answer at all, which is the one case that still has to show as unknown.
-        """
-        if from_temp is None or to_temp is None:
-            return None, None, None
-        minutes = self.newton_minutes(from_temp, to_temp, ambient=ambient)
-        if minutes is not None:
-            return minutes, PREDICTION_MODEL_NEWTON, None
-        reason = self._newton_decline_reason(to_temp, ambient)
-        minutes = self.thermal_minutes(from_temp, to_temp, ambient=ambient)
-        if minutes is not None:
-            return minutes, PREDICTION_MODEL_THERMAL, reason
-        # Guarded: this is the last link in the chain and it reaches into bucket state
-        # that a shadow row has no business depending on. A diagnostic that goes
-        # unavailable because the thing it observes threw is a diagnostic that loses
-        # exactly the run worth looking at.
-        try:
-            minutes = self._predictor(ambient).heating_minutes(from_temp, to_temp)
-        except Exception:                                    # noqa: BLE001
-            _LOGGER.debug("Shadow fallback: the bucket model threw", exc_info=True)
-            minutes = None
-        if minutes is not None:
-            return minutes, PREDICTION_MODEL_BUCKETS, reason
-        return None, None, reason
-
-    def _update_newton_shadow(self, current_temp, current_target) -> None:
-        """Recompute the physical model's shadow of Ready at and of the planned start.
-
-        Deliberately raw. The shipping Ready at slews its display so corrections land as
-        bounded ramps, and latches once the water arrives; neither is a property of the
-        model, and reproducing them here would hide exactly the wandering this is meant
-        to expose. What is compared is the estimate, not the presentation of it.
-
-        When the physical model declines — too few traverses to fit, or an asymptote at
-        or below the target, which on a cold night is a real answer — the row falls back
-        down the same chain the shipping estimate uses, and `newton_ready_source` /
-        `newton_start_source` name what actually produced it. They used to go to None
-        instead, because a gap in the history was the finding and a fallback would erase
-        it; the source attribute keeps the finding without leaving a user-facing start
-        time blank, which matters now the model is becoming selectable. See
-        _shadow_minutes.
-        """
-        self.newton_ready_at = None
-        self.newton_start_at = None
-        self.newton_ready_source = None
-        self.newton_start_source = None
-        # The target the shadow was aiming at, and the temperature it planned from.
-        # Recorded because without them a Ready-at row cannot be read: the shipping
-        # sensor shows the *scheduled time verbatim* while a schedule is pending, so the
-        # two are not answering the same question and a reader has to be told which one
-        # this is. See _MSpaNewtonShadowSensor.
-        self.newton_target_temp = None
-        self.newton_plan_temp = None
-        plan_temp = self.scheduling_temp()
-        if plan_temp is None:
-            plan_temp = current_temp
-        if plan_temp is None:
-            return
-
-        # Ready at: to whichever target is actually being heated towards — the schedule's
-        # while one is pending, the thermostat's otherwise. Mirrors the shipping sensor's
-        # choice of target so the two series are answering the same question.
-        target = current_target
-        if self.scheduled_ready_at is not None and self.schedule_target_temp is not None:
-            target = self.schedule_target_temp
-        self.newton_target_temp = target
-        self.newton_plan_temp = plan_temp
-        self.newton_ambient_source = "now"
-        if target is not None:
-            live = self.live_ambient_for(plan_temp, target)
-            if live is not None:
-                ambient, kind = live
-                self.newton_ambient_source = f"forecast_{kind}"
-            else:
-                ambient, self.newton_ambient_source = self.effective_ambient()
-            minutes, source, reason = self._shadow_minutes(plan_temp, target, ambient)
-            self.newton_ready_source = source
-            if reason is not None:
-                self.newton_decline_reason = reason
-            elif source == PREDICTION_MODEL_NEWTON:
-                self.newton_decline_reason = None
-            if minutes is not None:
-                self.newton_ready_at = (
-                    datetime.now(timezone.utc) + timedelta(minutes=minutes))
-
-        # Planned start: the same subtraction `_check_schedule_trigger` makes, against the
-        # same scheduled time and — this is the part that was missing — priced from the
-        # same ambient.
-        #
-        # It used to call newton_minutes with no ambient at all, which fell back to the
-        # instantaneous reading while the shipping planner used the forecast averaged
-        # across the run. Two different questions again, and far more visible here than
-        # anywhere else it happened: a schedule days out is priced from weather days away,
-        # so an afternoon reading against a pre-dawn forecast put the two start times
-        # hours apart. Observed at ten. The comment above this claimed they were directly
-        # comparable, which is exactly the sort of thing a comment should not be trusted
-        # for.
-        self.newton_start_ambient_source = "now"
-        if (self.scheduled_ready_at is not None and not self._schedule_triggered
-                and self.schedule_target_temp is not None):
-            due = dt_util.as_utc(self.scheduled_ready_at)
-            planned = self.forecast_ambient_for(
-                due, plan_temp, self.schedule_target_temp)
-            if planned is not None:
-                start_amb, start_kind = planned
-                self.newton_start_ambient_source = f"forecast_{start_kind}"
-            else:
-                start_amb, self.newton_start_ambient_source = self.effective_ambient()
-            minutes, source, reason = self._shadow_minutes(
-                plan_temp, self.schedule_target_temp, start_amb)
-            self.newton_start_source = source
-            if reason is not None:
-                self.newton_decline_reason = reason
-            if minutes is not None:
-                self.newton_start_at = due - timedelta(minutes=minutes)
 
     # How often the forecast is re-read after a success. The call itself is cheap — see
     # below — but it crosses the service bus, and the data behind it only changes hourly.
@@ -3216,6 +3120,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         independent.
         """
         if heat_state == _HEAT_STATE_FULL and curr_temp is not None:
+            # The nowcast's weather, time-weighted over the interval between crossings.
+            # Before anything else in this branch, so a poll that completes a crossing
+            # has the interval it was reached through already accumulated.
+            self.accumulate_nowcast_conditions(now_mono)
             if self._rate_last_temp is None:
                 # First poll in heat mode — set a phase-uncertain anchor.
                 self._rate_last_temp = curr_temp
@@ -3502,6 +3410,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._thermal_chord = []
             self._thermal_crossings_seen = 0
             self._thermal_hot_rejects = 0
+            # Same for the nowcast window, and for the same reason — with one more: the
+            # tub may be stratified again when the heater comes back, which is what
+            # happened on 08.10.2026 when the power was restored.
+            if self._nowcast_crossings:
+                self.reset_nowcast_run()
 
     def _track_cooling_rate(self, curr_temp, heat_state, now_mono: float) -> None:
         """Sample the passive cooling rate from temperature drops.
@@ -3834,8 +3747,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
         self.thermal_a = blend(self.thermal_a, sample, A_ALPHA)
         self.thermal_a_n += 1
-        # There is something measured now, so the opening estimate stops being held.
-        self.release_thermal_hold()
+        # Deliberately not release_thermal_hold(). A completed chord is no longer what
+        # ends the hold — the nowcast window settling is, because a chord can be measured
+        # through water that has not mixed. See thermal_hold_finish.
         litres = implied_litres(self.thermal_a, self.heater_power_heat_w)
         _LOGGER.info(
             "Thermal A: %.3f °C/h from %d crossing(s) (rate %.3f at gap %.1f, "
@@ -3844,13 +3758,24 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             f", ≈{litres:.0f} L" if litres else "")
 
     def finalise_thermal_run(self) -> None:
-        """Fit `tau` from the completed run, then clear its points — R6.
+        """Measure `tau` and the lift from the completed run, then clear its points — R6.
 
         The whole run is the smallest lever that produces an honest slope. A partial one
         is not merely noisier, it is biased: on 11.09.2026 the first twelve crossings
         imply 37 h where all twenty imply 66 h, against 54-61 h measured independently
-        from cooling. So `tau` moves once per run and never during one, which also means
+        from cooling. So this happens once per run and never during one, which also means
         the displayed finish cannot jump because the model changed underneath it.
+
+        `tau` is **adopted outright, not blended.** It used to be an EMA across runs, and
+        that was the wrong memory on the wrong quantity: `tau` scales with the water
+        mass, so it is precisely what a refill changes, and smoothing it meant a drained
+        tub took several runs to be believed. On 08.10.2026 the carried 36.68 h described
+        1257 litres while the run measured about 1000. The guards in `fit_run` — ten
+        points, a 12 K spread, a plausible range — are what protect it; an average over
+        runs that described different tubs never was.
+
+        The memory moves to the **lift**, `A * tau`, which is the one quantity a refill
+        does not disturb. See learn_nowcast_lift.
         """
         pts = self._thermal_points or []
         _, fitted = fit_run(pts)
@@ -3863,7 +3788,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self.thermal_model().tau_h)
             self.reset_thermal_run()
             return
-        self.thermal_tau_h = blend(self.thermal_tau_h, fitted, TAU_ALPHA)
+        previous = self.thermal_tau_h
+        self.thermal_tau_h = fitted
         self.thermal_tau_n += 1
         # `A` must move with `tau`. Every crossing this run learned `A` as
         # rate + gap/tau at the *old* tau, so the two are a pair — the collinear pair
@@ -3877,10 +3803,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self.thermal_a = joint_a
         gaps = [g for g, _ in pts]
         _LOGGER.info(
-            "Thermal tau: run of %d crossings spanning %.1f K fitted %.1f h → %.1f h "
-            "[n=%d]; A re-derived at that tau → %.3f °C/h", len(pts),
-            max(gaps) - min(gaps), fitted, self.thermal_tau_h, self.thermal_tau_n,
+            "Thermal tau: run of %d crossings spanning %.1f K measured %.1f h "
+            "(was %s) [n=%d]; A re-derived at that tau → %.3f °C/h", len(pts),
+            max(gaps) - min(gaps), self.thermal_tau_h,
+            f"{previous:.1f} h" if previous is not None else "seeded",
+            self.thermal_tau_n,
             self.thermal_a if self.thermal_a is not None else float("nan"))
+        self.learn_nowcast_lift(joint_a, self.thermal_tau_h)
         self.reset_thermal_run()
 
     def restore_thermal_run(self, stored: dict) -> None:
@@ -3954,14 +3883,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         trades the other way — 15 minutes free against 22 held — and mean absolute error
         is unchanged on both runs, so what this buys is specifically the worst case.
 
-        Released when the first chord of *this run* completes. Every run, not only the
-        first: a carried-over `A` does not make the opening honest, because the water's
-        position at heater-on is still known only to a band and the first bands after
-        heater-on run far above the settled rate (24.09.2026: five bands at 1.4-1.8 °C/h
-        against 0.9 settled). Until a chord has been measured there is nothing to say that
-        the scheduler did not already say.
+        Released when the nowcast window *settles*, not when the first chord completes.
+        Those used to be the same moment and are not: a chord is 1.5 °C of measured
+        heating, which the opening bands can supply while the tub is still stratified and
+        reading fast (24.09.2026: five bands at 1.4-1.8 °C/h against 0.9 settled;
+        08.10.2026 after a power restore, at least four). The settling test is what knows
+        the difference — see nowcast.SETTLE_TOLERANCE. Until it passes there is nothing
+        to say that the scheduler did not already say.
 
-        Ends on: a chord this run, the target moving, a genuine heater stop (the
+        Ends on: the window settling, the target moving, a genuine heater stop (the
         transition branch, only after the heater had been running), or the schedule
         being cleared. Not on `heating_since is None`: between the trigger's setpoint
         command and the device reporting `heating` there are ~30 s of idle polls, and
@@ -3971,11 +3901,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         if self._thermal_hold_finish is None:
             return None
-        if self._thermal_points:
-            # A chord has completed *this run*, so there is something measured to show.
-            # Not `thermal_a is not None`: that gated the hold to the one run after a
-            # storage wipe, and on 24.09.2026 — A carried over from the run before — the
-            # hold never existed and the display walked exactly as it had on 17.09.
+        if self._nowcast_mixed:
+            # The window has settled, so there is something measured to show. Not
+            # `thermal_a is not None`: that gated the hold to the one run after a storage
+            # wipe, and on 24.09.2026 — A carried over from the run before — the hold
+            # never existed and the display walked exactly as it had on 17.09.
             self.release_thermal_hold()
             return None
         if target is not None and self._thermal_hold_target is not None and (
@@ -4038,6 +3968,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         if temp is None:
             return
+        # The nowcast sees every crossing, including the ones discarded below. Its
+        # settling gate is a test on the crossings themselves, so it has to be shown the
+        # transient it is testing for — see nowcast.SETTLE_TOLERANCE.
+        self.record_nowcast_crossing(when_mono, temp)
         self._thermal_crossings_seen += 1
         if self._thermal_crossings_seen <= THERMAL_CHORD_SKIP_CROSSINGS:
             _LOGGER.debug(
@@ -4116,6 +4050,305 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 return
         self.learn_from_crossing(rate, mean, air)
         self.anchor_thermal_chord(when_mono, temp)
+
+    # ---- the nowcast ---------------------------------------------------------
+    #
+    # Separate from everything above it, and that separation is the design. The
+    # scheduler has to predict before a single crossing exists, so it keeps the learned
+    # model. The live estimate is standing next to a tub that is telling it the answer,
+    # so it uses the tub: the last four crossings, the air, and one carried constant.
+    # Nothing else may leak in — see docs/nowcast-ready-at.md.
+
+    def accumulate_nowcast_conditions(self, now_mono: float) -> None:
+        """One poll's worth of weather, weighted by the time it stood for.
+
+        Called every poll while heating. Weighted on the poll interval rather than
+        counted per poll because the interval is not constant: rapid polling after a
+        command runs at one second, and a plain mean would let a minute of that outweigh
+        an hour of ordinary polling.
+        """
+        last = self._cross_last_mono
+        self._cross_last_mono = now_mono
+        secs = (now_mono - last) if last is not None else 0.0
+        if secs <= 0 or secs > 3600:
+            # A gap this long is a restart or an outage, not an interval. The crossing
+            # that follows it is still a fact; what happened outside during it is not.
+            return
+        air = self.ambient_temp
+        if air is not None:
+            if self._cross_air_start is None:
+                self._cross_air_start = float(air)
+            self._cross_air_sum += float(air) * secs
+            self._cross_air_secs += secs
+        if self.ambient_uv is not None:
+            self._cross_uv_sum += float(self.ambient_uv) * secs
+            self._cross_uv_secs += secs
+        if self.ambient_wind is not None or self.ambient_gust is not None:
+            self._cross_wind_sum += float(self.ambient_wind or 0.0) * secs
+            self._cross_gust_sum += float(self.ambient_gust or 0.0) * secs
+            self._cross_wind_secs += secs
+
+    def _reset_crossing_conditions(self) -> None:
+        """Start accumulating the next interval."""
+        self._cross_air_sum = self._cross_air_secs = 0.0
+        self._cross_uv_sum = self._cross_uv_secs = 0.0
+        self._cross_wind_sum = self._cross_gust_sum = self._cross_wind_secs = 0.0
+        self._cross_air_start = None
+
+    def reset_nowcast_run(self) -> None:
+        """Drop the run's crossings. Called where a window stops being a measurement.
+
+        A heater interruption, a temperature drop (cold water added, or a reading that
+        settles back after mixing) and a data gap all invalidate the window rather than
+        merely widening it, so it is discarded rather than extended. The mixed latch goes
+        with it: after an interruption the tub may be stratified again, which is exactly
+        what happened on 08.10.2026 when the power came back.
+        """
+        if self._nowcast_crossings:
+            _LOGGER.debug("Nowcast: dropping %d crossing(s) of the interrupted window",
+                          len(self._nowcast_crossings))
+        self._nowcast_crossings = []
+        self._nowcast_mixed = False
+        self._cross_last_mono = None
+        self._reset_crossing_conditions()
+
+    def record_nowcast_crossing(self, when_mono: float, temp) -> None:
+        """Every 0.5 °C boundary while heating, with the weather it was reached through.
+
+        Every one, including the unmixed ones the thermal chord discards: the settling
+        gate is a test on the crossings themselves, so it needs to see the transient it
+        is testing for. See nowcast.SETTLE_TOLERANCE.
+        """
+        if temp is None:
+            return
+        water = float(temp)
+        if self._nowcast_crossings is None:
+            self._nowcast_crossings = []
+        prev = self._nowcast_crossings[-1] if self._nowcast_crossings else None
+        if prev is not None and water <= prev.water:
+            # Not a crossing upward. Cold water, or a reading settling back after
+            # mixing — either way the window is no longer measuring one climb.
+            _LOGGER.info(
+                "Nowcast: water fell %.1f → %.1f °C — the window is not measuring one "
+                "climb any more, dropping it", prev.water, water)
+            self.reset_nowcast_run()
+            self._nowcast_crossings = [nc.Crossing(when_mono, water, None)]
+            self._cross_last_mono = when_mono
+            return
+        air = (self._cross_air_sum / self._cross_air_secs
+               if self._cross_air_secs > 0 else self.ambient_temp)
+        self._nowcast_crossings.append(nc.Crossing(when_mono, water, air))
+        # Once mixed, mixed for the rest of the run: a tub does not re-stratify while
+        # the heater runs, and a latch keeps the gate from flickering on a rate that
+        # later changes for an honest reason, such as the sun coming out.
+        if not self._nowcast_mixed and nc.settled(
+                self._nowcast_crossings, self.nowcast_lift()):
+            self._nowcast_mixed = True
+            _LOGGER.info(
+                "Nowcast: the window has settled after %d crossing(s) — the live "
+                "estimate is now measured rather than held",
+                len(self._nowcast_crossings))
+        self._append_crossing_log(when_mono, water, air)
+        # Keep only what two windows need, plus a little slack for the log writer.
+        keep = 2 * nc.WINDOW_BOUNDARIES + 2
+        if len(self._nowcast_crossings) > keep:
+            self._nowcast_crossings = self._nowcast_crossings[-keep:]
+        self._reset_crossing_conditions()
+
+    def nowcast_lift(self) -> float:
+        """The carried asymptote lift, seeded until a run has measured one.
+
+        Migration happens here and needs no store surgery: an installation carrying a
+        learned `(A, tau)` pair already carries the lift as their product.
+        """
+        if self.nowcast_lift_c is not None:
+            return self.nowcast_lift_c
+        return nc.lift_from_run(self.thermal_a, self.thermal_tau_h) or nc.DEFAULT_LIFT_C
+
+    def learn_nowcast_lift(self, a, tau_h) -> None:
+        """Fold a completed run's own `A * tau` into the carried lift.
+
+        A long memory, and the only long memory in the whole design, because the lift is
+        the only quantity a refill does not disturb: `A` goes as one over the water mass
+        and `tau` goes with it, so the product is a property of heater power and
+        insulation. The old scheme had it backwards — a long memory on the two things
+        that genuinely change, and the stable one left to drift wherever they took it,
+        which is why a refill used to take several runs to work through.
+        """
+        measured = nc.lift_from_run(a, tau_h)
+        if measured is None:
+            return
+        before = self.nowcast_lift_c
+        self.nowcast_lift_c = blend(before, measured, _LIFT_ALPHA)
+        self.nowcast_lift_n += 1
+        _LOGGER.info(
+            "Nowcast lift: run measured %.2f °C (A %.3f x tau %.1f h) → carried "
+            "%.2f °C [n=%d]", measured, a, tau_h, self.nowcast_lift_c,
+            self.nowcast_lift_n)
+
+    def nowcast(self, target):
+        """The projection for this target, or None when the window cannot answer.
+
+        None is a real answer and has to stay one: before the window exists, before the
+        tub has mixed, without an outdoor temperature, or for a target this heater cannot
+        hold against this air. The caller shows the held opening estimate instead — it
+        must not publish a number this did not produce.
+        """
+        if target is None or not self._nowcast_mixed:
+            return None
+        return nc.nowcast(
+            self._nowcast_crossings, float(target), self.nowcast_lift(),
+            air_segments=self.forecast_segments(), air_now=self.ambient_temp)
+
+    def nowcast_finish(self, target) -> datetime | None:
+        """When this target is reached, from the newest crossing forward.
+
+        Anchored on the crossing rather than on the current reading, because that is the
+        one point where the water temperature and the clock are both facts: between
+        boundaries the reading is known only to within half a degree, while a crossing
+        time is exact.
+
+        A run that falls behind is pushed out rather than left standing. If the next
+        boundary is overdue, the heater is not delivering what the window measured, and
+        the shortfall is added — without it the finish would sit still while the tub
+        failed to arrive at it.
+        """
+        n = self.nowcast(target)
+        if n is None or not self._nowcast_crossings:
+            return None
+        crossed_at = self._nowcast_last_at
+        if crossed_at is None:
+            return None
+        finish = crossed_at + timedelta(minutes=n.minutes)
+        now = datetime.now(timezone.utc)
+        due = crossed_at + timedelta(minutes=n.step_minutes)
+        if now > due:
+            finish += now - due
+        return finish
+
+    def nowcast_diagnostics(self) -> dict:
+        """What the live estimate is built on, for the Ready at attributes.
+
+        Everything here is measured this run or carried as the single constant. Nothing
+        learned appears, because nothing learned is used.
+        """
+        crossings = self._nowcast_crossings or []
+        win = nc.measure(crossings)
+        out = {
+            "nowcast_crossings": len(crossings),
+            "nowcast_settled": bool(self._nowcast_mixed),
+            "nowcast_lift_c": round(self.nowcast_lift(), 2),
+            "nowcast_lift_samples": self.nowcast_lift_n,
+            "nowcast_rate_c_per_h": None,
+            "nowcast_window_span_c": None,
+            "nowcast_window_hours": None,
+            "nowcast_air_c": None,
+            "nowcast_gap_c": None,
+            "nowcast_tau_h": None,
+            "nowcast_a_c_per_h": None,
+            "nowcast_asymptote_c": None,
+            "nowcast_forecast_held": None,
+        }
+        if win is None:
+            return out
+        out["nowcast_rate_c_per_h"] = round(win.rate, 3)
+        out["nowcast_window_span_c"] = round(win.span_c, 2)
+        out["nowcast_window_hours"] = round(win.hours, 2)
+        out["nowcast_air_c"] = _round_or_none(win.air, 2)
+        params = nc.derive(win, self.nowcast_lift())
+        if params is not None:
+            out["nowcast_gap_c"] = round(win.water_mid - win.air, 2)
+            out["nowcast_tau_h"] = round(params[0], 2)
+            out["nowcast_a_c_per_h"] = round(params[1], 3)
+            out["nowcast_asymptote_c"] = round(win.air + self.nowcast_lift(), 1)
+        projected = self.nowcast(self.scheduling_temp())
+        if projected is not None:
+            out["nowcast_forecast_held"] = projected.air_held
+        return out
+
+    # ---- the crossing log ----------------------------------------------------
+
+    def _append_crossing_log(self, when_mono: float, water: float, air) -> None:
+        """One row per crossing, queued for its own store.
+
+        The water sensor only changes at half-degree boundaries, so this list *is* the
+        full resolution of that measurement — there is no finer signal to preserve and
+        no reason to log raw polls.
+
+        `uv`, `wind` and `gust` are written and never read by any model. They are the
+        record that lets solar gain and wind be settled in a few weeks against data
+        instead of guessed at now.
+        """
+        when = dt_util.utcnow()
+        # The newest crossing's wall clock, which is what the projection is anchored on.
+        # The monotonic clock measures the intervals and cannot be turned into a time of
+        # day; this can, and does not survive a restart, which is correct — a restarted
+        # run re-anchors on its next crossing rather than extrapolating from a time it
+        # cannot place.
+        self._nowcast_last_at = when
+        prev = (self._nowcast_crossings[-2]
+                if len(self._nowcast_crossings) > 1 else None)
+        secs = round(when_mono - prev.mono) if prev is not None else None
+        rate = ((water - prev.water) / (secs / 3600.0)
+                if prev is not None and secs else None)
+        row = {
+            "t": when.isoformat(timespec="seconds"),
+            "water": water,
+            "secs": secs,
+            "air": _round_or_none(air, 2),
+            "air_start": _round_or_none(self._cross_air_start, 2),
+            "air_end": _round_or_none(self.ambient_temp, 2),
+            "uv": _round_or_none(
+                self._cross_uv_sum / self._cross_uv_secs
+                if self._cross_uv_secs > 0 else self.ambient_uv, 2),
+            "wind": _round_or_none(
+                self._cross_wind_sum / self._cross_wind_secs
+                if self._cross_wind_secs > 0 else self.ambient_wind, 2),
+            "gust": _round_or_none(
+                self._cross_gust_sum / self._cross_wind_secs
+                if self._cross_wind_secs > 0 else self.ambient_gust, 2),
+            "rate": _round_or_none(rate, 4),
+            "gap": (_round_or_none(water - 0.25 - air, 2)
+                    if air is not None else None),
+        }
+        if self._crossing_log is None:
+            self._crossing_log = []
+        self._crossing_log.append(row)
+        # Bounded. At forty crossings a run and a couple of runs a week this is roughly
+        # three months, which comfortably covers the question being asked of it.
+        if len(self._crossing_log) > _CROSSING_LOG_MAX:
+            self._crossing_log = self._crossing_log[-_CROSSING_LOG_MAX:]
+        self._crossing_log_dirty = True
+
+    async def _load_crossing_log(self) -> None:
+        """Read the crossing log back on the first poll after a restart."""
+        if self._crossing_log_loaded:
+            return
+        self._crossing_log_loaded = True
+        if self._crossing_store is None:
+            return
+        try:
+            stored = await self._crossing_store.async_load()
+        except Exception:                                     # noqa: BLE001
+            _LOGGER.debug("Crossing log: could not be read", exc_info=True)
+            return
+        rows = (stored or {}).get("crossings") or []
+        if isinstance(rows, list):
+            self._crossing_log = list(rows[-_CROSSING_LOG_MAX:])
+            _LOGGER.debug("Crossing log: %d row(s) restored", len(self._crossing_log))
+
+    async def _save_crossing_log(self) -> None:
+        """Write the log, and only when a crossing has actually been added."""
+        if not getattr(self, "_crossing_log_dirty", False):
+            return
+        self._crossing_log_dirty = False
+        if self._crossing_store is None:
+            return
+        try:
+            await self._crossing_store.async_save(
+                {"crossings": self._crossing_log or []})
+        except Exception:                                     # noqa: BLE001
+            _LOGGER.debug("Crossing log: could not be written", exc_info=True)
 
     def thermal_diagnostics(self) -> dict:
         """What the model currently believes, for the diagnostic sensor."""

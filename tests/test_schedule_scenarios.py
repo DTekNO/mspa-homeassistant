@@ -54,7 +54,6 @@ class MockCoordinator:
         scheduled_ready_at: "datetime | None" = None,
         schedule_target_temp: float = 40.0,
         schedule_triggered: bool = False,
-        shadow_revisions: "int | None" = None,
     ):
         self.near_target = near_target
         self.ready_latched = ready_latched
@@ -70,8 +69,6 @@ class MockCoordinator:
         self.last_update_success = last_update_success
         self.scheduled_ready_at = scheduled_ready_at
         self.schedule_target_temp = schedule_target_temp
-        # None means no session, matching the real coordinator outside one.
-        self._shadow_revisions = shadow_revisions
         # Target as the readiness latch last saw it. None on the first poll, which is
         # why a spa that simply reaches its setpoint still latches.
         self._latch_target = None
@@ -103,11 +100,6 @@ class MockCoordinator:
             "heater": _heater,
         }
 
-    def shadow_revisions(self):
-        """Matches the real coordinator: revision count, or None outside a session."""
-        return self._shadow_revisions
-
-
     # Borrowed, not reimplemented: a mock that restates the logic under test proves
     # only that the mock agrees with itself.
     circulating = MSpaUpdateCoordinator.circulating
@@ -115,7 +107,6 @@ class MockCoordinator:
     session_plan = MSpaUpdateCoordinator.session_plan
     session_settled = MSpaUpdateCoordinator.session_settled
     session_opening_eta = MSpaUpdateCoordinator.session_opening_eta
-    session_progress_deviation = MSpaUpdateCoordinator.session_progress_deviation
     shadow_eta = MSpaUpdateCoordinator.shadow_eta
     # The model seam, borrowed for the same reason as the rest: these scenarios are
     # about what the *selected* model produces, and a mock that answered with its own
@@ -134,6 +125,23 @@ class MockCoordinator:
     thermal_tau_h = None
     thermal_a_n = 0
     thermal_tau_n = 0
+    # The nowcast, borrowed for the same reason as the rest. Left with no crossings, so
+    # these scenarios run on the opening and fallback regimes — which is what they were
+    # written against, and what an installation sees before its window is a measurement.
+    nowcast = MSpaUpdateCoordinator.nowcast
+    nowcast_finish = MSpaUpdateCoordinator.nowcast_finish
+    nowcast_lift = MSpaUpdateCoordinator.nowcast_lift
+    nowcast_diagnostics = MSpaUpdateCoordinator.nowcast_diagnostics
+    thermal_hold_finish = MSpaUpdateCoordinator.thermal_hold_finish
+    release_thermal_hold = MSpaUpdateCoordinator.release_thermal_hold
+    _nowcast_crossings = None
+    _nowcast_mixed = False
+    _nowcast_last_at = None
+    nowcast_lift_c = None
+    nowcast_lift_n = 0
+    _thermal_hold_finish = None
+    _thermal_hold_target = None
+    _thermal_points = None
     heating_minutes = MSpaUpdateCoordinator.heating_minutes
     thermal_minutes = MSpaUpdateCoordinator.thermal_minutes
     forecast_segments = MSpaUpdateCoordinator.forecast_segments
@@ -553,147 +561,6 @@ def _readiness_sensor(coordinator) -> "MSpaReadyAtTimeSensor":
     return e
 
 
-class TestEtaSlew:
-    """Rate cap on the displayed ETA.
-
-    Cap and snap semantics were both revised after the 2026-08-06 session (see the
-    comment above _ETA_SLEW_MIN_PER_MIN): the cap dropped 3 -> 1 min per wall
-    minute, and snapping is now decided by _replan_key rather than by magnitude.
-    Cap assertions read _eta_display, the unrounded internal position, so display
-    rounding does not obscure what the cap did.
-    """
-
-    _BASE = datetime(2026, 7, 31, 10, 0, tzinfo=timezone.utc)
-
-    def test_shadow_revision_snaps_rather_than_ramps(self):
-        """A plan revision is adopted at once, not crawled toward.
-
-        ShadowPlan revises about six times in a session, after measuring a third of the
-        remaining climb. Slewing that at a minute per minute meant a three-hour
-        correction took three hours to show, and the next revision always overtook it:
-        on 2026-08-19 the display sat 122 minutes behind a plan that had been right for
-        an hour. The churn the cap exists to suppress is already suppressed here.
-
-        Bucket model only: the shadow curve steers the display under the frozen plan and
-        nothing else, so its revisions snap there and are ignored under the thermal model
-        (see the next test, and _replan_key).
-        """
-        c = MockCoordinator(shadow_revisions=1)
-        c.config_entry = type("E", (), {"options": {"prediction_model": "buckets"}})()
-        e = _readiness_sensor(c)
-        eta = self._BASE + timedelta(hours=12)
-        e._slew_eta(eta, now_utc=self._BASE)
-
-        revised = eta - timedelta(minutes=180)
-        c._shadow_revisions = 2
-        shown = e._slew_eta(revised, now_utc=self._BASE + timedelta(minutes=1))
-        assert e._eta_display == revised, "a revision should be adopted, not ramped"
-        assert shown == revised
-
-    def test_a_thermal_chord_snaps_rather_than_ramps(self):
-        """Same event, same lesson, new model. On 17.09.2026 the first chord moved the
-        estimate three hours and the display crawled toward it at a minute per minute
-        for three hours — then the next chord pulled it back the other way. What read
-        as wobble was one honest step, drawn out by the cap it should have bypassed."""
-        c = MockCoordinator(shadow_revisions=0)
-        c.thermal_a_n = 0
-        e = _readiness_sensor(c)
-        eta = self._BASE + timedelta(hours=12)
-        e._slew_eta(eta, now_utc=self._BASE)
-
-        revised = eta - timedelta(minutes=180)
-        c.thermal_a_n = 1                                 # the first chord completed
-        shown = e._slew_eta(revised, now_utc=self._BASE + timedelta(minutes=1))
-        assert e._eta_display == revised, "a chord should be adopted, not ramped"
-        assert shown == revised
-
-    def test_a_shadow_revision_does_not_snap_the_thermal_display(self):
-        """24.09.2026 13:51: "re-anchored at 20.0 °C — revision 1" snapped a thermal
-        estimate the shadow curve was not steering. Under the thermal model the shadow
-        is a recorder, not a driver, and must not enter the replan identity."""
-        c = MockCoordinator(shadow_revisions=1)          # default model: thermal
-        c.thermal_a_n = 3
-        e = _readiness_sensor(c)
-        eta = self._BASE + timedelta(hours=12)
-        e._slew_eta(eta, now_utc=self._BASE)
-        c._shadow_revisions = 2
-        e._slew_eta(eta - timedelta(minutes=180), now_utc=self._BASE + timedelta(minutes=1))
-        moved = (eta - e._eta_display).total_seconds() / 60
-        assert 0 < moved <= 1.0 + 1e-6, f"snapped or stood still: moved {moved:.1f} min"
-
-    def test_drift_without_a_revision_still_ramps(self):
-        """The cap still applies to everything that is not a revision."""
-        c = MockCoordinator(shadow_revisions=1)
-        e = _readiness_sensor(c)
-        eta = self._BASE + timedelta(hours=12)
-        e._slew_eta(eta, now_utc=self._BASE)
-
-        drift = eta - timedelta(minutes=180)
-        shown = e._slew_eta(drift, now_utc=self._BASE + timedelta(minutes=1))
-        assert e._eta_display == eta - timedelta(minutes=1), (
-            "without a revision the gap must close at the capped rate"
-        )
-        assert shown != drift
-
-    def test_first_eta_is_taken_verbatim(self):
-        e = _readiness_sensor(MockCoordinator())
-        eta = self._BASE + timedelta(hours=3)
-        assert e._slew_eta(eta, now_utc=self._BASE) == eta
-
-    def test_lump_is_ramped_at_capped_rate(self):
-        """A 13 min correction moves the estimate by at most 1 min per wall minute."""
-        e = _readiness_sensor(MockCoordinator())
-        eta = self._BASE + timedelta(hours=3)
-        e._slew_eta(eta, now_utc=self._BASE)
-        e._slew_eta(eta + timedelta(minutes=13), now_utc=self._BASE + timedelta(minutes=1))
-        assert e._eta_display == eta + timedelta(minutes=1)
-
-    def test_lump_fully_repaid_over_successive_polls(self):
-        """13 min at 1 min/min takes 13 polls, then stops — no overshoot."""
-        e = _readiness_sensor(MockCoordinator())
-        eta = self._BASE + timedelta(hours=3)
-        e._slew_eta(eta, now_utc=self._BASE)
-        raw = eta + timedelta(minutes=13)
-        now = self._BASE
-        for _ in range(20):
-            now += timedelta(minutes=1)
-            e._slew_eta(raw, now_utc=now)
-        assert e._eta_display == raw
-
-    def test_earlier_corrections_also_capped(self):
-        e = _readiness_sensor(MockCoordinator())
-        eta = self._BASE + timedelta(hours=3)
-        e._slew_eta(eta, now_utc=self._BASE)
-        e._slew_eta(eta - timedelta(minutes=10), now_utc=self._BASE + timedelta(minutes=1))
-        assert e._eta_display == eta - timedelta(minutes=1)
-
-    def test_magnitude_alone_does_not_snap(self):
-        """The old rule adopted anything over 30 min wholesale.  Both large jumps in
-        the 2026-08-06 session were rate-learning revisions, not user replans, so
-        size on its own must no longer bypass the cap."""
-        e = _readiness_sensor(MockCoordinator())
-        eta = self._BASE + timedelta(hours=3)
-        e._slew_eta(eta, now_utc=self._BASE)
-        e._slew_eta(eta + timedelta(minutes=45), now_utc=self._BASE + timedelta(seconds=30))
-        moved = (e._eta_display - eta).total_seconds() / 60
-        assert moved <= 0.5 + 1e-9, f"moved {moved:.1f} min in 30 s"
-
-    def test_non_eta_state_resets_slew(self):
-        """Reaching Ready (or any non-ETA regime) clears the slew state so the
-        next heating session starts fresh instead of ramping from stale data."""
-        c = MockCoordinator(near_target=True, ready_latched=True,
-                            water_temp=40.0, target_temp=40.0)
-        e = _readiness_sensor(c)
-        e._eta_display = self._BASE            # stale leftover
-        e._eta_wall = self._BASE
-        e._eta_plan_key = ("stale",)
-        e._eta_closing = True
-        val = _readiness_text(e)
-        assert val == "Ready"
-        assert e._eta_display is None
-        assert e._eta_wall is None
-        assert e._eta_plan_key is None
-        assert e._eta_closing is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -955,67 +822,55 @@ class TestReadyAtAttributeMatchesState:
 # READY AT ETA — deadband, coarse display, and snapping on cause not size
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestEtaSmoothing:
-    """The first slew attempt capped movement at 3 min/min and snapped anything
-    over 30 min.  Measured over an 11 h session that gave 166 display changes and
-    14 reversals: the cap rarely bound on the jitter, and both large corrections
-    came from rate learning rather than the user, so they bypassed smoothing.
+class TestTheEstimateIsNotSmoothed:
+    """What replaced the slew: the live estimate is published as it is computed.
+
+    The cap, the deadband, the hysteresis latch and the replan snap all existed because a
+    bucket-model estimate twitched at every sample. Every regime that remains moves only
+    when a crossing completes or not at all, so smoothing them only delayed correct
+    answers — on 19.08.2026 the display sat 122 minutes behind a plan that had been right
+    for an hour. These assert that the delay is gone, which is the part a future
+    "let us just smooth it a little" would break.
     """
 
-    _BASE = datetime(2026, 8, 6, 21, 30, tzinfo=timezone.utc)
+    _BASE = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
 
-    def _sensor(self, c):
-        return _readiness_sensor(c)
+    def _sensor(self, coordinator):
+        s = object.__new__(MSpaReadyAtTimeSensor)
+        s.coordinator = coordinator
+        return s
 
-    def test_small_movement_is_ignored(self):
-        """±1-2 min jitter produced most of the churn and must not reach the display."""
-        c = MockCoordinator(water_temp=30.0, target_temp=40.0, heat_rate=2.0, heater="on")
+    def test_a_three_hour_correction_lands_in_one_step(self):
+        c = MockCoordinator(water_temp=30.0, target_temp=39.5, heater="on")
         e = self._sensor(c)
-        first = e._slew_eta(self._BASE + timedelta(minutes=300), self._BASE)
-        for i, drift in enumerate([1, 2, -1, 2, -2, 1], start=1):
-            got = e._slew_eta(self._BASE + timedelta(minutes=300 + drift),
-                              self._BASE + timedelta(seconds=30 * i))
-            assert got == first, f"jitter of {drift} min moved the display"
+        first = self._BASE + timedelta(hours=12)
+        revised = first - timedelta(hours=3)
+        with patch("custom_components.mspa.sensor._compute_ready_at",
+                   return_value=("eta", first, "nowcast")):
+            assert e.native_value == MSpaReadyAtTimeSensor._round_eta(first)
+        with patch("custom_components.mspa.sensor._compute_ready_at",
+                   return_value=("eta", revised, "nowcast")):
+            assert e.native_value == MSpaReadyAtTimeSensor._round_eta(revised)
 
-    def test_display_is_rounded_to_five_minutes(self):
-        c = MockCoordinator(water_temp=30.0, target_temp=40.0, heat_rate=2.0, heater="on")
-        e = self._sensor(c)
-        got = e._slew_eta(self._BASE.replace(minute=37, second=0), self._BASE)
-        assert got.minute % 5 == 0, f"{got} is not on a 5-minute boundary"
-        assert got.second == 0
+    def test_nothing_is_carried_between_reads(self):
+        """No held display position, so two sensors reading the same coordinator at the
+        same moment cannot disagree — which is what the slew's wall-clock state allowed.
+        """
+        c = MockCoordinator(water_temp=30.0, target_temp=39.5, heater="on")
+        when = self._BASE + timedelta(hours=4)
+        with patch("custom_components.mspa.sensor._compute_ready_at",
+                   return_value=("eta", when, "nowcast")):
+            assert self._sensor(c).native_value == self._sensor(c).native_value
 
-    def test_large_model_correction_ramps_instead_of_snapping(self):
-        """The -68 min case: a rate sample revises the estimate, so it must slew."""
-        c = MockCoordinator(water_temp=30.0, target_temp=40.0, heat_rate=2.0, heater="on")
+    def test_the_regime_is_published(self):
+        """Which of the three answered. Without it a reader cannot tell a measured
+        estimate from a held one, and they deserve very different trust."""
+        c = MockCoordinator(water_temp=30.0, target_temp=39.5, heater="on")
         e = self._sensor(c)
-        e._slew_eta(self._BASE + timedelta(minutes=300), self._BASE)
-        # 68 min earlier, one poll later — must NOT be adopted wholesale
-        got = e._slew_eta(self._BASE + timedelta(minutes=232),
-                          self._BASE + timedelta(seconds=30))
-        moved = abs((got - (self._BASE + timedelta(minutes=300))).total_seconds() / 60)
-        assert moved <= 5, f"moved {moved:.0f} min in 30 s — snapped instead of ramping"
-
-    def test_a_real_replan_snaps(self):
-        """Moving the thermostat is the user changing the question — jump to it."""
-        c = MockCoordinator(water_temp=30.0, target_temp=40.0, heat_rate=2.0, heater="on")
-        e = self._sensor(c)
-        e._slew_eta(self._BASE + timedelta(minutes=300), self._BASE)
-        c._last_data["target_temperature"] = "38.0"          # user lowers the setpoint
-        target = self._BASE + timedelta(minutes=232)
-        got = e._slew_eta(target, self._BASE + timedelta(seconds=30))
-        assert got == e._round_eta(target), "a genuine replan should be adopted at once"
-
-    def test_sustained_drift_still_gets_through(self):
-        """Smoothing must not mean ignoring a real trend."""
-        c = MockCoordinator(water_temp=30.0, target_temp=40.0, heat_rate=2.0, heater="on")
-        e = self._sensor(c)
-        e._slew_eta(self._BASE + timedelta(minutes=300), self._BASE)
-        raw = self._BASE + timedelta(minutes=360)            # 60 min later, held
-        last = None
-        for i in range(1, 121):                              # two hours of polls
-            last = e._slew_eta(raw, self._BASE + timedelta(minutes=i))
-        assert abs((last - raw).total_seconds() / 60) <= 5, (
-            f"display stalled at {last}, raw was {raw}")
+        for regime in ("nowcast", "opening", "fallback"):
+            with patch("custom_components.mspa.sensor._compute_ready_at",
+                       return_value=("eta", self._BASE, regime)):
+                assert e.extra_state_attributes["regime"] == regime
 
 
 class TestScheduleStartSlew:
@@ -1520,73 +1375,6 @@ class TestFrozenSessionPlan:
         c._prediction["start_time"] = "not a timestamp"
         assert c.session_settled(37.0) is False
         assert c.session_opening_eta() is None
-
-
-class TestProgressDeviation:
-    """How the session is running against its own opening plan, in minutes.
-
-    Deliberately a separate attribute rather than folded into the ETA: the estimate
-    answers "when", this answers "how is it going", and conflating them is what made
-    the shipped ETA chase every sample.
-    """
-
-    def _coord(self, *, water, elapsed_min, start_temp=33.0):
-        c = MockCoordinator(water_temp=water, target_temp=39.5, heat_rate=1.0,
-                            anchor_offset_minutes=0.0)
-        c.temp_anchor_temp = water
-        c._prediction = {
-            "start_time": (datetime.now(timezone.utc)
-                           - timedelta(minutes=elapsed_min)).isoformat(),
-            "start_temp": start_temp,
-            "target_temp": 39.5,
-            "estimated_minutes": 426.0,
-            "estimated_minutes_biased": 426.0,
-            "plan_rates": [1.10, 1.00, 0.80],   # mid 1.0 °C/h → 1 °C per 60 min
-        }
-        return c
-
-    def test_none_outside_a_session(self):
-        c = MockCoordinator(water_temp=35.0, target_temp=39.5)
-        assert c.session_progress_deviation(35.0) is None
-
-    def test_none_before_the_settle_point(self):
-        """The opening crossings measure band position, so a deviation then is noise."""
-        c = self._coord(water=34.0, elapsed_min=45)
-        assert c.session_progress_deviation(34.0) is None
-
-    def test_behind_schedule_is_positive(self):
-        """2.0 °C at 1.0 °C/h is allowed 120 min; taking 150 is 30 behind."""
-        c = self._coord(water=35.0, elapsed_min=150)
-        assert c.session_progress_deviation(35.0) == pytest.approx(30.0, abs=0.5)
-
-    def test_ahead_of_schedule_is_negative(self):
-        c = self._coord(water=35.0, elapsed_min=100)
-        assert c.session_progress_deviation(35.0) == pytest.approx(-20.0, abs=0.5)
-
-    def test_on_plan_is_about_zero(self):
-        c = self._coord(water=35.0, elapsed_min=120)
-        assert abs(c.session_progress_deviation(35.0)) < 0.5
-
-    def test_it_does_not_move_the_eta(self):
-        """The whole point of a separate attribute."""
-        behind = self._coord(water=35.0, elapsed_min=150)
-        on_plan = self._coord(water=35.0, elapsed_min=120)
-        now = datetime.now(timezone.utc)
-        a = _anchor_eta_utc(behind, 39.5, now) - behind.temp_anchor_time
-        b = _anchor_eta_utc(on_plan, 39.5, now) - on_plan.temp_anchor_time
-        assert a == b, "the remaining estimate must not depend on the deviation"
-
-    def test_a_corrupt_record_does_not_raise(self):
-        c = self._coord(water=35.0, elapsed_min=150)
-        c._prediction["start_temp"] = "nonsense"
-        assert c.session_progress_deviation(35.0) is None
-
-    def test_exposed_on_the_ready_at_sensor(self):
-        c = self._coord(water=35.0, elapsed_min=150)
-        attrs = MSpaReadyAtTimeSensor.extra_state_attributes.fget(
-            _readiness_sensor(c))
-        assert attrs["progress_deviation"] == pytest.approx(30.0, abs=0.5)
-        assert attrs["plan_settled"] is True
 
 
 class TestIntegrationVersionAttribute:

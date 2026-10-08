@@ -107,8 +107,6 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities(entities)
     async_add_entities([MSpaFaultSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaAmbientLearningSensor(coordinator)], update_before_add=True)
-    async_add_entities([MSpaNewtonReadyAtSensor(coordinator),
-                        MSpaNewtonStartAtSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaFilterSensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaHeaterTimerBinarySensor(coordinator)], update_before_add=True)
     async_add_entities([MSpaHeaterTimerTimeSensor(coordinator)], update_before_add=True)
@@ -334,6 +332,39 @@ def _segmented_heating_minutes(from_temp: float, to_temp: float, coordinator) ->
         from_temp, to_temp, ambient=(live[0] if live else None))
 
 
+def _live_eta(coordinator, target_temp, now_utc):
+    """The live finish time and the regime that produced it.
+
+    Three regimes, in order, and the order is the whole design.
+
+    `nowcast` — the run's own last four 0.5 °C crossings, projected through the forecast.
+    It owns the answer whenever it can give one, because it is the only one of the three
+    measuring *this* water: on 08.10.2026 the learned model read 22:55 for a tub that was
+    measurably going to make 18:50, not because the physics was wrong but because its
+    parameters described 260 litres that were no longer there.
+
+    `opening` — the held estimate, for the stretch before the window is a measurement.
+    This is the scheduler's own committed finish where there is one, which is what makes
+    the handover seamless: the number on screen when heating starts is the number the
+    schedule was planned on, not a second opinion about it.
+
+    `fallback` — the learned model. Reached when the nowcast cannot answer at all, which
+    in practice means no outdoor temperature: the nowcast needs a gap, and without a
+    weather entity there is none to compute. A blank Ready at is a broken dashboard, so
+    the buckets carry it.
+
+    Deliberately not a vote or a blend. Each regime answers alone, and the attribute says
+    which did.
+    """
+    eta = coordinator.nowcast_finish(target_temp)
+    if eta is not None:
+        return eta, "nowcast"
+    held = coordinator.thermal_hold_finish(target_temp)
+    if held is not None:
+        return held, "opening"
+    return _anchor_eta_utc(coordinator, target_temp, now_utc), "fallback"
+
+
 def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | None":
     """Return the anchor-based UTC ETA to reach target_temp when heating, or None.
 
@@ -554,37 +585,28 @@ def _overshoot(coordinator) -> "float | None":
         return None
 
 
+def _round_or_none(value, digits: int = 1):
+    """Round where there is something to round. Readings are legitimately absent."""
+    return None if value is None else round(float(value), digits)
+
+
 # Sentinel: distinguishes "state never yet reported" from None (no data).
 _UNSET = object()
 
-# Rate-capped ETA display (Ready at sensor).  Corrections to the live estimate
-# — the lump when a temperature crossing re-anchors, the +1 min/min creep when
-# the anchor is stale — are followed at a bounded pace instead of jumping, so
-# quantization effects land as gentle ramps.  A move larger than the snap
-# threshold is a genuine replan (schedule/setpoint change) and is followed
-# immediately.
-_ETA_SLEW_MIN_PER_MIN = 1.0   # max displayed-ETA movement per wall-clock minute
-_ETA_DEADBAND_MIN = 5.0       # ignore raw movement smaller than this
-_ETA_ROUND_MIN = 5            # display granularity, minutes
-
-# Why these values.  The first attempt capped movement at 3 min per wall minute
-# and snapped anything beyond 30 min, on the theory that a large correction meant
-# the user had replanned.  Measured over an 11 h session (2026-08-06/07) that gave
-# 166 display changes, 39 in the worst hour, 14 direction reversals, and the cap
-# saturated on 30% of steps — it was acting as a speed limiter pegged at its
-# limit, not as a smoother.  Three things were wrong:
+# Display granularity for the live estimate, in minutes.
 #
-#   * 3 min/min is 1.5 min per 30 s poll, so the cap almost never bound on the
-#     ±1-2 min jitter that produced most of the churn.
-#   * There was no deadband, so every wiggle — including reversals — rendered.
-#   * Snapping on magnitude caught the wrong events.  Both large jumps that
-#     session (-68 min, +38 min) came from rate-learning samples, not from the
-#     user: a single sample early in a 16 h heat-up moves the ETA by more than
-#     30 min, so precisely the corrections most in need of smoothing bypassed it.
+# All that is left of the old rate-capped display. The cap, the deadband, the hysteresis
+# latch and the replan snap were there because a bucket-model estimate twitched at every
+# sample: over an 11 h session on 06.08.2026 the unsmoothed display changed 166 times,
+# 39 of them in the worst hour, with 14 direction reversals, and the first cap saturated
+# on 30% of steps — a speed limiter pegged at its limit rather than a smoother. Every
+# regime that remains moves only when a crossing completes, or not at all, so there is
+# nothing left to smooth. See MSpaReadyAtTimeSensor.
 #
-# Snapping is now driven by cause rather than size (see _replan_key), and the
-# display is rounded because minute precision on an estimate hours out is
-# spurious: it guarantees visible churn however the slew is tuned.
+# Rounding stays, for a different reason than it was introduced for: a finish five hours
+# out is not known to the minute, and printing it to the minute claims a precision the
+# measurement does not have.
+_ETA_ROUND_MIN = 5
 
 # Displayed schedule start (Heat Schedule sensor).  Same lesson, applied to the
 # other sensor: hold the shown start steady against drift that carries no
@@ -610,16 +632,16 @@ def _sra_utc(coordinator) -> "datetime | None":
     return sra.astimezone(timezone.utc) if sra.tzinfo else sra.replace(tzinfo=timezone.utc)
 
 
-def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
-    """Return the Ready at state as (kind, dt).
+def _compute_ready_at(coordinator) -> "tuple[str, datetime | None, str | None]":
+    """Return the Ready at state as (kind, dt, regime).
 
     kind is one of:
       'ready' — the spa is at the temperature that matters (dt is None)
       'none'  — no meaningful display (dt is None)
       'sched' — dt is the scheduled ready time; shown verbatim.  It moves only
                 when the user moves the schedule, so it is never slewed.
-      'eta'   — dt is a live anchor-based estimate; the Ready at sensor slews
-                this for display so corrections land as bounded ramps.
+      'eta'   — dt is the live estimate.  `regime` names which of the three
+                produced it; see _live_eta.
 
     Context determines which target drives the display:
 
@@ -684,24 +706,25 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
         # heat. Ordinary maintenance cycling toward a low holding setpoint never
         # qualifies, which is what keeps this branch quiet for the days a schedule
         # usually spends pending.
-        manual_eta = None
+        manual_eta, manual_regime = None, None
         if heater_on and coordinator.session_plan() is not None:
             try:
                 thermostat = float(coordinator._last_data.get("target_temperature") or 0)
             except (TypeError, ValueError):
                 thermostat = None
             if thermostat is not None and water is not None and thermostat > water:
-                manual_eta = _anchor_eta_utc(coordinator, thermostat, now_utc)
+                manual_eta, manual_regime = _live_eta(
+                    coordinator, thermostat, now_utc)
         if manual_eta is not None:
             remaining = (manual_eta - now_utc).total_seconds()
             if remaining <= 300:
                 _LOGGER.debug("ready_at → Ready (manual heat under a pending schedule)")
-                return ("ready", None)
+                return ("ready", None, None)
             _LOGGER.debug(
                 "ready_at → %s (manual heat under a pending schedule, target=%.1f)",
                 manual_eta.isoformat(), thermostat,
             )
-            return ("eta", manual_eta)
+            return ("eta", manual_eta, manual_regime)
 
         near_sched = (
             sched_temp is not None and water is not None
@@ -712,27 +735,27 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
                 "ready_at → Ready (schedule_pending spa at sched_temp=%.1f water=%.1f)",
                 sched_temp, water,
             )
-            return ("ready", None)
+            return ("ready", None, None)
         _LOGGER.debug("ready_at → %s (schedule_pending)", sra.isoformat())
-        return ("sched", sra)
+        return ("sched", sra, "scheduled")
 
     # ── SCHEDULED HEATING ─────────────────────────────────────────────────────
     # Trigger fired — predict ETA to schedule target from current anchor.
     # Tracks real heating progress; independent of the original planned lead time.
     if triggered and sched_temp is not None:
-        eta = _anchor_eta_utc(coordinator, sched_temp, now_utc)
+        eta, regime = _live_eta(coordinator, sched_temp, now_utc)
         if eta is not None:
             remaining = (eta - now_utc).total_seconds()
             if remaining <= 300:
                 _LOGGER.debug("ready_at → Ready (scheduled_heating ≤5min)")
-                return ("ready", None)
+                return ("ready", None, None)
             _LOGGER.debug(
                 "ready_at → %s (scheduled_heating sched_temp=%.1f remaining=%.0fs)",
                 eta.isoformat(), sched_temp, remaining,
             )
-            return ("eta", eta)
+            return ("eta", eta, regime)
         _LOGGER.debug("ready_at → None (scheduled_heating no anchor/rate)")
-        return ("none", None)
+        return ("none", None, None)
 
     # ── FREE CONTEXT ──────────────────────────────────────────────────────────
     # No schedule pending or triggered.  Use thermostat-relative state.
@@ -775,12 +798,12 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
     if latched or direction == "at_target" or (near and modest):
         reason = "latched" if latched else ("near_target" if near else "at_target")
         _LOGGER.debug("ready_at → Ready (free ctx: %s)", reason)
-        return ("ready", None)
+        return ("ready", None, None)
 
     # COOLING: spa above setpoint, no useful ETA
     if direction in ("cooling", None):
         _LOGGER.debug("ready_at → None (free ctx: direction=%s)", direction)
-        return ("none", None)
+        return ("none", None, None)
 
     # FREE HEATING: heater on, predict ETA to thermostat setpoint
     if heater_on:
@@ -789,22 +812,22 @@ def _compute_ready_at(coordinator) -> "tuple[str, datetime | None]":
         except (TypeError, ValueError):
             thermostat = None
         if thermostat is not None:
-            eta = _anchor_eta_utc(coordinator, thermostat, now_utc)
+            eta, regime = _live_eta(coordinator, thermostat, now_utc)
             if eta is not None:
                 remaining = (eta - now_utc).total_seconds()
                 if remaining <= 300:
                     _LOGGER.debug("ready_at → Ready (free_heating ≤5min)")
-                    return ("ready", None)
+                    return ("ready", None, None)
                 _LOGGER.debug(
                     "ready_at → %s (free_heating thermostat=%.1f remaining=%.0fs)",
                     eta.isoformat(), thermostat, remaining,
                 )
-                return ("eta", eta)
+                return ("eta", eta, regime)
         _LOGGER.debug("ready_at → None (free_heating no anchor/rate/thermostat)")
-        return ("none", None)
+        return ("none", None, None)
 
     _LOGGER.debug("ready_at → None (free ctx: heater_off no applicable state)")
-    return ("none", None)
+    return ("none", None, None)
 
 
 def _compute_ready_at_value(coordinator) -> "str | None":
@@ -814,7 +837,7 @@ def _compute_ready_at_value(coordinator) -> "str | None":
     Schedule sensor for the shared readiness definition; the Ready at sensor
     itself goes through _compute_ready_at so it can slew the live ETA.
     """
-    kind, dt = _compute_ready_at(coordinator)
+    kind, dt, _ = _compute_ready_at(coordinator)
     if kind == "ready":
         return "Ready"
     if dt is not None:
@@ -1022,9 +1045,8 @@ class MSpaReadinessSensor(MSpaSensorEntity):
     State is 'Ready' when at or within five minutes of target, otherwise the
     expected ready-at time in local time ('19:45', '19:45 +1d').
 
-    It must not drive the slew: _slew_eta advances by wall-clock time and is not
-    idempotent, so only the owner's native_value may call it.  This reads the
-    position the owner established, which is what display_ready_at returns.
+    It reads display_ready_at rather than re-deriving, which is what keeps the two
+    entities from answering "when" with different numbers.
     """
 
     name = "Ready at"
@@ -1156,8 +1178,25 @@ class MSpaHeatScheduleSensor(MSpaSensorEntity):
 class MSpaReadyAtTimeSensor(MSpaSensorEntity):
     """The Ready at time as a real timestamp, formatted by Home Assistant.
 
+    The one prediction entity. While heating it is the nowcast: the run's own last four
+    0.5 °C crossings, inverted to a trajectory through one carried constant and walked
+    forward over the hourly temperature forecast. Nothing learned on another day reaches
+    it — see docs/nowcast-ready-at.md, and _live_eta for the three regimes.
+
     None while the spa is Ready or there is nothing to predict — the Ready status
     companion is what distinguishes those two, since an absent time cannot.
+
+    **There is no slew.** The displayed estimate used to be rate-capped at a minute per
+    wall-clock minute, with a deadband, a hysteresis latch and a replan snap, because the
+    estimate underneath it twitched at every sample: a bucket rate was weeks old, so each
+    0.5 °C crossing re-anchored a plan built from stale numbers. Every regime that
+    remains is steady by construction — the nowcast moves only when a crossing completes,
+    and then by the width of a four-boundary window rather than a single reading; the
+    opening estimate is held constant by definition; the scheduled time is the time that
+    was asked for. Smoothing them meant a correct three-hour correction took three hours
+    to appear and the next revision always overtook it — observed 19.08.2026 sitting 122
+    minutes behind a plan that had been right for an hour. The honest answer arrives
+    whole.
     """
 
     name = "Ready at time"
@@ -1167,10 +1206,6 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
     def __init__(self, coordinator, config_entry=None):
         super().__init__(coordinator)
         self._attr_device_info = self.device_info
-        self._eta_display = None      # slewed ETA shown to the user
-        self._eta_wall = None         # wall clock of last slew step
-        self._eta_plan_key = None     # plan identity; a change snaps
-        self._eta_closing = False     # mid-correction hysteresis latch
         self._attr_unique_id = (
             f"mspa_ready_at_time_{getattr(coordinator, 'device_id', 'unknown')}")
 
@@ -1179,92 +1214,14 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
         if not super().available:
             return False
         # Available whenever we have enough data to determine a state.
-        return _spa_direction(self.coordinator) is not None or self.coordinator.ready_latched
-
-    def _replan_key(self):
-        """Identity of the plan being estimated.
-
-        A change here means the ETA should jump to the new answer rather than crawl to
-        it.  Two causes qualify.
-
-        The user moved something — the schedule time, the schedule target, or the
-        thermostat.  The old estimate is answering a different question.
-
-        Or the shadow curve revised itself.  This was originally excluded as "the model
-        revising its own estimate", which is right for an estimate that twitches at
-        every sample and wrong for this one: ShadowPlan revises about six times in a
-        session, having measured a third of the remaining climb before it will commit.
-        Slewing that at a minute per minute meant a correct three-hour correction took
-        three hours to appear, and the next revision always overtook it — observed on
-        2026-08-19, where the display sat 122 minutes behind a plan that had already
-        been right for an hour.  The churn the slew exists to suppress is exactly what
-        ShadowPlan has already suppressed by construction, so it should not be paying
-        for it twice.
-        """
-        c = self.coordinator
-        try:
-            setpoint = float(c._last_data.get("target_temperature"))
-        except (TypeError, ValueError):
-            setpoint = None
-        # A completed thermal chord is the same kind of event as a shadow revision, and
-        # the same lesson applies. On 17.09.2026 the first chord moved the estimate
-        # three hours and the display crawled toward it for three hours, then the next
-        # chord pulled it back — what read as wobble was one honest step, drawn out.
-        # The shadow curve only drives the display under the frozen-plan (bucket)
-        # model; under the thermal model it still records revisions but must not snap a
-        # display it is not steering — 24.09.2026 13:51, "revision 1" snapped a thermal
-        # estimate for no reason of the thermal model's.
-        shadow = c.shadow_revisions() if getattr(c, "uses_frozen_plan", True) else 0
-        return (c.scheduled_ready_at, c.schedule_target_temp, setpoint,
-                shadow, getattr(c, "thermal_a_n", 0))
-
-    def _slew_eta(self, raw_eta, now_utc=None):
-        """Move the displayed ETA toward raw_eta, smoothly and coarsely.
-
-        Three mechanisms, in order:
-          * replan snap — if the plan itself changed (_replan_key), adopt the new
-            estimate immediately; the old one is answering a different question.
-          * deadband with hysteresis — a gap under _ETA_DEADBAND_MIN never *starts*
-            movement, so jitter and small reversals are ignored; but once moving,
-            the gap is closed completely rather than stalling at the deadband
-            edge, which would otherwise leave a permanent lag of up to
-            _ETA_DEADBAND_MIN behind the real estimate.
-          * rate cap — otherwise close the gap at no more than
-            _ETA_SLEW_MIN_PER_MIN per wall-clock minute.
-
-        The returned value is rounded to _ETA_ROUND_MIN for display.  The
-        unrounded position is kept internally so repeated small steps still
-        accumulate instead of being rounded away each time.
-        """
-        now = now_utc or datetime.now(timezone.utc)
-        key = self._replan_key()
-        replanned = (self._eta_plan_key is not None and key != self._eta_plan_key)
-
-        if self._eta_display is None or self._eta_wall is None or replanned:
-            if replanned:
-                _LOGGER.debug("ETA slew: plan changed, snapping to %s", raw_eta.isoformat())
-            self._eta_display = raw_eta
-            self._eta_closing = False
-        else:
-            delta_min = (raw_eta - self._eta_display).total_seconds() / 60.0
-            if abs(delta_min) >= _ETA_DEADBAND_MIN:
-                self._eta_closing = True
-            elif abs(delta_min) < 0.5:
-                self._eta_closing = False
-            if self._eta_closing:
-                dt_min = max((now - self._eta_wall).total_seconds() / 60.0, 0.0)
-                cap = _ETA_SLEW_MIN_PER_MIN * dt_min
-                step = min(max(delta_min, -cap), cap)
-                self._eta_display = self._eta_display + timedelta(minutes=step)
-
-        self._eta_wall = now
-        self._eta_plan_key = key
-        return self._round_eta(self._eta_display)
+        return (_spa_direction(self.coordinator) is not None
+                or self.coordinator.ready_latched)
 
     @staticmethod
-
     def _round_eta(dt):
         """Round to the nearest _ETA_ROUND_MIN for display."""
+        if dt is None:
+            return None
         q = _ETA_ROUND_MIN * 60
         secs = dt.hour * 3600 + dt.minute * 60 + dt.second
         shift = round(secs / q) * q - secs
@@ -1273,47 +1230,40 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
     def display_ready_at(self):
         """Return (kind, timestamp) for whatever this sensor is currently showing.
 
-        Single source of truth: the attribute has to agree with the state.
-        This used to re-derive the time independently, which disagreed with the
-        display whenever a schedule was driving it — with a schedule pending and
-        the spa cooling toward its maintenance setpoint the state showed
-        "13:00 +1d" while ready_at reported nothing, because the old branch bailed
-        out on `cooling`.  Deriving both from _compute_ready_at() removes the
-        second opinion.
-
-        Also the source for the Ready at time and Ready status sensors, which is
-        why it reads `_eta_display` rather than calling `_slew_eta`: the slew
-        advances by wall-clock time and is not idempotent, so only `native_value`
-        may drive it.  Before the first `native_value` of a session there is no
-        slewed position yet and the raw estimate stands in for one update.
+        Single source of truth: the state, the `ready_at` attribute and both deprecated
+        text mirrors have to agree. This used to re-derive the time independently, which
+        disagreed with the display whenever a schedule was driving it — with a schedule
+        pending and the spa cooling toward its maintenance setpoint the state showed
+        "13:00 +1d" while ready_at reported nothing, because the old branch bailed out on
+        `cooling`.
         """
-        kind, kind_dt = _compute_ready_at(self.coordinator)
+        kind, dt, _ = _compute_ready_at(self.coordinator)
         if kind == "sched":
-            # Scheduled times are shown verbatim and never slewed.
-            return kind, kind_dt
+            # The time that was asked for, shown verbatim and never rounded.
+            return kind, dt
         if kind == "eta":
-            # Match the slewed display rather than the raw anchor estimate.
-            smoothed = (self._round_eta(self._eta_display)
-                        if self._eta_display is not None else None)
-            return kind, (smoothed if smoothed is not None else kind_dt)
+            return kind, self._round_eta(dt)
         return kind, None       # 'ready' / 'none' — there is no time to report
 
     @property
     def extra_state_attributes(self):
-        direction = _spa_direction(self.coordinator)
-        latched = self.coordinator.ready_latched
+        c = self.coordinator
+        direction = _spa_direction(c)
+        latched = c.ready_latched
         cooling = direction == "cooling"
-        mins = _minutes_to_target(self.coordinator)
-        # Keep the attributes consistent with the slewed state display: when a
-        # smoothed ETA is being shown, minutes_remaining and ready_at derive
-        # from it rather than from the raw anchor estimate.
-        smoothed = (self._round_eta(self._eta_display)
-                    if self._eta_display is not None else None)
-        if smoothed is not None and not latched and not cooling:
+        kind, dt, regime = _compute_ready_at(c)
+        ready_at_utc = (dt if kind == "sched"
+                        else self._round_eta(dt) if kind == "eta" else None)
+
+        if cooling:
+            mins = None
+        elif ready_at_utc is not None and not latched:
             mins = max(0, round(
-                (smoothed - datetime.now(timezone.utc)).total_seconds() / 60
-            ))
-        rounded = (round(mins / 5) * 5) if (mins is not None and mins > 5 and not cooling) else (None if cooling else mins)
+                (ready_at_utc - datetime.now(timezone.utc)).total_seconds() / 60))
+        else:
+            mins = _minutes_to_target(c)
+        rounded = (round(mins / 5) * 5) if (mins is not None and mins > 5) else mins
+
         if latched:
             color = "green"
         elif direction == "heating":
@@ -1322,120 +1272,61 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
             color = "light-blue"
         else:
             color = "green"
-        data = self.coordinator._last_data
+
+        data = c._last_data
         try:
             water_temp = float(data.get("water_temperature"))
             target_temp = float(data.get("target_temperature"))
         except (TypeError, ValueError):
             water_temp = target_temp = None
 
-        kind, ready_at_utc = self.display_ready_at()
-        ready_at_ts = ready_at_utc.isoformat() if ready_at_utc is not None else None
+        circulating, temperature_basis = _temperature_basis(c)
 
-        # The rate actually in effect for the current estimate: segmented over
-        # the span to the display-driving target, with all corrections and the
-        # bias — NOT the flat EMA (which is exposed separately below).
-        rel_target = _relevant_target(self.coordinator)
-        if (water_temp is not None and rel_target is not None
-                and rel_target > water_temp):
-            effective = _segmented_effective_rate(self.coordinator, water_temp, rel_target)
-        elif water_temp is not None and target_temp is not None:
-            effective = _effective_rate(self.coordinator, water_temp, target_temp)
-        else:
-            effective = None
-        computed_heat = getattr(self.coordinator, "computed_heat_rate", None)
-        computed_cool = getattr(self.coordinator, "computed_cool_rate", None)
-        raw = data.get("device_heat_perhour", 0)
-        try:
-            device_rate = int(raw) / 10.0 if int(raw) > 0 else None
-        except (TypeError, ValueError):
-            device_rate = None
-        buckets = getattr(self.coordinator, "heat_rate_buckets", [None, None, None])
-        session_scalar = getattr(self.coordinator, "_session_scalar", 1.0)
-        prediction_bias = getattr(self.coordinator, "prediction_bias", 1.0)
-
-        # Ambient (weather-model) correction visibility.  ambient_factor is the
-        # multiplier currently applied to the bucket the water is in, so a value
-        # < 1.0 means colder-than-baseline air is slowing the estimate.
-        ambient_temp = getattr(self.coordinator, "ambient_temp", None)
-        ambient_baseline = getattr(self.coordinator, "ambient_baseline", None)
-        if water_temp is not None:
-            amb_idx = 0 if water_temp < _HEAT_BUCKET_T1 else 1 if water_temp < _HEAT_BUCKET_T2 else 2
-            ambient_factor = round(ambient_rate_factor(amb_idx, ambient_temp, ambient_baseline), 3)
-        else:
-            ambient_factor = None
-
-        circulating, temperature_basis = _temperature_basis(self.coordinator)
-
-        # How the session is running against its own opening plan, in minutes: positive
-        # is behind, negative ahead.  Deliberately separate from the ETA rather than
-        # folded into it — the estimate answers "when", this answers "how is it going",
-        # and mixing them is what made the old ETA chase every sample.
-        anchor = getattr(self.coordinator, "temp_anchor_temp", None)
-        deviation = self.coordinator.session_progress_deviation(anchor)
-        settled = self.coordinator.session_settled(anchor)
-
-        return {
+        out = {
             "direction": direction,
             "minutes_remaining": rounded,
             "color": color,
-            # Null until the session settles: the opening crossings measure band
-            # position rather than heating, so a deviation computed then is meaningless.
-            "progress_deviation": deviation,
-            "plan_settled": settled,
+            # Which of the three regimes produced the time. See _live_eta.
+            "regime": regime,
             # Whether the temperature this estimate is built on is the tub's at all.
-            # False means the probe is sitting in stagnant water in the pump
-            # housing, which reads at or below tub temperature — so the estimate
-            # is a safe over-estimate of the work remaining, not a wrong one.
+            # False means the probe is sitting in stagnant water in the pump housing,
+            # which reads at or below tub temperature — so the estimate is a safe
+            # over-estimate of the work remaining, not a wrong one.
             "circulating": circulating,
             "temperature_basis": temperature_basis,
             # ISO 8601 UTC, or None when the state is "Ready"/unknown.  Templates:
             #   {{ state_attr('sensor..._ready_at','ready_at') | as_datetime | as_local }}
-            "ready_at": ready_at_ts,
+            "ready_at": ready_at_utc.isoformat() if ready_at_utc is not None else None,
             # What that timestamp means, since it has two sources: 'sched' is the
             # time you asked for, 'eta' is the live prediction.  'ready'/'none'
             # accompany a null ready_at.
             "ready_at_kind": kind,
-            "effective_rate_deg_per_hour": round(effective, 3) if effective is not None else None,
-            "computed_heat_rate_deg_per_hour": round(computed_heat, 3) if computed_heat is not None else None,
-            "computed_cool_rate_deg_per_hour": round(computed_cool, 3) if computed_cool is not None else None,
-            "heat_rate_cold_deg_per_hour": round(buckets[0], 3) if buckets[0] is not None else None,
-            "heat_rate_mid_deg_per_hour": round(buckets[1], 3) if buckets[1] is not None else None,
-            "heat_rate_hot_deg_per_hour": round(buckets[2], 3) if buckets[2] is not None else None,
-            "session_condition_scalar": round(session_scalar, 3),
-            "prediction_bias": round(prediction_bias, 3),
-            "ambient_temp_deg_c": round(ambient_temp, 1) if ambient_temp is not None else None,
-            "ambient_baseline_deg_c": round(ambient_baseline, 2) if ambient_baseline is not None else None,
-            "ambient_factor": ambient_factor,
-            "device_rate_deg_per_hour": device_rate,
             "current_temperature": water_temp,
             "target_temperature": target_temp,
+            # Air is a term in the equation now, not a correction bolted on outside it,
+            # so the reading it was priced against belongs next to the answer.
+            "ambient_temp_deg_c": _round_or_none(getattr(c, "ambient_temp", None), 1),
             # The manifest version of the code actually running, which a hot deploy
             # stamps with the commit it came from ("2026.8.2-beta+hot.f6c1d54").  HACS's
             # update entity reports what HACS installed and is blind to a hot deploy, and
             # the setup log line scrolls out of the retained window, so this is the one
             # answer to "which build is this?" that is always one read away.
-            "integration_version": getattr(self.coordinator, "integration_version", None),
-            # The short form, for somewhere a rendered timestamp will not fit.  New
-            # here; the deprecated mirror strips it, having never published it.
+            "integration_version": getattr(c, "integration_version", None),
+            # The short form, for somewhere a rendered timestamp will not fit.
             "compact": _fmt_compact(ready_at_utc),
         }
+        # What the estimate is actually built on. Every one of these is measured this run
+        # or is the single carried constant; nothing learned appears, because nothing
+        # learned is used. The three bucket rates, the session scalar, the ambient factor
+        # and the prediction bias all left with the model that needed them, and the
+        # progress deviation left with the frozen plan it was measured against.
+        out.update(c.nowcast_diagnostics())
+        return out
 
     @property
     def native_value(self):
-        # The one place the slew may be driven, because _slew_eta advances by
-        # wall-clock time.  Everything else reads display_ready_at, which returns
-        # the position this established without moving it on.
-        kind, dt = _compute_ready_at(self.coordinator)
-        if kind == "eta" and dt is not None:
-            return self._slew_eta(dt)
-        # Ready / none / scheduled: exact displays, and the slew state resets so
-        # the next ETA regime starts fresh.
-        self._eta_display = None
-        self._eta_wall = None
-        self._eta_plan_key = None
-        self._eta_closing = False
-        return dt if kind == "sched" else None
+        kind, dt = self.display_ready_at()
+        return dt if kind in ("eta", "sched") else None
 
 
 class MSpaReadyStatusSensor(MSpaSensorEntity):
@@ -1531,7 +1422,7 @@ class MSpaHeatScheduleStartSensor(MSpaSensorEntity):
 
         Size cannot separate them — at the cold bucket rate a crossing is worth
         about 15 min and at the hot bucket about 40, which straddles the drift —
-        so this discriminates on cause, as _slew_eta does. A change of reading is
+        so this discriminates on cause rather than on size. A change of reading is
         adopted at once; drift within one reading has to clear a wide deadband.
 
         The deadband is asymmetric, because during a cool-down drift in the two
@@ -1992,195 +1883,6 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
             out["mean_abs_error_shipping_min_same_sessions_norm"] = round(
                 sum(abs(a) for a, _ in berrs) / len(berrs), 1)
         return out
-
-
-class _MSpaNewtonShadowSensor(MSpaSensorEntity):
-    """Base for the physical model's shadow of a decision the bucket model makes.
-
-    These are the observation channel, and they are sensors rather than attributes for
-    one practical reason: Home Assistant's recorder keeps state history and the UI can
-    chart it, while attribute history exists in the database but cannot be got at from
-    the frontend. The whole purpose of these is to be reviewed after a heat run, so the
-    history has to be reachable.
-
-    Diagnostic category, enabled by default. Enabled because a disabled entity records
-    nothing, and a shadow nobody recorded is worth less than no shadow; diagnostic so it
-    sits with the other internals rather than presenting itself as something to act on.
-    Neither drives a prediction, a schedule or a display.
-    """
-
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
-
-    # Five minutes, and the arithmetic that settled on it is worth keeping.
-    #
-    # The shadow is recomputed on every coordinator poll — thirty seconds while the
-    # heater runs, one second during a rapid-poll burst — and the raw value is
-    # `now + minutes`, so unrounded it wrote a recorder row on every poll: measured at
-    # 120 an hour, 2880 a day, indefinitely.
-    #
-    # Rounding to the minute only halved it, because of what the sensor does when nothing
-    # is happening. Idle, the water temperature is fixed, so `minutes` is constant and the
-    # estimate slides forward at exactly wall-clock rate — a new minute every minute,
-    # 1440 rows a day, none of them saying anything. The heat-up case reasons the other
-    # way and is what the first attempt was built around: there the estimate holds still
-    # while time passes, so rounding does collapse it. The sensor is idle almost all the
-    # time.
-    #
-    # Five minutes costs nothing where it matters. A nine-hour run still has 108 possible
-    # points, which is ample for seeing whether the estimate wanders, and that is the
-    # whole job.
-    _QUANTUM_S = 300
-
-    @classmethod
-    def _quantised(cls, when):
-        """Round an ETA to the nearest `_QUANTUM_S`. None stays None."""
-        if when is None:
-            return None
-        from datetime import datetime, timedelta, timezone
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        secs = (when - epoch).total_seconds()
-        return epoch + timedelta(
-            seconds=round(secs / cls._QUANTUM_S) * cls._QUANTUM_S)
-
-    def __init__(self, coordinator):
-        super().__init__(coordinator)
-        self._attr_device_info = self.device_info
-        self.coordinator = coordinator
-        self._attr_name = self._shadow_name
-        self._attr_unique_id = (
-            f"mspa_{self._shadow_slug}_"
-            f"{getattr(coordinator, 'device_id', 'unknown')}")
-
-    @property
-    def extra_state_attributes(self):
-        """The parameters behind the number, so a history row explains itself.
-
-        Without these a gap in the series is unreadable months later — no fit yet, or a
-        target the model said was unreachable, look identical from the outside.
-        """
-        c = self.coordinator
-        fit = c.newton_fit()
-        real = len([r for r in getattr(c, "_band_observations", []) if r.get("usable")])
-        out = {
-            "traverses_recorded": real,
-            # True while the model is primed from the learned buckets. It says a time
-            # here rests on the bucket shape rather than on measured traverses, which is
-            # exactly the thing the shadow exists to test — so it must be visible in the
-            # history rather than inferred from a date.
-            "seeded": bool(fit and fit["seeded"]),
-            "traverses_fitted": fit["n"] if fit else 0,
-            "tau_h": round(fit["tau_h"], 2) if fit else None,
-            "asymptote_lift_c": round(fit["asymptote_lift_c"], 2) if fit else None,
-            "ambient_temp_deg_c": c.ambient_temp,
-            # Which ambient priced this row: the instant, or a forecast mean over the
-            # rest of the run. It changes what the number means, so it travels with it.
-            "ambient_source": getattr(c, self._ambient_source_attr, "now"),
-            # Which model produced this row. "newton" is the physical model answering
-            # for itself; anything else means it declined and the row fell back down
-            # the chain, with `fallback_reason` saying why. A blank state now means
-            # nothing could answer at all, rather than "Newton could not".
-            "source": getattr(c, self._source_attr, None),
-            "fallback_reason": (
-                None if getattr(c, self._source_attr, None) == PREDICTION_MODEL_NEWTON
-                else getattr(c, "newton_decline_reason", None)),
-            # The asymptote in absolute terms is what decides reachability, so it is the
-            # number that explains a None.
-            # What this row aimed at, and from where. A Ready-at row cannot be read
-            # without them: the target switches between the thermostat's and the
-            # schedule's depending on whether a schedule is pending, and the shipping
-            # sensor shows the scheduled time verbatim rather than an estimate — so the
-            # two are not always answering the same question.
-            "target_temp_c": c.newton_target_temp,
-            # Rounded for the same reason as the state. The planned-from temperature is
-            # extrapolated within its band, so it moves continuously; at full precision it
-            # changed on every poll and a changed attribute writes a row whatever the
-            # state does.
-            "plan_temp_c": _r(c.newton_plan_temp, 1),
-            "asymptote_deg_c": (
-                round(c.ambient_temp + fit["asymptote_lift_c"], 1)
-                if fit and c.ambient_temp is not None else None),
-        }
-        # Guarded, because the comparison reaches into the shipping model's own state
-        # and this sensor's job is to keep recording. A diagnostic that goes unavailable
-        # because the thing it observes threw is a diagnostic that loses exactly the run
-        # worth looking at.
-        # Which shipping sensor this one is the shadow of, spelled out. Both shadows sit
-        # next to each other in the panel and one is a start while the other is a finish,
-        # so the tempting pairing is the wrong one: comparing "Newton start at" against
-        # "Ready at" differences a start against a finish and yields the length of the
-        # heat-up, which looks like a spectacular disagreement and is not one. Caught by
-        # the person who wrote this, which is fair warning about everyone else.
-        out["compare_with"] = self._compare_with
-        try:
-            out["shipping_equivalent"] = self._shipping_equivalent()
-        except Exception:                                    # noqa: BLE001
-            out["shipping_equivalent"] = None
-        return out
-
-
-class MSpaNewtonReadyAtSensor(_MSpaNewtonShadowSensor):
-    """When the physical model says the water will reach the temperature being aimed at.
-
-    Raw, and deliberately not slewed or latched the way the shipping Ready at is. Those
-    are properties of the display rather than of the model, and reproducing them would
-    smooth away exactly the wandering this exists to expose.
-    """
-
-    _shadow_name = "Newton ready at"
-    _shadow_slug = "newton_ready_at"
-    _ambient_source_attr = "newton_ambient_source"
-    _source_attr = "newton_ready_source"
-    _compare_with = "Ready at"
-    _attr_icon = "mdi:function-variant"
-
-    @property
-    def native_value(self):
-        return self._quantised(self.coordinator.newton_ready_at)
-
-    def _shipping_equivalent(self):
-        """The bucket model's answer to *this sensor's* question, in minutes.
-
-        Not `_minutes_to_target`, which was here first and was actively misleading: it
-        aims at the thermostat setpoint, while this sensor aims at the schedule target
-        whenever a schedule is pending. On a spa sitting at its holding temperature with
-        a schedule set for the day after, that reported 0 against a Newton estimate of
-        five and a half hours — two different questions, and the obvious reading of the
-        pair is that the physical model is broken.
-
-        Same span, same target, buckets rather than Newton. That is the only form in
-        which the two numbers may be differenced.
-        """
-        c = self.coordinator
-        from_temp, to_temp = c.newton_plan_temp, c.newton_target_temp
-        if from_temp is None or to_temp is None:
-            return None
-        return _r(c._predictor().heating_minutes(from_temp, to_temp), 0)
-
-
-class MSpaNewtonStartAtSensor(_MSpaNewtonShadowSensor):
-    """When the physical model says a scheduled heat-up would have to start.
-
-    The same subtraction `_check_schedule_trigger` makes against the same scheduled
-    time, so the two start times answer the same question and can be differenced
-    directly. None whenever no schedule is pending, or once one has fired.
-    """
-
-    _shadow_name = "Newton start at"
-    _shadow_slug = "newton_start_at"
-    _ambient_source_attr = "newton_start_ambient_source"
-    _source_attr = "newton_start_source"
-    _compare_with = "Heat Schedule — the 'Start at' time, not Ready at"
-    _attr_icon = "mdi:function-variant"
-
-    @property
-    def native_value(self):
-        return self._quantised(self.coordinator.newton_start_at)
-
-    def _shipping_equivalent(self):
-        """The bucket model's planned start, which is what actually fires the heater."""
-        start = getattr(self.coordinator, "_last_computed_start_at", None)
-        return start.isoformat() if start is not None else None
 
 
 class MSpaFaultSensor(MSpaDiagnosticSensor):

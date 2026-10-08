@@ -65,20 +65,12 @@ class _ReadinessStub:
 
     def __init__(self, coordinator):
         self.coordinator = coordinator
-        self._eta_display = None
-        self._eta_wall = None
-        self._eta_plan_key = None
-        self._eta_closing = False
-
-    """Stands in for the sensor that now owns the ETA: Ready at time."""
 
     available = True
     display_ready_at = MSpaReadyAtTimeSensor.display_ready_at
     # staticmethod on the real class; unwrapped by the class access above, so it
     # has to be rewrapped or `self` gets passed as the datetime.
     _round_eta = staticmethod(MSpaReadyAtTimeSensor._round_eta)
-    _slew_eta = MSpaReadyAtTimeSensor._slew_eta
-    _replan_key = MSpaReadyAtTimeSensor._replan_key
     native_value = MSpaReadyAtTimeSensor.native_value
     extra_state_attributes = MSpaReadyAtTimeSensor.extra_state_attributes
 
@@ -271,17 +263,16 @@ class TestReadyAtAgreement:
         assert ts.tzinfo is not None, "a timestamp state must be timezone-aware"
         assert ts.astimezone().strftime("%H:%M") == state[:5]
 
-    def test_the_timestamp_follows_the_slew_not_the_raw_estimate(self):
-        """The companion must not re-derive: the text sensor shows a slewed ETA.
-
-        Two entities that disagree about when the spa is ready are worse than one,
-        so the companion reads the slewed position rather than computing its own.
-        """
+    def test_the_timestamp_is_the_rounded_estimate_not_a_re_derivation(self):
+        """The companion must not re-derive. Two entities that disagree about when
+        the spa is ready are worse than either alone, so every one of them reads
+        display_ready_at rather than computing its own answer."""
         r = self._heating()
-        _state_of(r)                                  # establishes the slew position
-        held = r._eta_display
-        r._eta_display = held - timedelta(hours=3)    # displayed value moves
-        assert _ready_time(r) == MSpaReadyAtTimeSensor._round_eta(r._eta_display)
+        when = _NOW_UTC + timedelta(hours=3, minutes=7)
+        with patch("custom_components.mspa.sensor._compute_ready_at",
+                   return_value=("eta", when, "nowcast")):
+            assert _ready_time(r) == MSpaReadyAtTimeSensor._round_eta(when)
+            assert _ready_time(r).minute % 5 == 0
 
     def test_ready_has_a_status_but_no_timestamp(self):
         c = MockCoordinator(water_temp=40.0, target_temp=40.0,
@@ -295,7 +286,7 @@ class TestReadyAtAgreement:
         """kind 'none' publishes nothing; HA translates unknown on its own."""
         r = self._heating()
         with patch("custom_components.mspa.sensor._compute_ready_at",
-                   return_value=("none", None)):
+                   return_value=("none", None, None)):
             assert _ready_status(r) is None
             assert _ready_time(r) is None
 
@@ -306,16 +297,16 @@ class TestReadyAtAgreement:
         r = self._heating()
         when = _NOW_UTC + timedelta(hours=2)
         with patch("custom_components.mspa.sensor._compute_ready_at",
-                   return_value=(kind, None if kind == "ready" else when)):
+                   return_value=(kind, None if kind == "ready" else when,
+                                 None if kind == "ready" else "nowcast")):
             assert _ready_status(r) == token
 
     def test_a_scheduled_time_is_shown_verbatim(self):
-        """Scheduled times are the user's own and are never slewed."""
+        """Scheduled times are the user's own and are never rounded or moved."""
         r = self._heating()
         when = _NOW_UTC + timedelta(hours=5)
-        r._eta_display = _NOW_UTC + timedelta(hours=99)   # would win if slewed
         with patch("custom_components.mspa.sensor._compute_ready_at",
-                   return_value=("sched", when)):
+                   return_value=("sched", when, "scheduled")):
             assert _ready_time(r) == when
 
 
@@ -418,7 +409,7 @@ class TestTheCompactAttribute:
         """A stale badge is worse than none: it would say a spa still had time to go."""
         r = self._heating()
         with patch("custom_components.mspa.sensor._compute_ready_at",
-                   return_value=("ready", None)):
+                   return_value=("ready", None, None)):
             assert _ready_time(r) is None
             assert _ready_compact(r) is None
 

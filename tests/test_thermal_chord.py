@@ -249,22 +249,25 @@ class TestTheOpeningEstimateIsHeld:
         c._thermal_hold_target = 39.0
         assert c.thermal_hold_finish(39.0) is not None
 
-    def test_it_is_released_the_moment_a_rate_is_learned(self):
+    def test_learning_a_rate_does_not_release_it(self):
+        """A chord is 1.5 °C of measured heating, which the opening bands can supply
+        while the tub is still stratified and reading fast. That used to end the hold,
+        and it is not the same event as the water having mixed."""
         c = self._heating()
         c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
         c._thermal_hold_target = 39.0
         c.learn_from_crossing(rate=1.0, water_mean=25.0, ambient=12.0)
         assert c.thermal_a is not None
-        assert c.thermal_hold_finish(39.0) is None
+        assert c.thermal_hold_finish(39.0) is not None
 
-    def test_a_completed_chord_releases_it(self):
-        """End to end: the hold lasts exactly as long as the first chord."""
+    def test_the_window_settling_releases_it(self):
+        """End to end: the hold lasts exactly as long as the water is unmixed."""
         c = self._heating()
         c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
         c._thermal_hold_target = 39.0
-        _walk(c, [20.0, 20.5, 21.0])
-        assert c.thermal_hold_finish(39.0) is not None, "released before it learned"
-        c.record_thermal_crossing(3 * 27 * 60.0, 21.5)
+        _walk(c, [20.0, 20.5, 21.0, 21.5])
+        assert c.thermal_hold_finish(39.0) is not None, "released before it measured"
+        c._nowcast_mixed = True
         assert c.thermal_hold_finish(39.0) is None
 
     def test_moving_the_setpoint_releases_it(self):
@@ -296,12 +299,12 @@ class TestTheOpeningEstimateIsHeld:
         c.begin_thermal_hold(18.5, 39.0)
         assert c._thermal_hold_finish is not None
 
-    def test_it_is_released_by_this_runs_first_chord_not_by_a_carried_rate(self):
+    def test_it_is_released_by_this_runs_own_water_not_by_a_carried_rate(self):
         c = self._heating(thermal_a=1.25)
         c._thermal_hold_finish = datetime.now(timezone.utc) + timedelta(hours=20)
         c._thermal_hold_target = 39.0
         assert c.thermal_hold_finish(39.0) is not None, "released by a carried-over A"
-        c._thermal_points = [(8.0, 1.0)]                  # a chord landed this run
+        c._nowcast_mixed = True                           # this run's window settled
         assert c.thermal_hold_finish(39.0) is None
 
 
