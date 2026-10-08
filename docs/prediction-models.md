@@ -119,10 +119,9 @@ Both are reached through one function, so switching moves no entity: the same se
 keep the same ids and the same meaning, and only the arithmetic behind them changes. The
 switch is deliberately not offered in the options dialog while the model is unproven.
 
-Two diagnostic sensors — **Newton ready at** and **Newton start at** — report what the
-physical model would have said, recomputed every poll and deciding nothing. Every
-finished session is priced by both and scored against what actually happened, so the
-question is settled by heat-ups rather than by argument.
+Every finished session is priced by both and scored against what actually happened, so
+the question is settled by heat-ups rather than by argument. The scoring is on the
+**Ambient learning** sensor.
 
 ---
 
@@ -131,16 +130,17 @@ question is settled by heat-ups rather than by argument.
 Nothing here decides anything. The physical model is measured in the open so it can be
 judged on heat-ups rather than on argument, and everything it produces is diagnostic.
 
-**Newton ready at** and **Newton start at** report to the nearest five minutes. They are
-recomputed on every poll, and at full precision they moved a second or two each time and
-filled the recorder with changes that were not changes. Five minutes still leaves 108
-points across a nine-hour run, which is ample for seeing whether the estimate wanders —
-and wandering is the whole thing they exist to reveal.
+Two diagnostic sensors used to report what the physical model would have said, poll by
+poll, and they were **removed on 08.10.2026**. They were there to expose whether the
+estimate wandered, and they answered that: it did, for the reason the fit itself gives
+away — a traverse fit carries an 18 % standard error on its slope, and that puts the
+asymptote only 8.5 K above the target, where at one sigma the low end falls below it.
 
-Both go **blank** whenever the model declines to answer: too few heating stretches
-recorded, or a night cold enough that it calls the target unreachable. The blank is
-deliberate. A filled-in fallback would look like an answer and hide the one fact worth
-knowing, which is that the model had nothing to say.
+What replaced them is not another learned model being watched from the outside. While the
+spa is heating the live estimate is measured from the run's own crossings, which is a
+different kind of answer: see [docs/nowcast-ready-at.md](nowcast-ready-at.md). The
+learned model is still what the **scheduler** uses, because at the moment it decides when
+to start there are no crossings to measure.
 
 The scoring appears on the **Ambient learning** sensor (diagnostic, disabled by default):
 
