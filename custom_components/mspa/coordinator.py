@@ -338,6 +338,11 @@ def _read_weather_entity(hass: HomeAssistant, entity_id: str | None) -> tuple[fl
 # the carried value is more likely to be a bad run than a changed spa.
 _LIFT_ALPHA = 0.25
 
+# Longer than this between polls is not an interval, it is an outage or a restart. The
+# weather in the middle of it was never observed, so it is left out of the interval mean
+# rather than having the last reading stretched across it.
+_CROSSING_MAX_POLL_GAP_S = 3600.0
+
 # How many crossing rows to keep. At forty crossings a run and a couple of runs a week
 # this is roughly three months — enough to settle whether UV and wind matter, which is
 # the question it is being kept for, and small enough that the file stays trivial.
@@ -4070,7 +4075,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         last = self._cross_last_mono
         self._cross_last_mono = now_mono
         secs = (now_mono - last) if last is not None else 0.0
-        if secs <= 0 or secs > 3600:
+        if secs <= 0 or secs > _CROSSING_MAX_POLL_GAP_S:
             # A gap this long is a restart or an outage, not an interval. The crossing
             # that follows it is still a fact; what happened outside during it is not.
             return
@@ -4154,6 +4159,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if len(self._nowcast_crossings) > keep:
             self._nowcast_crossings = self._nowcast_crossings[-keep:]
         self._reset_crossing_conditions()
+        # The next interval is measured from this crossing. In production the same poll
+        # has already accumulated up to here, so this changes nothing; it matters when a
+        # poll was missed, where otherwise the first observed poll of the interval would
+        # silently contribute no weight.
+        self._cross_last_mono = when_mono
 
     def nowcast_lift(self) -> float:
         """The carried asymptote lift, seeded until a run has measured one.
@@ -4220,7 +4230,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if crossed_at is None:
             return None
         finish = crossed_at + timedelta(minutes=n.minutes)
-        now = datetime.now(timezone.utc)
+        # One clock. The anchor is stamped with dt_util.utcnow(), so the comparison has
+        # to use the same source — mixing it with datetime.now(timezone.utc) is a
+        # subtraction between two notions of now that only happen to agree.
+        now = dt_util.utcnow()
         due = crossed_at + timedelta(minutes=n.step_minutes)
         if now > due:
             finish += now - due
