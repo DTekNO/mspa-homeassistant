@@ -17,7 +17,6 @@ from .const import (
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
     DEFAULT_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_LOOKAHEAD_DAYS,
-    PREDICTION_MODEL_NEWTON,
 )
 from .entity import MSpaSensorEntity, MSpaBinarySensorEntity
 from .predictor import (
@@ -284,20 +283,6 @@ def _effective_cool_rate(coordinator) -> float | None:
     return None
 
 
-def _effective_rate(coordinator, water_temp: float, target_temp: float) -> float | None:
-    """Return the appropriate rate (°C/h, positive) for the current direction.
-
-    - target_temp > water_temp  →  heating: uses _effective_heat_rate
-    - target_temp < water_temp  →  cooling: uses _effective_cool_rate
-    - equal                     →  None (already at target)
-    """
-    if target_temp > water_temp:
-        return _effective_heat_rate(coordinator)
-    if target_temp < water_temp:
-        return _effective_cool_rate(coordinator)
-    return None
-
-
 # Temperature thresholds separating the three heating-rate buckets (°C).
 # Bucket 0: T < _HEAT_BUCKET_T1  — cold, minimal thermal losses, fastest heating
 # Bucket 1: _HEAT_BUCKET_T1 ≤ T < _HEAT_BUCKET_T2
@@ -487,35 +472,6 @@ def _anchor_eta_utc(coordinator, target_temp: float, now_utc) -> "datetime | Non
         )
 
     return eta_utc
-
-
-def _minutes_to_target(coordinator) -> int | None:
-    """Return minutes remaining until the spa reaches its target temperature.
-
-    Returns 0 when near target, None when no rate data is available.
-    Shared by MSpaTempReachSensor and MSpaReadinessSensor.
-    """
-    if coordinator.near_target:
-        return 0
-    anchor_time   = coordinator.temp_anchor_time
-    anchor_temp   = coordinator.temp_anchor_temp
-    anchor_target = coordinator.temp_anchor_target
-    if anchor_time is None or anchor_temp is None or anchor_target is None:
-        return None
-    if anchor_target > anchor_temp:
-        anchor_minutes = _segmented_heating_minutes(anchor_temp, anchor_target, coordinator)
-    elif anchor_target < anchor_temp:
-        rate = _effective_cool_rate(coordinator)
-        if rate is None:
-            return None
-        anchor_minutes = (abs(anchor_target - anchor_temp) / rate) * 60
-    else:
-        return 0
-    if anchor_minutes is None:
-        return None
-    ready_at = anchor_time + timedelta(minutes=anchor_minutes)
-    remaining = (ready_at - datetime.now(timezone.utc)).total_seconds() / 60
-    return max(0, round(remaining))
 
 
 def _relevant_target(coordinator) -> "float | None":
