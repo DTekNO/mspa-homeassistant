@@ -164,7 +164,8 @@ The water sensor only changes at half-degree boundaries, so **the crossing list 
 the full resolution of that measurement**. There is no finer signal to preserve and no
 need to log raw polls.
 
-It does have to be saved locally, though. Home Assistant's recorder purges states after
+The integration does have to persist it itself, rather than leaning on the recorder.
+Home Assistant's recorder purges states after
 `purge_keep_days` (ten by default) and keeps only hourly long-term statistics after that,
 which destroys the crossing *times* — the one quantity this entire method rests on. Ten
 days from now today's run is unanalysable.
@@ -189,7 +190,8 @@ One row per crossing:
 
 Bound it at about a thousand rows. At forty crossings per run and a couple of runs a
 week that is roughly three months, which comfortably covers the question being asked.
-This replaces downloading history by hand.
+Nothing here is manual: the integration writes every row as the crossing happens, so no
+history ever has to be downloaded by hand.
 
 Revisit in a few weeks with real data. If either proves to matter, the forecast already
 carries both.
