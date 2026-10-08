@@ -17,6 +17,8 @@ from .const import (
     REGIONS,
     COUNTRY_TO_REGION,
     DEFAULT_PUMP_POWER,
+    CONF_OFFLINE_AFTER_MINUTES,
+    DEFAULT_OFFLINE_AFTER_MINUTES,
     DEFAULT_BUBBLE_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
     DEFAULT_HEATER_POWER_HEAT,
@@ -251,7 +253,7 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 OPTION_KEYS = frozenset({
     "pump_power", "bubble_power", "heater_power_preheat", "heater_power_heat",
     CONF_TRACK_TEMPERATURE_UNIT, CONF_ALWAYS_ENFORCE_UNIT, CONF_RESTORE_STATE,
-    CONF_WEATHER_ENTITY, CONF_SCHEDULE_TARGET_TEMP,
+    CONF_WEATHER_ENTITY, CONF_SCHEDULE_TARGET_TEMP, CONF_OFFLINE_AFTER_MINUTES,
 })
 
 
@@ -313,6 +315,13 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 default=self.config_entry.options.get(CONF_SCHEDULE_TARGET_TEMP, DEFAULT_SCHEDULE_TARGET_TEMP),
             ): NumberSelector(NumberSelectorConfig(
                 min=20, max=40, step=0.5, unit_of_measurement="°C", mode=NumberSelectorMode.BOX,
+            )),
+            vol.Optional(
+                CONF_OFFLINE_AFTER_MINUTES,
+                default=self.config_entry.options.get(
+                    CONF_OFFLINE_AFTER_MINUTES, DEFAULT_OFFLINE_AFTER_MINUTES),
+            ): NumberSelector(NumberSelectorConfig(
+                min=1, max=120, step=1, unit_of_measurement="min", mode=NumberSelectorMode.BOX,
             )),
         })
 

@@ -78,6 +78,13 @@ MIN_TEMP = 20
 
 # Power consumption defaults (Watts) based on MSpa Comfort model specifications
 # These are configurable per-device in the integration options
+# How long the spa may stay silent before the connectivity sensor calls it offline.
+# Ten minutes clears the two outages that are not faults: the daily Starlink drop
+# (~30 s, every entity at once) and the vendor cloud missing single polls (23 of them
+# on 07.10.2026, 30 s each, while the spa never left the wifi).
+CONF_OFFLINE_AFTER_MINUTES = "offline_after_minutes"
+DEFAULT_OFFLINE_AFTER_MINUTES = 10
+
 DEFAULT_PUMP_POWER = 60  # Filter pump: 2000l/t, 60W, 12V
 DEFAULT_BUBBLE_POWER = 900  # Bubble generator: 900W (1.2HP)
 DEFAULT_HEATER_POWER_PREHEAT = 1500  # Heating element: 1500W (preheat mode)

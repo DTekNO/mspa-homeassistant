@@ -426,6 +426,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.region = self.config.get("region", "ROW")  # Default to ROW for safety
 
         self._last_data = {}
+        # When the spa last answered. Persisted, so the connectivity sensor can still
+        # say how long it has been gone after a restart that happened mid-outage.
+        self.last_seen_utc = None
         self.api = MSpaApiClient(
             hass=hass,
             account_email=self.account_email,
@@ -897,6 +900,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     transformed_data[key] = value
 
             self._last_data = transformed_data
+            # "Seen" means the spa answered, not merely that the call returned. The
+            # cloud keeps serving a payload with is_online False after the unit loses
+            # power, which is the exact case the connectivity sensor exists for: on
+            # 07.10.2026 a PRCD trip took the heater, the controller and the radio in
+            # the same second while the API went on replying.
+            if (transformed_data.get("is_online", True) is not False
+                    and transformed_data.get("ConnectType", "") != "offline"):
+                self.last_seen_utc = dt_util.utcnow()
             _LOGGER.debug("Fetched MSpa transformed data: %s", transformed_data)
 
             # Read optional weather entity for ambient-condition bias.
@@ -1255,6 +1266,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self.computed_heat_rate = stored.get("heat_rate")
                     self.computed_cool_rate = stored.get("cool_rate")
                     self.ambient_baseline = stored.get("ambient_baseline")
+                    # Only adopt the stored time when nothing has been seen yet this
+                    # session: the first poll may already have succeeded, and that is
+                    # the more recent truth.
+                    if self.last_seen_utc is None and stored.get("last_seen"):
+                        try:
+                            self.last_seen_utc = dt_util.parse_datetime(
+                                stored["last_seen"])
+                        except (TypeError, ValueError):
+                            self.last_seen_utc = None
                     # Restore the temperature anchor so a restart mid-step doesn't
                     # discard the elapsed heating time and jump the ETA forward.
                     # A fresh "now" anchor was already set earlier this poll; only
@@ -1485,6 +1505,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "thermal_tau_n": self.thermal_tau_n,
                 "thermal_points": list(self._thermal_points or []),
                 "thermal_crossings_seen": self._thermal_crossings_seen,
+                "last_seen": (self.last_seen_utc.isoformat()
+                              if self.last_seen_utc else None),
                 "heat_rate_buckets": self.heat_rate_buckets,
                 "heat_rate_buckets_norm": self.heat_rate_buckets_norm,
                 # What the three learned rates say about themselves: whether they still

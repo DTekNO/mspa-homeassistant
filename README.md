@@ -617,6 +617,43 @@ grid_options:
 
 ![example card](img/spa_ready_card.png)
 
+
+## Knowing when the spa goes offline
+
+Every entity here becomes `unavailable` when the spa stops answering, which is the one
+state an automation cannot usefully trigger on — it looks the same as a restart, a reload,
+or Home Assistant starting up.
+
+`binary_sensor.mspa_connectivity` exists for that. It is the only entity that stays
+available when the spa is not, so it can be the trigger:
+
+```yaml
+automation:
+  - alias: MSpa has gone offline
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.mspa_connectivity
+        to: "off"
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          message: >-
+            MSpa offline since
+            {{ state_attr('binary_sensor.mspa_connectivity', 'last_seen') }}
+```
+
+| Attribute | Meaning |
+|---|---|
+| `last_seen` | ISO 8601 UTC time the spa last answered. Survives a restart. |
+| `offline_minutes` | How long it has been silent. `null` if never seen. |
+| `grace_minutes` | The configured window. |
+
+Brief gaps are not outages, so the sensor waits before reporting one: a broadband blip or
+a single missed cloud poll clears in well under a minute. The default window is 10 minutes,
+set under **⚙️ Configure → Call the spa offline after**. The state is `unknown`, not `off`,
+until the spa has been seen at least once, so a fresh install with wrong credentials does
+not look like an outage.
+
 ## Ready at Sensor
 
 The **Ready at** sensor gives a single, human-readable answer to "is the spa ready, and if not, when?".
