@@ -319,3 +319,18 @@ class TestLiftFromRun:
 
     def test_the_seed_is_inside_its_own_bounds(self):
         assert LIFT_MIN_C <= DEFAULT_LIFT_C <= LIFT_MAX_C
+
+
+class TestAFreezingNightIsAReading:
+    """0.0 °C is falsy, and the one night where getting the air wrong matters most."""
+
+    def test_zero_air_is_used_not_discarded(self):
+        rows = _run(0.60, air=0.0, start=30.0)
+        n = nowcast(rows, 39.5, 55.0, air_now=0.0)
+        assert n is not None
+        assert n.air_c == 0.0
+        assert n.asymptote_c == pytest.approx(55.0)
+        # The same window at 10 °C must finish sooner; if the 0.0 had been dropped and
+        # the window's own air used instead, these would be identical.
+        warm = nowcast(_run(0.60, air=10.0, start=30.0), 39.5, 55.0, air_now=10.0)
+        assert warm.minutes < n.minutes

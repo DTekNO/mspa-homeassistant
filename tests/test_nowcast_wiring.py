@@ -580,3 +580,17 @@ class TestARestartMidRun:
         c = _coord(nowcast_lift_c=55.0, _crossing_log=[])
         c.restore_nowcast_run()
         assert c._nowcast_crossings == [] and c._nowcast_mixed is False
+
+
+class TestADropIsTheMostInterestingRow:
+    def test_it_is_logged_before_the_window_is_dropped(self):
+        """An unexplained gap in the log would be worse than a row with a negative rate
+        in it, and the restore path already cuts the window at a fall rather than
+        reading across one."""
+        c = _cross(_coord(), [30.0, 30.5, 31.0, 31.5])
+        rows_before = len(c._crossing_log)
+        c.record_nowcast_crossing(5 * 1620.0, 28.0)
+        assert len(c._crossing_log) == rows_before + 1
+        assert c._crossing_log[-1]["water"] == 28.0
+        assert c._crossing_log[-1]["rate"] < 0, "the fall is visible in the file"
+        assert len(c._nowcast_crossings) == 1, "and the window still restarts"

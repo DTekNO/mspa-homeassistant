@@ -307,13 +307,16 @@ def nowcast(crossings, target: float, lift_c: float, *,
         # Honest refusal: this heater cannot hold this water against this air. Returning
         # a very large number would be read as a prediction.
         return None
+    # `is not None`, not `or`: an air temperature of exactly 0.0 is a reading, and a
+    # freezing night is the one where getting this wrong matters most.
+    flat = air_now if air_now is not None else win.air
     walked = minutes_to_target(win.water, target, a, tau_h,
-                               air_segments=air_segments, air=air_now or win.air)
+                               air_segments=air_segments, air=flat)
     if walked is None:
         return None
     minutes, held = walked
     step = minutes_to_target(win.water, min(win.water + 0.5, target), a, tau_h,
-                             air_segments=air_segments, air=air_now or win.air)
+                             air_segments=air_segments, air=flat)
     return Nowcast(
         minutes=minutes,
         step_minutes=(step[0] if step else 0.0),

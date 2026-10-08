@@ -1255,13 +1255,16 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
         ready_at_utc = (dt if kind == "sched"
                         else self._round_eta(dt) if kind == "eta" else None)
 
-        if cooling:
-            mins = None
-        elif ready_at_utc is not None and not latched:
+        # Derived from the time on display, never computed a second way. This used to
+        # fall back to the bucket model's own countdown, which could disagree with the
+        # state it was sitting next to.
+        if ready_at_utc is not None and not cooling:
             mins = max(0, round(
                 (ready_at_utc - datetime.now(timezone.utc)).total_seconds() / 60))
+        elif latched or direction == "at_target":
+            mins = 0
         else:
-            mins = _minutes_to_target(c)
+            mins = None
         rounded = (round(mins / 5) * 5) if (mins is not None and mins > 5) else mins
 
         if latched:

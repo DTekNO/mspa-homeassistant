@@ -4206,6 +4206,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.info(
                 "Nowcast: water fell %.1f → %.1f °C — the window is not measuring one "
                 "climb any more, dropping it", prev.water, water)
+            # Logged before the reset, and logged at all: a drop is the most interesting
+            # row in the file. An unexplained gap in the log would be worse than a row
+            # with a negative rate in it, and the restore path already cuts the window
+            # at a fall rather than reading across one.
+            self._nowcast_crossings.append(nc.Crossing(when_mono, water, None))
+            self._append_crossing_log(when_mono, water, None)
             self.reset_nowcast_run()
             self._nowcast_crossings = [nc.Crossing(when_mono, water, None)]
             self._cross_last_mono = when_mono
