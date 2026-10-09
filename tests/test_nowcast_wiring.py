@@ -594,3 +594,80 @@ class TestADropIsTheMostInterestingRow:
         assert c._crossing_log[-1]["water"] == 28.0
         assert c._crossing_log[-1]["rate"] < 0, "the fall is visible in the file"
         assert len(c._nowcast_crossings) == 1, "and the window still restarts"
+
+
+class TestASoakAndARefillAreNotAHeatUp:
+    """08.10.2026, and what it cost.
+
+    A clean run took the tub 28.0 → 38.5 over nine hours. Then it was used, then 150 L at
+    well temperature went in, and the water fell to 34.5. The heater never left full heat
+    through any of it, so nothing cancelled the session — the only cancellation was on the
+    heater stopping — and when the water came back to 39.5 at 01:27 the next morning it
+    was recorded as one eighteen-hour heat-up to target.
+
+    That single row took the scored mean absolute error from 63 to 147 minutes and drove
+    `prediction_bias` to its 1.1 ceiling, which makes every later estimate 10 %
+    pessimistic. Every individual band inside the session was correctly discarded by
+    `_window_looks_unmeasurable`; nothing applied the same test at session scale.
+    """
+
+    def _running(self, start=28.0, target=39.5):
+        c = _coord()
+        c._prediction = {"start_temp": start, "peak_temp": start,
+                         "target_temp": target, "estimated_minutes": 540.0,
+                         "start_time": _NOW.isoformat()}
+        c._shadow = object()
+        c._thermal_points = [(20.0, 1.2), (22.0, 1.1)]
+        return c
+
+    def test_the_peak_follows_the_water_up(self):
+        c = self._running()
+        for w in (28.5, 31.0, 38.5):
+            c._note_session_disturbance(w)
+        assert c._prediction is not None
+        assert c._prediction["peak_temp"] == 38.5
+
+    def test_ordinary_overshoot_is_not_a_disturbance(self):
+        """The reading is quantised to 0.5 °C and thermostat overshoot is one step."""
+        c = self._running()
+        c._note_session_disturbance(38.5)
+        c._note_session_disturbance(38.0)
+        assert c._prediction is not None, "one step down is not a refill"
+
+    def test_the_0810_fall_cancels_the_session(self):
+        c = self._running()
+        c._note_session_disturbance(38.5)
+        c._note_session_disturbance(34.5)          # soak, then 150 L of well water
+        assert c._prediction is None
+        assert c._shadow is None
+
+    def test_the_mixed_volume_chord_points_are_cleared(self):
+        """They described the tub before 150 L went into it. Left in place they would be
+        fitted together with the reheat's, giving a tau for neither volume."""
+        c = self._running()
+        c._note_session_disturbance(38.5)
+        c._note_session_disturbance(34.5)
+        assert c._thermal_points == []
+
+    def test_the_nowcast_window_goes_with_it(self):
+        c = self._running()
+        c._nowcast_crossings = [nc.Crossing(0.0, 38.0, 12.0)]
+        c._nowcast_mixed = True
+        c._note_session_disturbance(38.5)
+        c._note_session_disturbance(34.5)
+        assert c._nowcast_crossings == [] and c._nowcast_mixed is False
+
+    def test_it_does_nothing_outside_a_session(self):
+        c = _coord()
+        c._prediction = None
+        c._note_session_disturbance(20.0)          # must not raise
+        assert c._prediction is None
+
+    def test_an_unreadable_temperature_cannot_cancel_a_session(self):
+        """A missing reading is not evidence of anything, and discarding a nine-hour
+        measurement on one is the more expensive mistake."""
+        c = self._running()
+        c._note_session_disturbance(38.5)
+        c._note_session_disturbance(None)
+        c._note_session_disturbance("unavailable")
+        assert c._prediction is not None

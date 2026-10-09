@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session_condition_scalar`, `prediction_bias`, `ambient_baseline_deg_c`,
   `ambient_factor`, `device_rate_deg_per_hour`, `progress_deviation` and `plan_settled`.
 
+### Fixed
+
+- **A session interrupted by a soak or a refill is no longer recorded as a heat-up.**
+  Only a heater stop cancelled a session before, so a run that was used and topped up
+  with cold water while the heater stayed on was scored as one very long heat-up to
+  target. Its chord points are discarded too, and the reheat is started as the new
+  session it is.
+
 ### Added
 
 - **Crossing log.** Every 0.5 °C crossing is written to its own store with the

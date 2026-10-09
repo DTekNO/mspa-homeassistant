@@ -157,6 +157,29 @@ _BUCKET_SPAN_FULL_C = 4.0
 # release the readiness latch when the user raises the setpoint.
 _NEW_SESSION_DELTA = 2.0          # °C
 
+# How far the water may fall during a heating session before the session stops being a
+# measurement of one.
+#
+# A spa in full heat does not cool itself: something took heat out faster than 2 kW put
+# it in, which in practice means the cover is off, or cold water was added, or both.
+# Either way what follows is a different tub from the one the session started on.
+#
+# Measured on 08.10.2026, which is why this exists. A clean run took the tub 28.0 → 38.5
+# over nine hours; then it was used, then 150 L at well temperature went in, and the water
+# fell to 34.5. The heater never left full heat through any of it, so nothing cancelled the
+# session — the only cancellation was on the heater stopping — and when the water finally
+# came back to 39.5 at 01:27 the next morning it was recorded as one eighteen-hour heat-up
+# to target. That single row took the scored mean absolute error from 63 to 147 minutes and
+# drove `prediction_bias` to its 1.1 ceiling, making every later estimate 10% pessimistic.
+#
+# 1.0 °C, because the reading is quantised to 0.5 and thermostat overshoot is one step of
+# it. Two steps down while the heater is at full output is not something the spa does to
+# itself. The band window already applies this test to its own spans — see
+# `_window_looks_unmeasurable` — and this is the same rule at session scale, which was the
+# gap: a session could span a soak and a refill while every individual band inside it was
+# correctly discarded.
+_SESSION_DROP_C = 1.0
+
 # The settle guard: both must be met before a partial span is trusted.
 #
 # Written for a plan that recomputed the ETA at every 0.5 °C crossing, and measured
@@ -1039,6 +1062,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             new_temp   = transformed_data.get("water_temperature")
             new_target = transformed_data.get("target_temperature")
             self._update_temp_anchor(new_temp, new_target)
+            # Before the session-start block below, so a disturbed session is cancelled
+            # and the reheat that follows is started cleanly as the new session it is.
+            self._note_session_disturbance(new_temp)
 
             # --- Prediction accuracy tracking ---
             # Start tracking when a big heating session begins (delta > 2°C).
@@ -1098,6 +1124,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._prediction = {
                         "start_time": datetime.now(timezone.utc).isoformat(),
                         "start_temp": new_temp,
+                        # The high-water mark, watched for the whole session. See
+                        # _note_session_disturbance.
+                        "peak_temp": new_temp,
                         "target_temp": new_target,
                         # What the integration actually predicts.
                         "estimated_minutes": round(raw_minutes, 1),
@@ -1715,6 +1744,48 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # than HA reports, which is occasionally useful when tracing.
             _LOGGER.debug("Update failed: %s", err, exc_info=True)
             raise UpdateFailed(f"Update failed: {err}") from err
+
+    def _note_session_disturbance(self, new_temp) -> None:
+        """Cancel the session if the water has fallen materially since its high point.
+
+        A heating session is a measurement of one tub warming up. Water going *down*
+        while the heater is at full output says that premise has failed — see
+        `_SESSION_DROP_C` for the run that proved it necessary and what it cost.
+
+        Cancelling rather than flagging, for two reasons. The session record is scored
+        and feeds the bias, so a row that is not a heat-up has to be out of the set, not
+        in it with a caveat; and the run's chord points now span two different water
+        volumes, so they must be cleared before they can be fitted together. The reheat
+        that follows is a genuine heat-up of the tub as it now stands, and the block
+        below starts it as a fresh session on this same poll.
+        """
+        if self._prediction is None or new_temp is None:
+            return
+        try:
+            water = float(new_temp)
+        except (TypeError, ValueError):
+            return
+        try:
+            peak = float(self._prediction.get(
+                "peak_temp", self._prediction.get("start_temp")))
+        except (TypeError, ValueError):
+            peak = water
+        if water > peak:
+            self._prediction["peak_temp"] = water
+            return
+        if peak - water < _SESSION_DROP_C:
+            return
+        _LOGGER.info(
+            "PREDICTION_CANCELLED: water fell %.1f → %.1f °C during the session "
+            "(%.1f °C, over the %.1f °C a spa in full heat can do to itself) — the tub "
+            "was used, refilled or uncovered, so this is no longer a measurement of one "
+            "heat-up. The reheat starts as a new session.",
+            peak, water, peak - water, _SESSION_DROP_C)
+        self._prediction = None
+        self._shadow = None
+        # Those crossings described the tub before whatever happened to it.
+        self.reset_thermal_run()
+        self.reset_nowcast_run()
 
     def _update_near_target(self, new_temp, new_target) -> None:
         """Maintain the near-target flag and the ready latch.
