@@ -53,6 +53,12 @@ A 20 % error costs 11 minutes, because this tub's asymptote sits 22 K or more ab
 reachable target, far from the steep part of the curve. A seeded default refined once per
 completed run is sufficient. This is not learning in any meaningful sense.
 
+**But that table is measured close to the target, and the insensitivity does not hold on
+a cold start.** With 6 K to run the lift barely matters; with 22 K to run it matters about
+four times as much. Measured on the 15.10 run from 17 °C, the same 10 % error is worth
+roughly 45 minutes rather than 11. Still small against a 24-hour climb — under 4 % — but
+the figure above should not be quoted for a run that starts cold.
+
 ## The sensor
 
 ### Which entities survive
@@ -203,6 +209,16 @@ These are most of the work.
   otherwise a seeded estimate from the lift and a default tau.
 - **Discard the window** on a data gap, on any temperature drop (cold water added, or a
   reading that settles back after mixing), and on a heater interruption.
+- **Draining is not detected, and cannot be by this test.** Every disturbance above
+  announces itself as a fall in temperature. Removing water does not: what comes out is
+  at the same temperature as what stays, so the reading never moves while the mass
+  changes underneath it. The rolling window self-corrects within four crossings, so the
+  *live* estimate recovers on its own — but the end-of-run `tau` fit pools every chord in
+  the run, and a run spanning two water levels fits a line through two different tubs.
+  The signature is available: a drain makes the derived `tau` fall sharply, and the
+  settling gate deliberately lets a falling `tau` through because that is also what the
+  sun on the cover looks like. Separating them needs a second signal. Until then, do not
+  drain mid-run.
 - **Target change** keeps the window. The measured rate is still valid; only the
   destination moved.
 - **Quantisation.** Require the window to span a real 1.5 °C, not a sensor artefact.
