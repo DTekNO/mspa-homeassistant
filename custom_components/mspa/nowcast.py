@@ -30,6 +30,7 @@ can be replayed against a recorded run.
 """
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 # The window is the last four crossing boundaries — a 1.5 °C span at this spa's 0.5 °C
@@ -43,6 +44,12 @@ from typing import NamedTuple
 # arrive as a changed rate without anything having to model them.
 WINDOW_BOUNDARIES = 4
 WINDOW_SPAN_C = 1.5
+
+# The widest the measurement window may get, and the climb-remaining thresholds that
+# take it there. See boundaries_for. The settle gate deliberately stays at
+# WINDOW_BOUNDARIES — it is looking for the opening transient and wants to be quick.
+WINDOW_MAX_BOUNDARIES = 8
+_WINDOW_LADDER = ((10.0, 8), (5.0, 6))
 
 # Seeded for an installation that has never completed a run. Replaced by the first
 # completed run's own (A * tau), and thereafter a long-memory average — the lift is the
@@ -119,10 +126,12 @@ class Window(NamedTuple):
     rate: float             # °C/h over the whole window
     span_c: float           # how far the water actually moved
     hours: float            # how long it took
-    water_mid: float        # midpoint water temperature, where the rate applies
+    water_start: float      # water at the oldest boundary
+    water_mid: float        # midpoint water temperature
     air: float | None       # time-weighted outdoor over the window
     water: float            # water at the newest boundary
     mono: float             # when that boundary was crossed
+    boundaries: int         # how many were used
 
 
 class Nowcast(NamedTuple):
@@ -141,11 +150,12 @@ class Nowcast(NamedTuple):
     target: float
     span_c: float
     hours: float
+    boundaries: int         # how many crossings the rate was measured over
     air_held: bool          # the forecast ran out and its last row was held
 
 
-def measure(crossings) -> Window | None:
-    """Rate and conditions over the last WINDOW_BOUNDARIES crossings, or None.
+def measure(crossings, boundaries: int = WINDOW_BOUNDARIES) -> Window | None:
+    """Rate and conditions over the last `boundaries` crossings, or None.
 
     None whenever the window is not yet a measurement: too few boundaries, no elapsed
     time, or a span short of WINDOW_SPAN_C. That last guard is the quantisation one —
@@ -153,13 +163,17 @@ def measure(crossings) -> Window | None:
     1.5 °C, which is a sensor artefact wearing a window's clothes.
     """
     rows = [c for c in (crossings or []) if c is not None]
-    if len(rows) < WINDOW_BOUNDARIES:
+    boundaries = max(WINDOW_BOUNDARIES, int(boundaries))
+    if len(rows) < boundaries:
         return None
-    win = rows[-WINDOW_BOUNDARIES:]
+    win = rows[-boundaries:]
     first, last = win[0], win[-1]
     span = last.water - first.water
     hours = (last.mono - first.mono) / 3600.0
-    if hours <= 0 or span < WINDOW_SPAN_C - 1e-9:
+    # The span a window of this width ought to cover, less one step of slack for a
+    # reading that stepped back and forth — the quantisation guard.
+    want = WINDOW_SPAN_C * (boundaries - 1) / (WINDOW_BOUNDARIES - 1)
+    if hours <= 0 or span < want - 1e-9:
         return None
     rate = span / hours
     if rate < MIN_RATE_C_PER_H:
@@ -178,35 +192,75 @@ def measure(crossings) -> Window | None:
         den += secs
     return Window(
         rate=rate, span_c=span, hours=hours,
-        water_mid=(first.water + last.water) / 2.0,
+        water_start=first.water, water_mid=(first.water + last.water) / 2.0,
         air=(num / den) if den > 0 else None,
-        water=last.water, mono=last.mono,
+        water=last.water, mono=last.mono, boundaries=len(win),
     )
 
 
 def derive(window: Window | None, lift_c: float) -> tuple[float, float] | None:
     """`(tau_h, A)` implied by a measured window and the carried lift, or None.
 
-    From `rate = A - gap/tau` with `A = lift/tau`:
+    This is the **exact** inversion of the equation over the window, not a chord
+    approximation. Integrating `dT/dt = A - (T - T_air)/tau` with `A = lift/tau` between
+    the window's two boundaries gives
 
-        rate = (lift - gap) / tau      ->      tau = (lift - gap) / rate
+        elapsed = tau * ln((S - T_start) / (S - T_end)),    S = air + lift
 
-    which is exact, not a fit. None when there is no air reading (the gap is the term
-    the window cannot supply for itself) or when the result is not a time constant.
+    and therefore `tau = elapsed / ln(...)`, with `A = lift/tau`. No fit, no slope, no
+    midpoint.
+
+    The chord form it replaces — `tau = (lift - gap) / rate` at the midpoint gap — is the
+    first-order expansion of this. Simulated against a known tub it is indistinguishable
+    out to a 3.5 °C window, drifts +0.3 % at 9.5 °C and +1.7 % across a 19.5 °C span,
+    because the measured rate is `span/elapsed`, a time-weighted mean, while the midpoint
+    gap implies the span-weighted one. So the chord was not what limited the window
+    width at today's cap — but it would become the limit, and the integral costs one
+    logarithm and is exact at every width.
+
+    None when there is no air reading (the gap is the term the window cannot supply for
+    itself), when the lift is implausible, or when the water is already at or beyond the
+    asymptote — in which case no time constant describes the climb.
     """
     if window is None or window.air is None:
         return None
     if lift_c is None or not LIFT_MIN_C <= lift_c <= LIFT_MAX_C:
         return None
-    gap = window.water_mid - window.air
-    if gap >= lift_c:
-        # The water is already above anything this heater can hold against this air, so
-        # the run is not going anywhere and no `tau` describes it.
+    asymptote = window.air + lift_c
+    if asymptote <= window.water:
+        # The water is already above anything this heater can hold against this air.
         return None
-    tau_h = (lift_c - gap) / window.rate
+    ratio = (asymptote - window.water_start) / (asymptote - window.water)
+    if ratio <= 1.0:
+        return None
+    tau_h = window.hours / math.log(ratio)
     if not TAU_MIN_H <= tau_h <= TAU_MAX_H:
         return None
     return tau_h, lift_c / tau_h
+
+
+def boundaries_for(remaining_c: float | None) -> int:
+    """How many boundaries to measure over, given the climb still to come.
+
+    The wander in the published finish is the window's noise multiplied by the time
+    remaining, so it is worst exactly when there is most evidence available and least
+    need to be quick. Four boundaries was chosen for a six-degree finish near target; the
+    15.10 cold start recorded 38 crossings and measured over four of them.
+
+    So the window widens when the target is far and narrows as it approaches, which puts
+    the averaging where the lever is long and keeps the response quick where it is short.
+    Near target the behaviour is exactly what it was.
+
+    Capped at WINDOW_MAX_BOUNDARIES rather than simply using everything: a window is still
+    one measurement of one rate, and a very wide one spans conditions — sun, wind, a
+    night — that have genuinely changed within it.
+    """
+    if remaining_c is None:
+        return WINDOW_BOUNDARIES
+    for threshold, n in _WINDOW_LADDER:
+        if remaining_c > threshold:
+            return n
+    return WINDOW_BOUNDARIES
 
 
 def settled(crossings, lift_c: float, tolerance: float = SETTLE_TOLERANCE) -> bool:
@@ -289,7 +343,8 @@ def minutes_to_target(water: float, target: float, a: float, tau_h: float,
 
 
 def nowcast(crossings, target: float, lift_c: float, *,
-            air_segments=None, air_now: float | None = None) -> Nowcast | None:
+            air_segments=None, air_now: float | None = None,
+            boundaries: int | None = None) -> Nowcast | None:
     """The whole algorithm. Minutes from the newest crossing to the target, or None.
 
     The projection starts at the newest *crossing* rather than at the current reading,
@@ -297,8 +352,16 @@ def nowcast(crossings, target: float, lift_c: float, *,
     facts: the reading between boundaries is known only to within half a degree, while a
     crossing time is exact. The caller adds the time since.
     """
-    win = measure(crossings)
-    params = derive(win, lift_c)
+    rows = [c for c in (crossings or []) if c is not None]
+    if boundaries is None:
+        boundaries = boundaries_for(
+            target - rows[-1].water if rows and target is not None else None)
+    # Widest window the evidence supports, down to the minimum.
+    win = params = None
+    while boundaries >= WINDOW_BOUNDARIES and params is None:
+        win = measure(rows, boundaries)
+        params = derive(win, lift_c)
+        boundaries -= 1
     if win is None or params is None:
         return None
     tau_h, a = params
@@ -323,7 +386,7 @@ def nowcast(crossings, target: float, lift_c: float, *,
         rate=win.rate, tau_h=tau_h, a=a, lift_c=lift_c,
         gap_c=win.water_mid - win.air, air_c=win.air, asymptote_c=asymptote,
         water=win.water, target=float(target),
-        span_c=win.span_c, hours=win.hours, air_held=held,
+        span_c=win.span_c, hours=win.hours, boundaries=win.boundaries, air_held=held,
     )
 
 

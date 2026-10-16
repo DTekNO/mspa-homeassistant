@@ -379,6 +379,11 @@ _CROSSING_MAX_INTERVAL_S = 7200.0
 # the question it is being kept for, and small enough that the file stays trivial.
 _CROSSING_LOG_MAX = 1000
 
+# How far the site thermometer may sit from the forecast and still be treated as a bias
+# to correct for rather than a broken sensor. Beyond this the forecast is used as
+# published — see nowcast_segments.
+_FORECAST_BIAS_MAX_C = 5.0
+
 def _read_weather_extras(hass: HomeAssistant, entity_id: str | None):
     """UV index, wind and gust from a weather entity, for the record only.
 
@@ -501,6 +506,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     _cross_last_mono: float | None = None
     ambient_temp: float | None = None
     ambient_wind: float | None = None
+    measured_outdoor_temp: float | None = None
     ambient_uv: float | None = None
     ambient_gust: float | None = None
     _crossing_store = None
@@ -4163,7 +4169,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # A gap this long is a restart or an outage, not an interval. The crossing
             # that follows it is still a fact; what happened outside during it is not.
             return
-        air = self.ambient_temp
+        air = self.crossing_air()
         if air is not None:
             if self._cross_air_start is None:
                 self._cross_air_start = float(air)
@@ -4183,6 +4189,50 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._cross_uv_sum = self._cross_uv_secs = 0.0
         self._cross_wind_sum = self._cross_gust_sum = self._cross_wind_secs = 0.0
         self._cross_air_start = None
+
+    def crossing_air(self) -> float | None:
+        """The air a crossing was reached through — measured where there is a measurement.
+
+        The gap is a statement about what already happened while the water climbed, so it
+        wants a thermometer, not a forecast. `ambient_temp` is the weather entity's
+        modelled temperature for the current hour; on 16.10 it read 10.0 against the site
+        sensor's 11.6, and it steps whenever the forecast refreshes, which moves `tau` and
+        therefore the whole projection between crossings when nothing about the tub has
+        changed.
+
+        The configured outdoor sensor was already being read every poll and written into
+        every crossing row — recorded and never used. It is used now, and the weather
+        entity is the fallback for an installation that has no thermometer.
+        """
+        if self.measured_outdoor_temp is not None:
+            return self.measured_outdoor_temp
+        return self.ambient_temp
+
+    def nowcast_segments(self):
+        """The forecast's shape, levelled on the site thermometer.
+
+        The walk has to be a forecast — nothing else knows what tonight will do. But its
+        *level* is model output for a grid square, and there is a thermometer at the tub.
+        Taking the shape from one and the level from the other is ordinary bias
+        correction, and it also keeps the walk in the same reference frame as the gap:
+        `tau` measured against the site sensor, applied to a trajectory in met.no's
+        frame, would carry the offset between them straight into the answer. On 16.10
+        that offset was 1.6 °C, worth about three quarters of an hour at mid-run.
+
+        Bounded, because a sensor reading nonsense must not drag the whole forecast with
+        it; past that the raw forecast is the safer answer.
+        """
+        segs = self.forecast_segments()
+        measured, modelled = self.measured_outdoor_temp, self.ambient_temp
+        if not segs or measured is None or modelled is None:
+            return segs
+        offset = measured - modelled
+        if abs(offset) > _FORECAST_BIAS_MAX_C:
+            _LOGGER.debug(
+                "Nowcast: site sensor is %.1f °C off the forecast — too far to trust as "
+                "a bias, using the forecast as published", offset)
+            return segs
+        return [(hours, air + offset) for hours, air in segs]
 
     def reset_nowcast_run(self) -> None:
         """Drop the run's crossings. Called where a window stops being a measurement.
@@ -4225,7 +4275,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
         now, now_mono = dt_util.utcnow(), time.monotonic()
         restored, last_at = [], None
-        for row in rows[-(2 * nc.WINDOW_BOUNDARIES + 2):]:
+        for row in rows[-(max(2 * nc.WINDOW_BOUNDARIES - 1,
+                             nc.WINDOW_MAX_BOUNDARIES) + 2):]:
             try:
                 when = dt_util.parse_datetime(row["t"])
                 water = float(row["water"])
@@ -4301,7 +4352,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._cross_last_mono = when_mono
             return
         air = (self._cross_air_sum / self._cross_air_secs
-               if self._cross_air_secs > 0 else self.ambient_temp)
+               if self._cross_air_secs > 0 else self.crossing_air())
         self._nowcast_crossings.append(nc.Crossing(when_mono, water, air))
         # Once mixed, mixed for the rest of the run: a tub does not re-stratify while
         # the heater runs, and a latch keeps the gate from flickering on a rate that
@@ -4314,8 +4365,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 "estimate is now measured rather than held",
                 len(self._nowcast_crossings))
         self._append_crossing_log(when_mono, water, air)
-        # Keep only what two windows need, plus a little slack for the log writer.
-        keep = 2 * nc.WINDOW_BOUNDARIES + 2
+        # Enough for the settle gate's two non-overlapping windows *and* for the widest
+        # measurement window, plus slack.
+        keep = max(2 * nc.WINDOW_BOUNDARIES - 1, nc.WINDOW_MAX_BOUNDARIES) + 2
         if len(self._nowcast_crossings) > keep:
             self._nowcast_crossings = self._nowcast_crossings[-keep:]
         self._reset_crossing_conditions()
@@ -4403,7 +4455,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return None
         return nc.nowcast(
             self._nowcast_crossings, float(target), self.nowcast_lift(),
-            air_segments=self.forecast_segments(), air_now=self.ambient_temp)
+            air_segments=self.nowcast_segments(), air_now=self.crossing_air())
 
     def nowcast_finish(self, target) -> datetime | None:
         """When this target is reached, from the newest crossing forward.
@@ -4445,12 +4497,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         second one to somewhere else.
         """
         crossings = self._nowcast_crossings or []
-        win = nc.measure(crossings)
+        last = crossings[-1].water if crossings else None
+        width = nc.boundaries_for(
+            (float(target) - last) if (target is not None and last is not None) else None)
+        win = nc.measure(crossings, width) or nc.measure(crossings)
         out = {
             "nowcast_crossings": len(crossings),
             "nowcast_settled": bool(self._nowcast_mixed),
             "nowcast_lift_c": round(self.nowcast_lift(), 2),
             "nowcast_lift_samples": self.nowcast_lift_n,
+            "nowcast_boundaries": None,
             "nowcast_rate_c_per_h": None,
             "nowcast_window_span_c": None,
             "nowcast_window_hours": None,
@@ -4463,6 +4519,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         }
         if win is None:
             return out
+        out["nowcast_boundaries"] = win.boundaries
         out["nowcast_rate_c_per_h"] = round(win.rate, 3)
         out["nowcast_window_span_c"] = round(win.span_c, 2)
         out["nowcast_window_hours"] = round(win.hours, 2)
@@ -4473,6 +4530,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             out["nowcast_tau_h"] = round(params[0], 2)
             out["nowcast_a_c_per_h"] = round(params[1], 3)
             out["nowcast_asymptote_c"] = round(win.air + self.nowcast_lift(), 1)
+        out["nowcast_air_source"] = (
+            "measured" if self.measured_outdoor_temp is not None else "forecast")
         projected = self.nowcast(target) if target is not None else None
         if projected is not None:
             out["nowcast_forecast_held"] = projected.air_held
@@ -4509,7 +4568,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             "secs": secs,
             "air": _round_or_none(air, 2),
             "air_start": _round_or_none(self._cross_air_start, 2),
-            "air_end": _round_or_none(self.ambient_temp, 2),
+            "air_end": _round_or_none(self.crossing_air(), 2),
             "uv": _round_or_none(
                 self._cross_uv_sum / self._cross_uv_secs
                 if self._cross_uv_secs > 0 else self.ambient_uv, 2),

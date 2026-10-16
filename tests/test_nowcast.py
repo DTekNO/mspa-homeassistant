@@ -14,8 +14,9 @@ import pytest
 
 from custom_components.mspa.nowcast import (
     DEFAULT_LIFT_C, LIFT_MAX_C, LIFT_MIN_C, MAX_HORIZON_H, MIN_RATE_C_PER_H,
-    SETTLE_TOLERANCE, TAU_MAX_H, TAU_MIN_H, WINDOW_BOUNDARIES, WINDOW_SPAN_C,
-    Crossing, derive, lift_from_run, measure, minutes_to_target, nowcast, settled,
+    SETTLE_TOLERANCE, TAU_MAX_H, TAU_MIN_H, WINDOW_BOUNDARIES, WINDOW_MAX_BOUNDARIES,
+    WINDOW_SPAN_C, Crossing, boundaries_for, derive, lift_from_run, measure,
+    minutes_to_target, nowcast, settled,
 )
 
 
@@ -334,3 +335,85 @@ class TestAFreezingNightIsAReading:
         # the window's own air used instead, these would be identical.
         warm = nowcast(_run(0.60, air=10.0, start=30.0), 39.5, 55.0, air_now=10.0)
         assert warm.minutes < n.minutes
+
+
+class TestTheWindowWidensWhereTheLeverIsLong:
+    """The wander in the published finish is the window's noise times the time left, so
+    it is worst exactly where there is most evidence and least need to be quick.
+
+    The 15.10 cold start recorded 38 crossings and measured over four of them.
+    """
+
+    @staticmethod
+    def _tub(n, lift=63.84, tau=55.5, air=10.0, start=20.0, noise=None):
+        """`n` crossings of a known tub, optionally with per-band timing noise."""
+        t, T, rows = 0.0, start, [Crossing(0.0, start, None)]
+        S = air + lift
+        for i in range(n):
+            dt = tau * math.log((S - T) / (S - T - 0.5))
+            if noise:
+                dt *= 1.0 + noise[i % len(noise)]
+            t += dt * 3600.0
+            T += 0.5
+            rows.append(Crossing(t, T, air))
+        return rows
+
+    def test_the_ladder_follows_the_climb_remaining(self):
+        assert boundaries_for(20.0) == 8
+        assert boundaries_for(7.0) == 6
+        assert boundaries_for(2.0) == WINDOW_BOUNDARIES
+        assert boundaries_for(None) == WINDOW_BOUNDARIES
+        assert boundaries_for(20.0) <= WINDOW_MAX_BOUNDARIES
+
+    def test_near_target_is_unchanged(self):
+        """The behaviour the existing scoring was done against must not move."""
+        rows = self._tub(10)
+        assert nowcast(rows, rows[-1].water + 2.0, 63.84,
+                       air_now=10.0).boundaries == WINDOW_BOUNDARIES
+
+    def test_far_from_target_it_measures_over_more(self):
+        rows = self._tub(10)
+        assert nowcast(rows, rows[-1].water + 20.0, 63.84,
+                       air_now=10.0).boundaries == 8
+
+    def test_it_narrows_to_what_it_has_rather_than_declining(self):
+        """Five crossings and a long climb: it wants eight boundaries, finds five, and
+        measures over all five rather than refusing or falling back to the minimum."""
+        rows = self._tub(4)
+        n = nowcast(rows, 39.0, 63.84, air_now=10.0)
+        assert n is not None
+        assert n.boundaries == 5
+
+    def test_it_still_declines_below_the_minimum(self):
+        assert nowcast(self._tub(2), 39.0, 63.84, air_now=10.0) is None
+
+    def test_a_wider_window_rejects_more_of_the_band_noise(self):
+        """The whole point of the change, asserted rather than asserted-in-a-comment.
+
+        Real band rates on 15.10 swung 5-12% between adjacent bands, at night, so it is
+        not sun. Averaging three of them leaves most of that in `tau`; averaging seven
+        leaves materially less.
+        """
+        noise = [0.08, -0.06, 0.05, -0.09, 0.07, -0.04, 0.10, -0.07, 0.03, -0.05]
+        rows = self._tub(30, noise=noise)
+        spreads = {}
+        for width in (WINDOW_BOUNDARIES, 8):
+            taus = []
+            for end in range(width, len(rows) + 1):
+                got = derive(measure(rows[:end], width), 63.84)
+                if got:
+                    taus.append(got[0])
+            spreads[width] = max(taus) - min(taus)
+        assert spreads[8] < spreads[WINDOW_BOUNDARIES] * 0.7, spreads
+
+    def test_the_exact_form_recovers_tau_at_every_width(self):
+        """A simulated tub of known tau, measured over windows from 4 to 40 boundaries.
+
+        The chord form it replaces drifts +1.7% across the widest of these. This is the
+        check that the integral does not.
+        """
+        rows = self._tub(40)
+        for width in (4, 6, 8, 12, 20, 40):
+            tau_h, a = derive(measure(rows, width), 63.84)
+            assert tau_h == pytest.approx(55.5, rel=1e-6), width
+            assert a * tau_h == pytest.approx(63.84)

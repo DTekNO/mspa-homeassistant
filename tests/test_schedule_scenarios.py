@@ -140,6 +140,9 @@ class MockCoordinator:
     nowcast_lift_c = None
     nowcast_lift_n = 0
     _run_lift_c = None
+    measured_outdoor_temp = None
+    crossing_air = MSpaUpdateCoordinator.crossing_air
+    nowcast_segments = MSpaUpdateCoordinator.nowcast_segments
     _thermal_hold_finish = None
     _thermal_hold_target = None
     _thermal_points = None
@@ -1753,3 +1756,46 @@ class TestTheWeatherEntityIsTheSwitch:
         p = HeatPredictor(buckets=[1.0, 1.0, 1.0], ambient_temp=None,
                           ambient_baseline=None, band_fits=c.band_fits())
         assert p.bucket_rate(38.0) == pytest.approx(1.0)
+
+
+class TestItRoundsToThePrecisionItHas:
+    """Not the slew. The slew showed a number the model did not believe on the way to one
+    it did; this shows the number the model believes, to the precision it is entitled to.
+
+    The window's noise multiplies the time remaining — measured over the 15-16.10 run the
+    derived `tau` varied about ±7%, which is ±84 min twenty hours out and ±8 with two to
+    go. Five-minute precision on the first of those is two orders of magnitude of claim
+    the measurement cannot support, and every one of those digits flickers.
+    """
+
+    _BASE = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+
+    def _round(self, hours_out):
+        when = self._BASE + timedelta(hours=hours_out, minutes=7, seconds=23)
+        return MSpaReadyAtTimeSensor._round_eta(when, now=self._BASE)
+
+    def test_far_out_rounds_to_the_half_hour(self):
+        assert self._round(20).minute % 30 == 0
+
+    def test_mid_run_rounds_to_the_quarter(self):
+        got = self._round(5)
+        assert got.minute % 15 == 0 and got.minute % 30 != 0 or got.minute % 30 == 0
+
+    def test_close_in_rounds_to_five(self):
+        assert self._round(1).minute % 5 == 0
+
+    def test_the_boundaries_are_where_they_are_documented(self):
+        assert self._round(8.5).minute % 30 == 0
+        assert self._round(7.5).minute % 15 == 0
+        assert self._round(3.5).minute % 15 == 0
+        assert self._round(2.5).minute % 5 == 0
+
+    def test_it_never_moves_the_answer_by_more_than_half_a_step(self):
+        """Rounding states the precision; it must not restate the answer."""
+        for hours, step in ((20, 30), (5, 15), (1, 5)):
+            when = self._BASE + timedelta(hours=hours, minutes=7, seconds=23)
+            got = MSpaReadyAtTimeSensor._round_eta(when, now=self._BASE)
+            assert abs((got - when).total_seconds()) <= step * 60 / 2 + 1
+
+    def test_none_stays_none(self):
+        assert MSpaReadyAtTimeSensor._round_eta(None) is None
