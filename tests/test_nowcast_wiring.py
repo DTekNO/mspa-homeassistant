@@ -711,3 +711,63 @@ class TestASoakAndARefillAreNotAHeatUp:
         c._note_session_disturbance(None)
         c._note_session_disturbance("unavailable")
         assert c._prediction is not None
+
+
+class TestTheThermometerIsRecordedNotUsed:
+    """`CONF_OUTDOOR_SENSOR` is a development instrument, not a feature.
+
+    It was taken out of the options dialog in 420b0db precisely because nothing depended
+    on it, and an option users must pick to no visible end commits the project to
+    supporting it. So the model must not start depending on it — an installation with the
+    option set and one without would otherwise predict differently with nothing on screen
+    to say why.
+
+    The arithmetic agrees. `tau` is measured against the same air the projection then
+    uses, so a constant offset very nearly cancels: a 1.6 °C bias — met.no against the
+    site sensor on 16.10 — costs nine minutes on a twenty-hour run.
+
+    What it does do is get recorded, per crossing rather than per session, which is what
+    makes the comparison it exists for answerable.
+    """
+
+    def test_the_gap_comes_from_the_weather_entity(self):
+        c = _coord(ambient_temp=12.0, measured_outdoor_temp=3.0)
+        c.record_nowcast_crossing(0.0, 30.0)
+        c.accumulate_nowcast_conditions(1800.0)
+        c.record_nowcast_crossing(1800.0, 30.5)
+        assert c._nowcast_crossings[-1].air == pytest.approx(12.0)
+
+    def test_the_thermometer_is_written_to_the_log(self):
+        c = _coord(ambient_temp=12.0, measured_outdoor_temp=3.0)
+        c.record_nowcast_crossing(0.0, 30.0)
+        c.accumulate_nowcast_conditions(1800.0)
+        c.record_nowcast_crossing(1800.0, 30.5)
+        row = c._crossing_log[-1]
+        assert row["air"] == pytest.approx(12.0), "the forecast air, as the model saw it"
+        assert row["air_measured"] == pytest.approx(3.0), "and the thermometer beside it"
+
+    def test_an_installation_without_one_records_nothing_rather_than_guessing(self):
+        c = _coord(ambient_temp=12.0, measured_outdoor_temp=None)
+        c.record_nowcast_crossing(0.0, 30.0)
+        c.accumulate_nowcast_conditions(1800.0)
+        c.record_nowcast_crossing(1800.0, 30.5)
+        assert c._crossing_log[-1]["air_measured"] is None
+        assert c._crossing_log[-1]["air"] == pytest.approx(12.0)
+
+    def test_the_prediction_is_identical_either_way(self):
+        """The property that matters: two installations, one with a thermometer and one
+        without, must publish the same number."""
+        def built(meas):
+            c = _coord(nowcast_lift_c=55.0, ambient_temp=12.0,
+                       measured_outdoor_temp=meas)
+            t, w = 0.0, 30.0
+            c.record_nowcast_crossing(t, w)
+            for _ in range(8):
+                t += (0.5 / 1.25) * 3600.0
+                c.accumulate_nowcast_conditions(t)
+                w += 0.5
+                c.record_nowcast_crossing(t, w)
+            return c.nowcast(39.5)
+        with_it, without = built(3.0), built(None)
+        assert with_it.tau_h == pytest.approx(without.tau_h)
+        assert with_it.minutes == pytest.approx(without.minutes)

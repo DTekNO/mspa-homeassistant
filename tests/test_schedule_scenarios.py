@@ -141,8 +141,6 @@ class MockCoordinator:
     nowcast_lift_n = 0
     _run_lift_c = None
     measured_outdoor_temp = None
-    crossing_air = MSpaUpdateCoordinator.crossing_air
-    nowcast_segments = MSpaUpdateCoordinator.nowcast_segments
     _thermal_hold_finish = None
     _thermal_hold_target = None
     _thermal_points = None
