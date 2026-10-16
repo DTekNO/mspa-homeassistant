@@ -549,20 +549,28 @@ def _round_or_none(value, digits: int = 1):
 # Sentinel: distinguishes "state never yet reported" from None (no data).
 _UNSET = object()
 
-# Display granularity for the live estimate, in minutes.
+# Display granularity for the live estimate: how coarsely to round, by how far away the
+# answer is.
 #
 # All that is left of the old rate-capped display. The cap, the deadband, the hysteresis
 # latch and the replan snap were there because a bucket-model estimate twitched at every
 # sample: over an 11 h session on 06.08.2026 the unsmoothed display changed 166 times,
 # 39 of them in the worst hour, with 14 direction reversals, and the first cap saturated
 # on 30% of steps — a speed limiter pegged at its limit rather than a smoother. Every
-# regime that remains moves only when a crossing completes, or not at all, so there is
-# nothing left to smooth. See MSpaReadyAtTimeSensor.
+# regime that remains moves only when a crossing completes, or not at all.
 #
-# Rounding stays, for a different reason than it was introduced for: a finish five hours
-# out is not known to the minute, and printing it to the minute claims a precision the
-# measurement does not have.
+# What rounding does is different from what the slew did, and the difference is the whole
+# justification. The slew showed a number the model did not believe, on the way to one it
+# did. This shows the number the model believes, to the precision it is entitled to.
+#
+# The precision is not constant, because the error is not. The window's noise multiplies
+# whatever time remains: measured over the 15-16.10 run the derived `tau` varied about
+# +/- 7%, which is +/- 84 minutes with twenty hours to go and +/- 8 with two. Printing a
+# twenty-hour-out estimate to five minutes claims two orders more precision than the
+# measurement has, and every one of those digits is free to flicker.
 _ETA_ROUND_MIN = 5
+# (hours remaining, minutes to round to) — first match wins, longest first.
+_ETA_ROUNDING = ((8.0, 30), (3.0, 15))
 
 # Displayed schedule start (Heat Schedule sensor).  Same lesson, applied to the
 # other sensor: hold the shown start steady against drift that carries no
@@ -1174,11 +1182,14 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
                 or self.coordinator.ready_latched)
 
     @staticmethod
-    def _round_eta(dt):
-        """Round to the nearest _ETA_ROUND_MIN for display."""
+    def _round_eta(dt, now=None):
+        """Round to the precision the estimate actually has. See _ETA_ROUNDING."""
         if dt is None:
             return None
-        q = _ETA_ROUND_MIN * 60
+        now = now or datetime.now(timezone.utc)
+        hours = (dt - now).total_seconds() / 3600.0
+        minutes = next((m for h, m in _ETA_ROUNDING if hours > h), _ETA_ROUND_MIN)
+        q = minutes * 60
         secs = dt.hour * 3600 + dt.minute * 60 + dt.second
         shift = round(secs / q) * q - secs
         return (dt + timedelta(seconds=shift)).replace(second=0, microsecond=0)
