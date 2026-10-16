@@ -1797,3 +1797,59 @@ class TestItRoundsToThePrecisionItHas:
 
     def test_none_stays_none(self):
         assert MSpaReadyAtTimeSensor._round_eta(None) is None
+
+
+class TestTheDisplayDoesNotFlickerAcrossABoundary:
+    """A quantiser re-renders whenever its input crosses a grid line, however little it
+    moved to get there — and the visible jump is a whole bucket regardless.
+
+    15.10, 20:17: the raw estimate moved 10:34 -> 10:45, eleven minutes. The half-hourly
+    display went 10:30 -> 11:00, then to 10:00 at the next crossing. An hour of visible
+    movement from eleven minutes of real movement, and the raw never reached 11:00 at all.
+    """
+
+    _NOW = datetime(2026, 10, 15, 18, 17, tzinfo=timezone.utc)
+
+    def _at(self, hh, mm):
+        return datetime(2026, 10, 16, hh, mm, tzinfo=timezone.utc)
+
+    def test_the_0810_flicker_does_not_happen(self):
+        r = MSpaReadyAtTimeSensor._round_eta
+        shown = r(self._at(8, 34), now=self._NOW)            # raw 10:34 local
+        assert shown == self._at(8, 30)
+        held = r(self._at(8, 45), now=self._NOW, shown=shown)
+        assert held == shown, "eleven minutes must not move it half an hour"
+
+    def test_a_real_move_still_lands(self):
+        """Past one bucket it re-rounds, and the move is not damped on the way."""
+        r = MSpaReadyAtTimeSensor._round_eta
+        shown = self._at(8, 30)
+        moved = r(self._at(9, 20), now=self._NOW, shown=shown)
+        assert moved != shown and moved == self._at(9, 30)
+
+    def test_exactly_one_bucket_away_is_still_held(self):
+        """The boundary itself. 10:34 -> 10:45 on 15.10 sat exactly on the *half*-bucket
+        line, which is why a half-bucket deadband flickered identically to none."""
+        r = MSpaReadyAtTimeSensor._round_eta
+        shown = self._at(8, 30)
+        assert r(self._at(9, 0), now=self._NOW, shown=shown) == shown
+
+    def test_it_is_idempotent(self):
+        """The property the wall-clock slew lacked, and what makes it safe for the state
+        and the attributes to evaluate it independently."""
+        r = MSpaReadyAtTimeSensor._round_eta
+        raw = self._at(8, 41)
+        once = r(raw, now=self._NOW)
+        assert r(raw, now=self._NOW, shown=once) == once
+        assert r(raw, now=self._NOW, shown=once) == once
+
+    def test_it_never_sits_outside_the_precision_it_claims(self):
+        """The whole licence for holding a value: it stays within one bucket, and the
+        bucket is already four times tighter than the measurement's own uncertainty."""
+        r = MSpaReadyAtTimeSensor._round_eta
+        shown = None
+        for minute in (34, 45, 8, 0, 33, 40, 31, 42, 36, 33, 29):
+            raw = self._at(8, minute) if minute > 20 else self._at(9, minute)
+            shown = r(raw, now=self._NOW, shown=shown)
+            q = MSpaReadyAtTimeSensor._bucket_minutes(raw, self._NOW)
+            assert abs((shown - raw).total_seconds()) <= q * 60

@@ -67,6 +67,7 @@ class _ReadinessStub:
         self.coordinator = coordinator
 
     available = True
+    _shown = None
     display_ready_at = MSpaReadyAtTimeSensor.display_ready_at
     # staticmethod on the real class; unwrapped by the class access above, so it
     # has to be rewrapped or `self` gets passed as the datetime.

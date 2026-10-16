@@ -572,6 +572,28 @@ _ETA_ROUND_MIN = 5
 # (hours remaining, minutes to round to) — first match wins, longest first.
 _ETA_ROUNDING = ((8.0, 30), (3.0, 15))
 
+# Rounding alone flickers, and the flicker is bigger than what causes it.
+#
+# A quantiser re-renders whenever its input crosses a boundary, however little it moved
+# to get there. On 15.10 the raw estimate went 10:34 -> 10:45, eleven minutes; the
+# half-hourly display went 10:30 -> 11:00 and then to 10:00 — a visible hour from a real
+# move of eleven minutes, in the direction nothing had moved.
+#
+# So the displayed value is kept while the raw stays within one bucket of it, and only
+# re-rounded once it does not. The display is then not always the *nearest* bucket — it
+# can sit a bucket away from the current estimate — but it is always inside the precision
+# it claims, and that precision is itself four times tighter than the measurement's own
+# uncertainty at that range (+/- 30 min shown against +/- 84 min real, twenty hours out).
+#
+# Replayed over 15.10 that is 10 display changes against 15, and the 11:00 excursion —
+# which the raw estimate never made, it peaked at 10:45 — does not happen at all.
+#
+# This is not the slew. The slew showed values the model did not hold, interpolating its
+# way toward ones it did, and it advanced with the wall clock so asking it twice moved it
+# twice. This is a pure function of (raw, currently shown): idempotent, so any number of
+# callers may evaluate it, and it never displays a time outside the model's own stated
+# tolerance.
+
 # Displayed schedule start (Heat Schedule sensor).  Same lesson, applied to the
 # other sensor: hold the shown start steady against drift that carries no
 # information.  See MSpaHeatScheduleSensor._slew_start for why cause rather than
@@ -1166,12 +1188,18 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
     name = "Ready at time"
     _attr_icon = "mdi:clock-check-outline"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
+    # Declared on the class as well as set in __init__: test fixtures build this with
+    # object.__new__ and would otherwise all break on a new instance attribute.
+    _shown = None
 
     def __init__(self, coordinator, config_entry=None):
         super().__init__(coordinator)
         self._attr_device_info = self.device_info
         self._attr_unique_id = (
             f"mspa_ready_at_time_{getattr(coordinator, 'device_id', 'unknown')}")
+        # The last value rendered, so the rounding can hold it while it stays true.
+        # Idempotent, unlike the slew this is not — see _ETA_ROUNDING.
+        self._shown = None
 
     @property
     def available(self):
@@ -1182,14 +1210,29 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
                 or self.coordinator.ready_latched)
 
     @staticmethod
-    def _round_eta(dt, now=None):
-        """Round to the precision the estimate actually has. See _ETA_ROUNDING."""
+    def _bucket_minutes(dt, now):
+        """The rounding step this estimate has earned. See _ETA_ROUNDING."""
+        hours = (dt - now).total_seconds() / 3600.0
+        return next((m for h, m in _ETA_ROUNDING if hours > h), _ETA_ROUND_MIN)
+
+    @staticmethod
+    def _round_eta(dt, now=None, shown=None):
+        """Round to the precision the estimate has, holding `shown` while it still fits.
+
+        Idempotent in `shown`: feeding the result back in returns it unchanged. That is
+        what makes it safe for the state and the attributes to evaluate it independently,
+        and it is the property the old wall-clock slew lacked.
+        """
         if dt is None:
             return None
         now = now or datetime.now(timezone.utc)
-        hours = (dt - now).total_seconds() / 3600.0
-        minutes = next((m for h, m in _ETA_ROUNDING if hours > h), _ETA_ROUND_MIN)
-        q = minutes * 60
+        q = MSpaReadyAtTimeSensor._bucket_minutes(dt, now) * 60
+        if shown is not None and abs((dt - shown).total_seconds()) <= q:
+            # Still within the precision being claimed, so still a true statement of the
+            # estimate. A half-bucket deadband would always show the *nearest* bucket and
+            # keeps flickering: on 15.10 the raw moved 10:34 -> 10:45, which straddles the
+            # half-bucket line exactly, and the display went to 11:00 and back.
+            return shown
         secs = dt.hour * 3600 + dt.minute * 60 + dt.second
         shift = round(secs / q) * q - secs
         return (dt + timedelta(seconds=shift)).replace(second=0, microsecond=0)
@@ -1207,9 +1250,12 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
         kind, dt, _ = _compute_ready_at(self.coordinator)
         if kind == "sched":
             # The time that was asked for, shown verbatim and never rounded.
+            self._shown = None
             return kind, dt
         if kind == "eta":
-            return kind, self._round_eta(dt)
+            self._shown = self._round_eta(dt, shown=self._shown)
+            return kind, self._shown
+        self._shown = None
         return kind, None       # 'ready' / 'none' — there is no time to report
 
     @property
@@ -1218,9 +1264,8 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
         direction = _spa_direction(c)
         latched = c.ready_latched
         cooling = direction == "cooling"
-        kind, dt, regime = _compute_ready_at(c)
-        ready_at_utc = (dt if kind == "sched"
-                        else self._round_eta(dt) if kind == "eta" else None)
+        kind, ready_at_utc = self.display_ready_at()
+        regime = _compute_ready_at(c)[2]
 
         # Derived from the time on display, never computed a second way. This used to
         # fall back to the bucket model's own countdown, which could disagree with the
