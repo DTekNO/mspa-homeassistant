@@ -489,6 +489,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     _nowcast_last_at: datetime | None = None
     nowcast_lift_c: float | None = None
     nowcast_lift_n: int = 0
+    _run_lift_c: float | None = None
     _cross_air_sum: float = 0.0
     _cross_air_secs: float = 0.0
     _cross_uv_sum: float = 0.0
@@ -745,6 +746,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # only one a refill does not disturb — see nowcast.py.
         self.nowcast_lift_c: float | None = None
         self.nowcast_lift_n: int = 0
+        # The lift this run is projecting with, snapshotted at its first crossing.
+        self._run_lift_c: float | None = None
         # Conditions accumulated over the interval between crossings, time-weighted on
         # the poll interval rather than counted per poll, so a slow cold hour outweighs
         # a quick warm one.
@@ -1466,6 +1469,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     # the learned pair, which is the correct starting value.
                     self.nowcast_lift_c = stored.get("lift")
                     self.nowcast_lift_n = stored.get("lift_n", 0) or 0
+                    self.seed_nowcast_lift_from_learned(stored)
                     self._band_observations = stored.get("band_observations", [])
                     self._band_stats = stored.get("band_stats", {})
                     # Restore the bias as a stored value — never recompute it here.
@@ -4194,6 +4198,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                           len(self._nowcast_crossings))
         self._nowcast_crossings = []
         self._nowcast_mixed = False
+        self._run_lift_c = None
         self._cross_last_mono = None
         self._reset_crossing_conditions()
 
@@ -4248,6 +4253,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 (now - last_at).total_seconds() / 60.0)
             return
         self._nowcast_crossings = restored
+        self._run_lift_c = (self.nowcast_lift_c if self.nowcast_lift_c is not None
+                            else nc.DEFAULT_LIFT_C)
         self._nowcast_last_at = last_at
         self._cross_last_mono = restored[-1].mono
         self._reset_crossing_conditions()
@@ -4270,6 +4277,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         water = float(temp)
         if self._nowcast_crossings is None:
             self._nowcast_crossings = []
+        if not self._nowcast_crossings and self._run_lift_c is None:
+            # The run opens here, and so does the constant it will be projected with.
+            self._run_lift_c = (self.nowcast_lift_c if self.nowcast_lift_c is not None
+                                else nc.DEFAULT_LIFT_C)
+            _LOGGER.info("Nowcast: this run projects with lift %.2f °C, held throughout",
+                         self._run_lift_c)
         prev = self._nowcast_crossings[-1] if self._nowcast_crossings else None
         if prev is not None and water <= prev.water:
             # Not a crossing upward. Cold water, or a reading settling back after
@@ -4313,14 +4326,45 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._cross_last_mono = when_mono
 
     def nowcast_lift(self) -> float:
-        """The carried asymptote lift, seeded until a run has measured one.
+        """The carried asymptote lift — one number, fixed for the whole of a run.
 
-        Migration happens here and needs no store surgery: an installation carrying a
-        learned `(A, tau)` pair already carries the lift as their product.
+        **It must not move while a run is in progress**, and that is an invariant rather
+        than something that happens to hold. It used to be re-derived on every call as
+        `thermal_a * thermal_tau_h` whenever no run had measured a lift yet, and
+        `thermal_a` is blended at every completed chord — by the same run. So the one
+        carried constant was being nudged by a feedback loop the design never intended.
+        Replaying 15.10, `a_at_fixed_tau` at the stale tau drifted 1.23 to 1.39 across the
+        run, swinging the lift between about 45 and 51 and the published finish by over an
+        hour at the point where the lever was longest.
+
+        Three sources, in order. The run's own snapshot, taken at its first crossing; the
+        stored value, which only `learn_nowcast_lift` writes and only at the end of a run;
+        and the seed. `thermal_a` is not among them.
         """
+        if self._run_lift_c is not None:
+            return self._run_lift_c
         if self.nowcast_lift_c is not None:
             return self.nowcast_lift_c
-        return nc.lift_from_run(self.thermal_a, self.thermal_tau_h) or nc.DEFAULT_LIFT_C
+        return nc.DEFAULT_LIFT_C
+
+    def seed_nowcast_lift_from_learned(self, stored: dict) -> None:
+        """Migrate an installation that has a learned pair but no measured lift.
+
+        Taken **once**, at load, and written into the stored value — not consulted again.
+        An installation carrying a learned `(A, tau)` already carries the lift as their
+        product, so this needs no store surgery; what it must not do is keep reading a
+        number that moves.
+        """
+        if self.nowcast_lift_c is not None:
+            return
+        seeded = nc.lift_from_run(stored.get("thermal_a"), stored.get("thermal_tau_h"))
+        if seeded is None:
+            return
+        self.nowcast_lift_c = seeded
+        _LOGGER.info(
+            "Nowcast lift: seeded at %.2f °C from the learned pair (A %.4f x tau %.2f h). "
+            "The first completed run replaces it outright.",
+            seeded, stored.get("thermal_a"), stored.get("thermal_tau_h"))
 
     def learn_nowcast_lift(self, a, tau_h) -> None:
         """Fold a completed run's own `A * tau` into the carried lift.
@@ -4335,7 +4379,11 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         measured = nc.lift_from_run(a, tau_h)
         if measured is None:
             return
-        before = self.nowcast_lift_c
+        # The first *measurement* replaces the seed outright rather than blending with
+        # it. `blend` adopts when the prior is None, so the prior is the stored value
+        # only once a run has actually contributed one — otherwise a seed written at
+        # migration would linger at three quarters weight through the first real run.
+        before = self.nowcast_lift_c if self.nowcast_lift_n > 0 else None
         self.nowcast_lift_c = blend(before, measured, _LIFT_ALPHA)
         self.nowcast_lift_n += 1
         _LOGGER.info(

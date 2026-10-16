@@ -139,6 +139,7 @@ class MockCoordinator:
     _nowcast_last_at = None
     nowcast_lift_c = None
     nowcast_lift_n = 0
+    _run_lift_c = None
     _thermal_hold_finish = None
     _thermal_hold_target = None
     _thermal_points = None

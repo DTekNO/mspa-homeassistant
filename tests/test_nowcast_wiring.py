@@ -273,11 +273,51 @@ class TestTheLiveFinish:
 
 
 class TestTheCarriedLift:
-    def test_it_migrates_from_the_learned_pair(self):
+    def test_it_migrates_from_the_learned_pair_once(self):
         """No store surgery. An installation carrying a learned (A, tau) already carries
-        the lift, as their product — 55.2 on this spa on 08.10.2026."""
+        the lift, as their product — 55.2 on this spa on 08.10.2026.
+
+        Taken **once**, at load, and written to the stored value. It used to be
+        re-derived on every call, and `thermal_a` is blended at every chord by the very
+        run being projected, so the one carried constant moved under it.
+        """
         c = _coord(thermal_a=1.5047, thermal_tau_h=36.68, nowcast_lift_c=None)
+        c.seed_nowcast_lift_from_learned(
+            {"thermal_a": 1.5047, "thermal_tau_h": 36.68})
+        assert c.nowcast_lift_c == pytest.approx(55.2, abs=0.1)
+        # And from here the live EMA is not consulted again.
+        c.thermal_a = 3.0
         assert c.nowcast_lift() == pytest.approx(55.2, abs=0.1)
+
+    def test_the_live_ema_never_reaches_the_lift(self):
+        """The defect this replaces. `thermal_a` moving must not move the projection."""
+        c = _coord(thermal_a=1.5047, thermal_tau_h=36.68, nowcast_lift_c=None)
+        first = c.nowcast_lift()
+        c.thermal_a, c.thermal_tau_h = 1.1501, 55.51     # a chord lands
+        assert c.nowcast_lift() == first
+
+    def test_the_lift_is_frozen_for_the_whole_run(self):
+        """Snapshotted at the run's first crossing. Replaying 15.10, `a_at_fixed_tau`
+        drifted 1.23 to 1.39 across the run and swung the published finish by over an
+        hour at the point the lever was longest."""
+        c = _coord(nowcast_lift_c=55.0)
+        c.record_nowcast_crossing(0.0, 30.0)
+        assert c._run_lift_c == pytest.approx(55.0)
+        c.nowcast_lift_c = 70.0                           # a completed run elsewhere
+        assert c.nowcast_lift() == pytest.approx(55.0), "the run keeps its own"
+        c.reset_nowcast_run()
+        assert c.nowcast_lift() == pytest.approx(70.0), "the next one picks up the new"
+
+    def test_a_seed_does_not_linger_through_the_first_measurement(self):
+        """`blend` adopts when the prior is None, so the prior must be the stored value
+        only once a run has contributed one — otherwise a migration seed would sit at
+        three quarters weight through the first real run."""
+        c = _coord(nowcast_lift_c=49.87, nowcast_lift_n=0)   # seeded, never measured
+        c.learn_nowcast_lift(1.1501, 55.51)                  # 63.84 measured
+        assert c.nowcast_lift_c == pytest.approx(63.84, abs=0.01)
+        assert c.nowcast_lift_n == 1
+        c.learn_nowcast_lift(1.0, 55.0)                      # 55.0, now blended
+        assert 55.0 < c.nowcast_lift_c < 63.84
 
     def test_a_fresh_install_uses_the_seed(self):
         c = _coord(thermal_a=None, thermal_tau_h=None, nowcast_lift_c=None)
