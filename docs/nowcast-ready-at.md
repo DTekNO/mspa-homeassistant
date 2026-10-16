@@ -131,14 +131,22 @@ was wrong in the same way: it answered from things learned on another day.
 | Input | Where from |
 |---|---|
 | Crossing times and water temperatures | Measured this run |
-| Outdoor temperature, time-weighted per interval | The weather entity, this run |
-| Hourly temperature forecast | The weather entity, for the hours ahead |
-| The asymptote lift | One carried constant — see above |
+| Outdoor temperature, time-weighted per interval | The **site thermometer**, this run |
+| Hourly temperature forecast | The weather entity, levelled on the thermometer |
+| The asymptote lift | One carried constant, **frozen at the run's first crossing** |
 
 Temperature is the only outside information admitted, and it is admitted because it is a
 *term in the equation* rather than a correction bolted on outside one. The lift is
 carried, but it is not information about today: it is a property of heater power and
 insulation, it is mass-independent, and a 20 % error in it costs eleven minutes.
+
+The lift is the only thing here that did not come from this run, and it is frozen for
+the run's duration. That is an invariant, not an accident: it used to be re-derived as
+`thermal_a × thermal_tau_h` whenever no run had measured one, and `thermal_a` is blended
+at every chord **by the run being projected**. Replaying 15.10, that fed the lift between
+about 45 and 51 and the published finish by over an hour. The migration from a learned
+pair is still how an existing installation gets a sensible starting value — but it is
+taken once, at load, and written down.
 
 Nothing else may enter, and the list matters more than the principle:
 
@@ -159,15 +167,21 @@ next to the tub.
 1. On every poll while heating, record each 0.5 °C **crossing**: timestamp, water
    temperature, and the time-weighted outdoor temperature over the interval since the
    previous crossing.
-2. **Window** = the last four boundaries, a 1.5 °C span.
-3. `rate = 1.5 / elapsed_hours`.
-4. `gap = midpoint_water − time_weighted_air_over_window`.
-5. `tau = (lift − gap) / rate`, then `A = lift / tau`.
+2. **Window** = the last *n* boundaries, where *n* widens with the climb remaining —
+   eight above 10 °C to run, six above 5 °C, four near target. The wander is the
+   window's noise multiplied by the time left, so the averaging goes where the lever is
+   long and the response stays quick where it is short.
+3. `rate = span / elapsed_hours`, for the diagnostics.
+4. `S = air + lift`, the asymptote the window was climbing toward.
+5. `tau = elapsed / ln((S − T_start) / (S − T_end))`, then `A = lift / tau`.
 6. Integrate `dT/dt = A − (T − T_air(t)) / tau` forward in one-minute steps, taking
    `T_air` from the hourly forecast, until the target is reached.
 
-Step 5 is an identity, not a fit. From `rate = A − gap/tau` with `A = lift/tau`,
-`rate = (lift − gap)/tau` and the inversion is exact.
+Step 5 is an identity, not a fit — it is the equation integrated between the window's
+two boundaries and solved for `tau`. It recovers a simulated tub's `tau` to one part in
+a million at any window width. The chord form it replaces, `tau = (lift − gap)/rate` at
+the midpoint gap, is its first-order expansion: indistinguishable out to 3.5 °C, +0.3 %
+at 9.5 °C, +1.7 % across 19.5 °C. Using the integral is what makes widening safe.
 
 Step 6 is worth doing properly. On 08.10 the forecast walk moved the answer 29 minutes
 **earlier** than a flat air temperature, because a sunny afternoon outweighed the cold

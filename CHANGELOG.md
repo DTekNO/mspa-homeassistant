@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The live estimate wanders much less.** Four changes, measured against the 15–16.10
+  run: the gap is computed from the site thermometer rather than the weather entity's
+  modelled temperature; the forecast walk is levelled on that thermometer; the window
+  widens from four to eight crossings when the target is far; and the carried lift is
+  frozen for the duration of a run. Peak-to-peak wander in the first half of a long run
+  falls from 166 to 102 minutes, with the systematic error largely gone.
+- **Ready at time is rounded to the precision it has** — half-hourly beyond 8 h out,
+  quarter-hourly beyond 3 h, five minutes inside that.
 - **Ready at time is now nowcast from the run's own crossings.** Rate from a rolling
   window over the last four 0.5 °C boundaries, inverted to a trajectory through one
   carried constant, then walked forward over the hourly temperature forecast. No learned
@@ -30,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The carried lift no longer drifts mid-run.** With no completed run to measure one it
+  was re-derived from the learned `A`, which the same run updates at every chord — so
+  the one constant the live estimate carries was being moved by a feedback loop. It is
+  now seeded once and held for the run. A related fix: the first measured run replaces a
+  seeded lift outright instead of blending with it.
 - **A session interrupted by a soak or a refill is no longer recorded as a heat-up.**
   Only a heater stop cancelled a session before, so a run that was used and topped up
   with cold water while the heater stayed on was scored as one very long heat-up to
