@@ -379,6 +379,21 @@ _CROSSING_MAX_INTERVAL_S = 7200.0
 # the question it is being kept for, and small enough that the file stays trivial.
 _CROSSING_LOG_MAX = 1000
 
+# How long the circulation pump must have been running before the heater engaged for the
+# tub to count as already mixed.
+#
+# The settle gate exists because the probe sits in the pump housing and reads unmixed
+# water. With the pump stopped that is severe: after the 07.10 power cut, nine hours
+# idle, the first band ran 4.945 C/h against a settled 1.0 -- 350% out. With the pump
+# running thirteen hours beforehand on 15.10 the same band ran 32% out and the excess was
+# gone by the fourth. So circulation does not remove the opening transient, but it is the
+# difference between one that must be waited out and one that can be dropped.
+_PREMIXED_PUMP_MINUTES = 30.0
+
+# Crossings of a run to retain. Uncapped in practice -- the window uses the whole run --
+# but a bound in case a run never finishes.
+_NOWCAST_CROSSINGS_MAX = 400
+
 def _read_weather_extras(hass: HomeAssistant, entity_id: str | None):
     """UV index, wind and gust from a weather entity, for the record only.
 
@@ -486,6 +501,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     # the methods that use them treat None as empty.
     _nowcast_crossings: list | None = None
     _nowcast_mixed: bool = False
+    _nowcast_premixed: bool = False
+    _nowcast_drop_next: bool = True
+    _nowcast_settled_at: int = 0
     _nowcast_last_at: datetime | None = None
     nowcast_lift_c: float | None = None
     nowcast_lift_n: int = 0
@@ -744,6 +762,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # session scalar, nothing from another day except the one carried lift.
         self._nowcast_crossings: list[nc.Crossing] = []
         self._nowcast_mixed: bool = False
+        # Whether the tub was already circulating when the heater engaged, and whether
+        # the next crossing is the one to discard. See record_nowcast_crossing.
+        self._nowcast_premixed: bool = False
+        self._nowcast_drop_next: bool = True
+        # How many crossings the run had when the window became usable. The measurement
+        # window grows from there and never reaches back past it.
+        self._nowcast_settled_at: int = 0
         # The asymptote lift, `A * tau`. The only constant carried in, and the only one
         # that can be: four crossings cannot measure both parameters. It is also the
         # only one a refill does not disturb — see nowcast.py.
@@ -4198,6 +4223,25 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._cross_meas_sum = self._cross_meas_secs = 0.0
         self._cross_air_start = None
 
+    def _pump_was_running(self) -> bool:
+        """Whether circulation had been running long enough before this run to mix the tub.
+
+        `circulating_since` is set when the pump starts and cleared when it stops, so a
+        pump that has been on for longer than _PREMIXED_PUMP_MINUTES at the moment the
+        first crossing lands is one that was already running when the heater engaged.
+
+        Unknown answers no. Treating an unknown as mixed would skip the gate on exactly
+        the installation that most needs it.
+        """
+        since = getattr(self, "circulating_since", None)
+        if since is None:
+            return False
+        try:
+            minutes = (dt_util.utcnow() - since).total_seconds() / 60.0
+        except (TypeError, ValueError):
+            return False
+        return minutes >= _PREMIXED_PUMP_MINUTES
+
     def reset_nowcast_run(self) -> None:
         """Drop the run's crossings. Called where a window stops being a measurement.
 
@@ -4212,6 +4256,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                           len(self._nowcast_crossings))
         self._nowcast_crossings = []
         self._nowcast_mixed = False
+        self._nowcast_premixed = False
+        self._nowcast_drop_next = True
+        self._nowcast_settled_at = 0
         self._run_lift_c = None
         self._cross_last_mono = None
         self._reset_crossing_conditions()
@@ -4239,8 +4286,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return
         now, now_mono = dt_util.utcnow(), time.monotonic()
         restored, last_at = [], None
-        for row in rows[-(max(2 * nc.WINDOW_BOUNDARIES - 1,
-                             nc.WINDOW_MAX_BOUNDARIES) + 2):]:
+        for row in rows[-_NOWCAST_CROSSINGS_MAX:]:
             try:
                 when = dt_util.parse_datetime(row["t"])
                 water = float(row["water"])
@@ -4292,6 +4338,26 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         water = float(temp)
         if self._nowcast_crossings is None:
             self._nowcast_crossings = []
+        if self._nowcast_drop_next:
+            # The first crossing after the heater engages is discarded, always.
+            #
+            # It is not a measurement of heating. On 15.10 the reading dipped 17.0 -> 16.5
+            # as the heater and pump came on and returned to 17.0 four minutes later, so
+            # the "crossing" recorded there was a switch-on artefact: it anchored the
+            # first window four minutes late and inflated the measured rate by a third.
+            #
+            # Dropping this one crossing is worth more than hours of waiting. Replayed on
+            # 15.10, releasing at four crossings without it puts the first estimate 194
+            # minutes out; with it, 76.
+            self._nowcast_drop_next = False
+            self._nowcast_premixed = self._pump_was_running()
+            self._reset_crossing_conditions()
+            self._cross_last_mono = when_mono
+            _LOGGER.info(
+                "Nowcast: first crossing after heater-on discarded (%.1f °C); the tub "
+                "%s already circulating", water,
+                "was" if self._nowcast_premixed else "was not")
+            return
         if not self._nowcast_crossings and self._run_lift_c is None:
             # The run opens here, and so does the constant it will be projected with.
             self._run_lift_c = (self.nowcast_lift_c if self.nowcast_lift_c is not None
@@ -4321,17 +4387,32 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # Once mixed, mixed for the rest of the run: a tub does not re-stratify while
         # the heater runs, and a latch keeps the gate from flickering on a rate that
         # later changes for an honest reason, such as the sun coming out.
+        #
+        # A tub that was already circulating when the heater engaged does not have to wait
+        # for the gate at all — it is mixed by definition, and the one band that still
+        # runs fast has just been discarded above. It publishes as soon as there is a
+        # window. That is 1h44m to the first estimate on 15.10 against 3h04m, and the
+        # thing it replaces is the scheduler's finish, which on that run was eight hours
+        # out — worse than any estimate the window ever produced.
+        if not self._nowcast_mixed and self._nowcast_premixed and (
+                len(self._nowcast_crossings) >= nc.WINDOW_BOUNDARIES):
+            self._nowcast_mixed = True
+            self._nowcast_settled_at = len(self._nowcast_crossings)
+            _LOGGER.info(
+                "Nowcast: %d crossings on an already-circulating tub — the live estimate "
+                "is measured from here", len(self._nowcast_crossings))
         if not self._nowcast_mixed and nc.settled(
                 self._nowcast_crossings, self.nowcast_lift()):
             self._nowcast_mixed = True
+            self._nowcast_settled_at = len(self._nowcast_crossings)
             _LOGGER.info(
                 "Nowcast: the window has settled after %d crossing(s) — the live "
                 "estimate is now measured rather than held",
                 len(self._nowcast_crossings))
         self._append_crossing_log(when_mono, water, air)
-        # Enough for the settle gate's two non-overlapping windows *and* for the widest
-        # measurement window, plus slack.
-        keep = max(2 * nc.WINDOW_BOUNDARIES - 1, nc.WINDOW_MAX_BOUNDARIES) + 2
+        # The whole run: the measurement window is uncapped. Bounded only against a run
+        # that never ends.
+        keep = _NOWCAST_CROSSINGS_MAX
         if len(self._nowcast_crossings) > keep:
             self._nowcast_crossings = self._nowcast_crossings[-keep:]
         self._reset_crossing_conditions()
@@ -4407,6 +4488,25 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             "%.2f °C [n=%d]", measured, a, tau_h, self.nowcast_lift_c,
             self.nowcast_lift_n)
 
+    def nowcast_boundaries(self) -> int:
+        """How many crossings the measurement window may span.
+
+        Four at the moment the window becomes usable, then one more for every crossing
+        since. It grows without limit — every cap tried cost accuracy on the 15.10 run —
+        but it never reaches back past the point the run became measurable.
+
+        That distinction is what the 08.10 replay caught. Simply using every crossing is
+        the same thing on an already-circulating tub, where the window opens at the
+        fourth. On a stratified one the gate releases at the ninth, and a window spanning
+        all nine swallows the 4.945 °C/h opening band it had just spent eight crossings
+        waiting out.
+        """
+        n = len(self._nowcast_crossings or [])
+        if not self._nowcast_settled_at:
+            return nc.WINDOW_BOUNDARIES
+        return max(nc.WINDOW_BOUNDARIES,
+                   nc.WINDOW_BOUNDARIES + n - self._nowcast_settled_at)
+
     def nowcast(self, target):
         """The projection for this target, or None when the window cannot answer.
 
@@ -4419,7 +4519,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             return None
         return nc.nowcast(
             self._nowcast_crossings, float(target), self.nowcast_lift(),
-            air_segments=self.forecast_segments(), air_now=self.ambient_temp)
+            air_segments=self.forecast_segments(), air_now=self.ambient_temp,
+            boundaries=self.nowcast_boundaries())
 
     def nowcast_finish(self, target) -> datetime | None:
         """When this target is reached, from the newest crossing forward.
@@ -4461,13 +4562,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         second one to somewhere else.
         """
         crossings = self._nowcast_crossings or []
-        last = crossings[-1].water if crossings else None
-        width = nc.boundaries_for(
-            (float(target) - last) if (target is not None and last is not None) else None)
-        win = nc.measure(crossings, width) or nc.measure(crossings)
+        win = (nc.measure(crossings, self.nowcast_boundaries())
+               or nc.measure(crossings))
         out = {
             "nowcast_crossings": len(crossings),
             "nowcast_settled": bool(self._nowcast_mixed),
+            "nowcast_premixed": bool(self._nowcast_premixed),
             "nowcast_lift_c": round(self.nowcast_lift(), 2),
             "nowcast_lift_samples": self.nowcast_lift_n,
             "nowcast_boundaries": None,

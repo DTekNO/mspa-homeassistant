@@ -45,11 +45,29 @@ from typing import NamedTuple
 WINDOW_BOUNDARIES = 4
 WINDOW_SPAN_C = 1.5
 
-# The widest the measurement window may get, and the climb-remaining thresholds that
-# take it there. See boundaries_for. The settle gate deliberately stays at
-# WINDOW_BOUNDARIES — it is looking for the opening transient and wants to be quick.
-WINDOW_MAX_BOUNDARIES = 8
-_WINDOW_LADDER = ((10.0, 8), (5.0, 6))
+# There is no upper bound on the measurement window, and that is a measured choice.
+#
+# The wander in the published finish is the window's noise multiplied by the time
+# remaining, so it is worst where there is most evidence and least need to be quick. The
+# 15.10 cold start recorded 44 crossings; every cap tried cost accuracy. Scored against
+# that run, as the mean error of what was actually displayed:
+#
+#     cap 4: 24 min     cap 12: 20 min     cap 20: 19 min     uncapped: 16 min
+#
+# Two things make it safe. `derive` is the exact integral rather than a chord, so a wide
+# window carries no width bias — it recovers a simulated tub's `tau` to one part in a
+# million from 4 boundaries to 40. And every disturbance that would leave a long window
+# describing a tub that no longer exists — cold water, a soak, a heater stop — discards
+# the run outright, so there is nothing for it to be stale about. The exception is
+# draining, which is invisible to a window of any width; see docs/nowcast-ready-at.md.
+#
+# What it *is* approximate about is the air: the window carries one time-weighted outdoor
+# temperature, so a window spanning a night assumes an air that in fact varied. The error
+# is self-limiting, because the window is short while the gap is small and the air matters
+# most, and by the time it is long the gap dwarfs the variation.
+#
+# The settle gate deliberately stays at WINDOW_BOUNDARIES: it is looking for the opening
+# transient and wants to be quick.
 
 # Seeded for an installation that has never completed a run. Replaced by the first
 # completed run's own (A * tau), and thereafter a long-memory average — the lift is the
@@ -239,30 +257,6 @@ def derive(window: Window | None, lift_c: float) -> tuple[float, float] | None:
     return tau_h, lift_c / tau_h
 
 
-def boundaries_for(remaining_c: float | None) -> int:
-    """How many boundaries to measure over, given the climb still to come.
-
-    The wander in the published finish is the window's noise multiplied by the time
-    remaining, so it is worst exactly when there is most evidence available and least
-    need to be quick. Four boundaries was chosen for a six-degree finish near target; the
-    15.10 cold start recorded 38 crossings and measured over four of them.
-
-    So the window widens when the target is far and narrows as it approaches, which puts
-    the averaging where the lever is long and keeps the response quick where it is short.
-    Near target the behaviour is exactly what it was.
-
-    Capped at WINDOW_MAX_BOUNDARIES rather than simply using everything: a window is still
-    one measurement of one rate, and a very wide one spans conditions — sun, wind, a
-    night — that have genuinely changed within it.
-    """
-    if remaining_c is None:
-        return WINDOW_BOUNDARIES
-    for threshold, n in _WINDOW_LADDER:
-        if remaining_c > threshold:
-            return n
-    return WINDOW_BOUNDARIES
-
-
 def settled(crossings, lift_c: float, tolerance: float = SETTLE_TOLERANCE) -> bool:
     """Whether the tub has mixed, judged on two non-overlapping windows.
 
@@ -354,8 +348,7 @@ def nowcast(crossings, target: float, lift_c: float, *,
     """
     rows = [c for c in (crossings or []) if c is not None]
     if boundaries is None:
-        boundaries = boundaries_for(
-            target - rows[-1].water if rows and target is not None else None)
+        boundaries = len(rows)      # everything the run has — see WINDOW_BOUNDARIES
     # Widest window the evidence supports, down to the minimum.
     win = params = None
     while boundaries >= WINDOW_BOUNDARIES and params is None:

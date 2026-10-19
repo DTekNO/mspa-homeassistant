@@ -52,6 +52,11 @@ def _coord(**over):
     c._thermal_hot_rejects = 0
     c._nowcast_crossings = []
     c._nowcast_mixed = False
+    c._nowcast_premixed = False
+    c._nowcast_settled_at = 0
+    # The helper stands for a run already past its opening. The dropped first crossing
+    # has its own tests — see TestTheFirstCrossingIsDiscarded.
+    c._nowcast_drop_next = False
     c._crossing_log = []
     c._forecast_rows = []
     for k, v in over.items():
@@ -117,8 +122,8 @@ class TestEveryCrossingIsRecorded:
         assert c._nowcast_crossings[-1].air == pytest.approx(5.0)
 
     def test_the_unmixed_crossings_are_recorded_too(self):
-        """The thermal chord discards the first two; the nowcast must not, because its
-        settling gate is a test on exactly those crossings."""
+        """The thermal chord discards the first two; the nowcast keeps all but the very
+        first, because its settling gate is a test on exactly those crossings."""
         c = _coord()
         c.heating_since = datetime.now(timezone.utc)
         for i in range(4):
@@ -259,7 +264,10 @@ class TestTheLiveFinish:
         d = c.nowcast_diagnostics()
         assert d["nowcast_settled"] is True
         assert d["nowcast_rate_c_per_h"] == pytest.approx(1.25, rel=0.02)
-        assert d["nowcast_window_span_c"] == pytest.approx(1.5)
+        # The window grows from four at the release point, so the span is every
+        # crossing since — see nowcast_boundaries.
+        assert d["nowcast_window_span_c"] == pytest.approx(
+            0.5 * (c.nowcast_boundaries() - 1))
         assert d["nowcast_lift_c"] == pytest.approx(55.0)
         assert d["nowcast_a_c_per_h"] * d["nowcast_tau_h"] == pytest.approx(55.0, rel=1e-2)
 
@@ -533,7 +541,7 @@ class TestTheRunItWasDesignedOn:
         """
         _, trace = self._replay()
         taus = [n.tau_h for _s, _w, mixed, n, _f in trace if mixed]
-        assert len(taus) == 7
+        assert len(taus) >= 7
         assert all(24.0 < t < 30.0 for t in taus), taus
         assert max(taus) < 36.68, "the stored tau described a fuller tub"
 
@@ -548,7 +556,7 @@ class TestTheRunItWasDesignedOn:
         """
         _, trace = self._replay()
         finishes = [f for _s, _w, mixed, _n, f in trace if mixed]
-        assert len(finishes) == 7
+        assert len(finishes) >= 7
         for f in finishes:
             assert abs((f - _at("17:00:00")).total_seconds()) < 2400, f.isoformat()
         assert max(finishes) < _at("20:55:00"), "the learned model's answer"
@@ -771,3 +779,93 @@ class TestTheThermometerIsRecordedNotUsed:
         with_it, without = built(3.0), built(None)
         assert with_it.tau_h == pytest.approx(without.tau_h)
         assert with_it.minutes == pytest.approx(without.minutes)
+
+
+class TestTheFirstCrossingIsDiscarded:
+    """It is not a measurement of heating.
+
+    On 15.10 the reading dipped 17.0 -> 16.5 as the heater and pump engaged and returned
+    to 17.0 four minutes later. The "crossing" recorded there was a switch-on artefact: it
+    anchored the first window four minutes late and inflated the measured rate by a third.
+
+    Dropping it is worth more than hours of waiting. Replayed on 15.10, releasing at four
+    crossings without the drop puts the first estimate 194 minutes out; with it, 76.
+    """
+
+    def _fresh(self, **over):
+        c = _coord(**over)
+        c._nowcast_drop_next = True          # as a run opens
+        return c
+
+    def test_the_first_one_is_not_kept(self):
+        c = self._fresh()
+        c.record_nowcast_crossing(0.0, 17.0)
+        assert c._nowcast_crossings == []
+        c.accumulate_nowcast_conditions(1260.0)
+        c.record_nowcast_crossing(1260.0, 17.5)
+        assert [x.water for x in c._nowcast_crossings] == [17.5]
+
+    def test_it_rearms_with_the_run(self):
+        c = self._fresh()
+        c.record_nowcast_crossing(0.0, 17.0)
+        c.record_nowcast_crossing(1260.0, 17.5)
+        c.reset_nowcast_run()
+        assert c._nowcast_drop_next is True
+
+    def test_the_interval_clock_restarts_at_the_dropped_crossing(self):
+        """The crossing is discarded but the moment is not — the interval that follows
+        is measured from it, or the first kept crossing carries weather from before the
+        heater was even on."""
+        c = self._fresh()
+        c.record_nowcast_crossing(600.0, 17.0)
+        assert c._cross_last_mono == 600.0
+
+
+class TestAlreadyCirculatingSkipsTheGate:
+    """A tub that was circulating when the heater engaged is mixed by definition.
+
+    With the pump running thirteen hours beforehand on 15.10 the first band ran 32% fast
+    and the excess was gone by the fourth; after the 07.10 power cut, nine hours idle, the
+    first band ran 350% fast. Circulation does not remove the opening transient, but it is
+    the difference between one that must be waited out and one that can be dropped.
+    """
+
+    def _run(self, pump_minutes, rates=(1.25,) * 6):
+        c = _coord(nowcast_lift_c=55.0)
+        c._nowcast_drop_next = True
+        c.circulating_since = (_NOW - timedelta(minutes=pump_minutes)
+                               if pump_minutes is not None else None)
+        t, w = 0.0, 30.0
+        c.record_nowcast_crossing(t, w)                   # dropped
+        for r in rates:
+            t += (0.5 / r) * 3600.0
+            c.accumulate_nowcast_conditions(t)
+            w += 0.5
+            c.record_nowcast_crossing(t, w)
+        return c
+
+    def test_a_circulating_tub_publishes_at_four_crossings(self):
+        c = self._run(pump_minutes=13 * 60, rates=(1.25,) * 4)
+        assert c._nowcast_premixed is True
+        assert c._nowcast_mixed is True
+        assert len(c._nowcast_crossings) == 4
+
+    def test_a_stopped_pump_still_waits_for_the_gate(self):
+        c = self._run(pump_minutes=None, rates=(1.25,) * 4)
+        assert c._nowcast_premixed is False
+        assert c._nowcast_mixed is False, "four crossings is not enough without the pump"
+
+    def test_a_pump_just_started_is_not_mixed(self):
+        assert self._run(pump_minutes=5, rates=(1.25,) * 4)._nowcast_premixed is False
+
+    def test_the_window_grows_from_the_release_point(self):
+        """Never back past it. On a stratified run the gate releases at the ninth
+        crossing, and a window spanning all nine would swallow the opening band it spent
+        eight crossings waiting out."""
+        c = self._run(pump_minutes=13 * 60, rates=(1.25,) * 8)
+        assert c._nowcast_settled_at == 4
+        assert c.nowcast_boundaries() == 8          # 4 + (8 - 4)
+
+    def test_before_release_it_is_the_minimum(self):
+        c = self._run(pump_minutes=None, rates=(1.25,) * 2)
+        assert c.nowcast_boundaries() == nc.WINDOW_BOUNDARIES

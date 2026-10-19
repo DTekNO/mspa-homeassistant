@@ -549,50 +549,41 @@ def _round_or_none(value, digits: int = 1):
 # Sentinel: distinguishes "state never yet reported" from None (no data).
 _UNSET = object()
 
-# Display granularity for the live estimate: how coarsely to round, by how far away the
-# answer is.
+# How far the estimate must move before the display is refreshed, in minutes.
 #
-# All that is left of the old rate-capped display. The cap, the deadband, the hysteresis
-# latch and the replan snap were there because a bucket-model estimate twitched at every
-# sample: over an 11 h session on 06.08.2026 the unsmoothed display changed 166 times,
-# 39 of them in the worst hour, with 14 direction reversals, and the first cap saturated
-# on 30% of steps — a speed limiter pegged at its limit rather than a smoother. Every
-# regime that remains moves only when a crossing completes, or not at all.
+# **Not a rounding, and not a slew.** The time shown is always a real estimate the model
+# produced, to the minute, unquantised. What this controls is only *when* the display is
+# refreshed from it.
 #
-# What rounding does is different from what the slew did, and the difference is the whole
-# justification. The slew showed a number the model did not believe, on the way to one it
-# did. This shows the number the model believes, to the precision it is entitled to.
+# The reason is that a crossing-by-crossing display re-renders on noise. The window
+# measures real band-to-band variation — sun, wind, mixing — which it averages but does
+# not eliminate, so the estimate jitters by a few minutes about a slowly moving truth.
+# Re-rendering on every one of those spends the reader's attention on nothing.
 #
-# The precision is not constant, because the error is not. The window's noise multiplies
-# whatever time remains: measured over the 15-16.10 run the derived `tau` varied about
-# +/- 7%, which is +/- 84 minutes with twenty hours to go and +/- 8 with two. Printing a
-# twenty-hour-out estimate to five minutes claims two orders more precision than the
-# measurement has, and every one of those digits is free to flicker.
-_ETA_ROUND_MIN = 5
-# (hours remaining, minutes to round to) — first match wins, longest first.
-_ETA_ROUNDING = ((8.0, 30), (3.0, 15))
-
-# Rounding alone flickers, and the flicker is bigger than what causes it.
+# The threshold tapers with the time remaining, because the uncertainty does: the
+# window's noise is a fraction of the climb still to come, so it is worth tens of minutes
+# twenty hours out and a couple of minutes at the end. A fixed threshold is therefore
+# wrong at one end or the other — loose enough to be quiet early is loose enough to stop
+# converging late.
 #
-# A quantiser re-renders whenever its input crosses a boundary, however little it moved
-# to get there. On 15.10 the raw estimate went 10:34 -> 10:45, eleven minutes; the
-# half-hourly display went 10:30 -> 11:00 and then to 10:00 — a visible hour from a real
-# move of eleven minutes, in the direction nothing had moved.
+# Replayed end to end over the 15-16.10 run, counting what was actually on screen:
 #
-# So the displayed value is kept while the raw stays within one bucket of it, and only
-# re-rounded once it does not. The display is then not always the *nearest* bucket — it
-# can sit a bucket away from the current estimate — but it is always inside the precision
-# it claims, and that precision is itself four times tighter than the measurement's own
-# uncertainty at that range (+/- 30 min shown against +/- 84 min real, twenty hours out).
+#     fixed 10 min            10 updates   mean 17 min   last 3 h: 5 min   final 10:05
+#     fixed  5 min            21 updates   mean 17 min   last 3 h: 2 min   final 10:04
+#     3% of remaining, 2-15    8 updates   mean 17 min   last 3 h: 2 min   final 10:04
 #
-# Replayed over 15.10 that is 10 display changes against 15, and the 11:00 excursion —
-# which the raw estimate never made, it peaked at 10:45 — does not happen at all.
+# The taper is strictly better than either: fewer updates than the loose fixed threshold
+# and a tighter endgame than the strict one, because it spends its refreshes where they
+# change the answer. Water reached target at 10:04.
 #
-# This is not the slew. The slew showed values the model did not hold, interpolating its
-# way toward ones it did, and it advanced with the wall clock so asking it twice moved it
-# twice. This is a pure function of (raw, currently shown): idempotent, so any number of
-# callers may evaluate it, and it never displays a time outside the model's own stated
-# tolerance.
+# What this replaces: a rounding ladder that quantised to 30/15/5 minutes by distance,
+# with hysteresis on the bucket. Both are gone. They were answering a question that was
+# not asked — the display does not need coarser numbers, it needs fewer changes — and the
+# quantiser made it worse, turning an eleven-minute move into a visible hour by flicking
+# across a half-hour boundary.
+_ETA_REFRESH_FRACTION = 0.03
+_ETA_REFRESH_MIN = 2.0
+_ETA_REFRESH_MAX = 15.0
 
 # Displayed schedule start (Heat Schedule sensor).  Same lesson, applied to the
 # other sensor: hold the shown start steady against drift that carries no
@@ -1198,7 +1189,7 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
         self._attr_unique_id = (
             f"mspa_ready_at_time_{getattr(coordinator, 'device_id', 'unknown')}")
         # The last value rendered, so the rounding can hold it while it stays true.
-        # Idempotent, unlike the slew this is not — see _ETA_ROUNDING.
+        # Idempotent, unlike the slew it replaced — see _ETA_REFRESH_MIN.
         self._shown = None
 
     @property
@@ -1210,32 +1201,32 @@ class MSpaReadyAtTimeSensor(MSpaSensorEntity):
                 or self.coordinator.ready_latched)
 
     @staticmethod
-    def _bucket_minutes(dt, now):
-        """The rounding step this estimate has earned. See _ETA_ROUNDING."""
-        hours = (dt - now).total_seconds() / 3600.0
-        return next((m for h, m in _ETA_ROUNDING if hours > h), _ETA_ROUND_MIN)
+    def _refresh_threshold(dt, now):
+        """How far the estimate must move to be worth re-displaying. See _ETA_REFRESH_*."""
+        remaining = max((dt - now).total_seconds() / 60.0, 0.0)
+        return max(_ETA_REFRESH_MIN,
+                   min(_ETA_REFRESH_MAX, remaining * _ETA_REFRESH_FRACTION))
 
     @staticmethod
     def _round_eta(dt, now=None, shown=None):
-        """Round to the precision the estimate has, holding `shown` while it still fits.
+        """What to display, given the live estimate and what is already on screen.
 
-        Idempotent in `shown`: feeding the result back in returns it unchanged. That is
-        what makes it safe for the state and the attributes to evaluate it independently,
-        and it is the property the old wall-clock slew lacked.
+        The estimate itself, to the minute — never quantised. What this decides is only
+        *when* to refresh from it: once it has moved further than _refresh_threshold.
+
+        Idempotent in `shown`: feeding the result back returns it unchanged, so the state
+        and the attributes may evaluate it independently. That is the property the old
+        wall-clock slew lacked, and the reason this is safe where that was not.
         """
         if dt is None:
             return None
+        dt = dt.replace(second=0, microsecond=0)
+        if shown is None:
+            return dt
         now = now or datetime.now(timezone.utc)
-        q = MSpaReadyAtTimeSensor._bucket_minutes(dt, now) * 60
-        if shown is not None and abs((dt - shown).total_seconds()) <= q:
-            # Still within the precision being claimed, so still a true statement of the
-            # estimate. A half-bucket deadband would always show the *nearest* bucket and
-            # keeps flickering: on 15.10 the raw moved 10:34 -> 10:45, which straddles the
-            # half-bucket line exactly, and the display went to 11:00 and back.
+        if abs((dt - shown).total_seconds()) / 60.0 <= MSpaReadyAtTimeSensor._refresh_threshold(dt, now):
             return shown
-        secs = dt.hour * 3600 + dt.minute * 60 + dt.second
-        shift = round(secs / q) * q - secs
-        return (dt + timedelta(seconds=shift)).replace(second=0, microsecond=0)
+        return dt
 
     def display_ready_at(self):
         """Return (kind, timestamp) for whatever this sensor is currently showing.

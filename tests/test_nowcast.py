@@ -14,9 +14,8 @@ import pytest
 
 from custom_components.mspa.nowcast import (
     DEFAULT_LIFT_C, LIFT_MAX_C, LIFT_MIN_C, MAX_HORIZON_H, MIN_RATE_C_PER_H,
-    SETTLE_TOLERANCE, TAU_MAX_H, TAU_MIN_H, WINDOW_BOUNDARIES, WINDOW_MAX_BOUNDARIES,
-    WINDOW_SPAN_C, Crossing, boundaries_for, derive, lift_from_run, measure,
-    minutes_to_target, nowcast, settled,
+    SETTLE_TOLERANCE, TAU_MAX_H, TAU_MIN_H, WINDOW_BOUNDARIES, WINDOW_SPAN_C,
+    Crossing, derive, lift_from_run, measure, minutes_to_target, nowcast, settled,
 )
 
 
@@ -358,23 +357,17 @@ class TestTheWindowWidensWhereTheLeverIsLong:
             rows.append(Crossing(t, T, air))
         return rows
 
-    def test_the_ladder_follows_the_climb_remaining(self):
-        assert boundaries_for(20.0) == 8
-        assert boundaries_for(7.0) == 6
-        assert boundaries_for(2.0) == WINDOW_BOUNDARIES
-        assert boundaries_for(None) == WINDOW_BOUNDARIES
-        assert boundaries_for(20.0) <= WINDOW_MAX_BOUNDARIES
+    def test_it_uses_every_crossing_the_run_has(self):
+        """Uncapped. Scored on 15.10, every cap tried cost accuracy: 24 min of mean
+        displayed error at 4 boundaries, 20 at 12, 19 at 20, 16 uncapped."""
+        for n in (6, 10, 30):
+            rows = self._tub(n)
+            assert nowcast(rows, 39.0, 63.84, air_now=10.0).boundaries == len(rows)
 
-    def test_near_target_is_unchanged(self):
-        """The behaviour the existing scoring was done against must not move."""
-        rows = self._tub(10)
-        assert nowcast(rows, rows[-1].water + 2.0, 63.84,
-                       air_now=10.0).boundaries == WINDOW_BOUNDARIES
-
-    def test_far_from_target_it_measures_over_more(self):
-        rows = self._tub(10)
-        assert nowcast(rows, rows[-1].water + 20.0, 63.84,
-                       air_now=10.0).boundaries == 8
+    def test_an_explicit_width_still_overrides(self):
+        rows = self._tub(20)
+        assert nowcast(rows, 39.0, 63.84, air_now=10.0,
+                       boundaries=6).boundaries == 6
 
     def test_it_narrows_to_what_it_has_rather_than_declining(self):
         """Five crossings and a long climb: it wants eight boundaries, finds five, and
@@ -397,14 +390,14 @@ class TestTheWindowWidensWhereTheLeverIsLong:
         noise = [0.08, -0.06, 0.05, -0.09, 0.07, -0.04, 0.10, -0.07, 0.03, -0.05]
         rows = self._tub(30, noise=noise)
         spreads = {}
-        for width in (WINDOW_BOUNDARIES, 8):
+        for width in (WINDOW_BOUNDARIES, 12):
             taus = []
             for end in range(width, len(rows) + 1):
                 got = derive(measure(rows[:end], width), 63.84)
                 if got:
                     taus.append(got[0])
             spreads[width] = max(taus) - min(taus)
-        assert spreads[8] < spreads[WINDOW_BOUNDARIES] * 0.7, spreads
+        assert spreads[12] < spreads[WINDOW_BOUNDARIES] * 0.7, spreads
 
     def test_the_exact_form_recovers_tau_at_every_width(self):
         """A simulated tub of known tau, measured over windows from 4 to 40 boundaries.

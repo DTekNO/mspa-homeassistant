@@ -272,8 +272,8 @@ class TestReadyAtAgreement:
         when = _NOW_UTC + timedelta(hours=3, minutes=7)
         with patch("custom_components.mspa.sensor._compute_ready_at",
                    return_value=("eta", when, "nowcast")):
-            assert _ready_time(r) == MSpaReadyAtTimeSensor._round_eta(when)
-            assert _ready_time(r).minute % 5 == 0
+            assert _ready_time(r) == when.replace(second=0, microsecond=0), (
+                "the estimate itself, to the minute — not quantised")
 
     def test_ready_has_a_status_but_no_timestamp(self):
         c = MockCoordinator(water_temp=40.0, target_temp=40.0,
