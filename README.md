@@ -457,47 +457,79 @@ This prevents stale seasonal data — for example rates learned in summer — fr
 ### Nowcasting the live Ready at time
 
 Everything above describes how the integration predicts **before** a heat-up starts. It
-has to do that from learning, because at the moment it decides when to start there is
-nothing to measure yet.
+has to guess then, from what it has learned on previous runs, because at the moment it
+decides when to switch on there is nothing yet to measure.
 
-Once the spa is heating, there is. The water temperature reports in 0.5 °C steps, and each
-of those **crossings** is an exact fact: a known temperature at a known time. Four of them
-span 1.5 °C, which is enough to measure a rate that means something — and that rate is
-this tub, today, at this water level, in this weather, with this cover. No learning can
-match it, and more to the point, learning can disagree with it badly. On 08.10.2026 a tub
-that had just been refilled to a lower level was measurably going to be ready in the early
-evening, while the learned model read 22:55 — because its parameters described a tub with
-about 260 litres more water in it.
+Once the spa is heating there is, and from that point **Ready at time stops guessing and
+starts measuring**. It watches the water climbing in your tub, right now, and works out
+when it will reach the setpoint from that — not from an average of how your spa behaved
+last month.
 
-So the live estimate is built from the run's own crossings and nothing else that was
-learned on another day:
+#### Why that matters
 
-1. The last four crossings give a **rate**, recomputed at every crossing. A rolling window,
-   so it self-corrects: a lower water level, a cold night, a sunny afternoon all arrive as
-   a changed rate without anything having to model them.
-2. One carried constant turns that rate into a **curve** — the height of the heater's
-   asymptote above the air. That number is a property of heater power and insulation and
-   survives a refill untouched, which is exactly why it is the one carried. It also barely
-   matters: a 20 % error in it costs about eleven minutes.
-3. The curve is then **walked forward hour by hour through the temperature forecast**, so a
-   run spanning dawn is priced against the weather it will actually meet. On 08.10 that
-   moved the answer 29 minutes earlier than a flat air temperature.
+A learned average describes a spa that no longer quite exists. Add water and it heats
+more slowly; drain some and it heats faster; a cold night, a wet cover, a different fill
+level all move it. The learned model takes several complete runs to notice, and in the
+meantime it is confidently wrong.
 
-Two things follow that are worth knowing about.
+On 15.10.2026 a tub filled to overflowing by rain was measurably going to be ready at
+10:04 the following morning. The learned model said 02:00 — eight hours early, because
+its parameters described a tub with several hundred litres less water in it. The nowcast
+had it inside half an hour by late morning, twenty hours ahead of the event.
 
-**It is held at the start of a run.** The temperature probe sits in the pump housing and
-reads heated water before the tub has mixed, so the first bands after the heater engages
-run far too fast — 4.9 °C/h against a settled 1.2 on 08.10, after the tub had stood all
-night. Until successive windows agree that the water has mixed, Ready at time shows the
-estimate the scheduler committed to and the `nowcast_settled` attribute reads `false`.
+#### It gets better as the run goes on
 
-**It is not smoothed.** A correction lands in one step rather than crawling toward the
-right answer over the next hour. The window is wide enough that it does not twitch, so
-there is nothing left to smooth, and smoothing only ever delayed correct answers.
+This is the part worth understanding, because it is what makes the number trustworthy.
 
-**Without a weather entity** the nowcast cannot run at all — it needs the outdoor
-temperature to know how fast the spa is losing heat — and Ready at time falls back to the
-learned model, reporting `regime: fallback`.
+The water temperature reports in 0.5 °C steps. Each of those **crossings** is an exact
+fact — a known temperature at a known time — and the gap between two of them is a
+measured heating rate. Four crossings is the fewest that measure a rate rather than
+noise, so that is where it starts.
+
+It does not stop there. **Every further crossing is added to the measurement**, so the
+window the rate is drawn from grows steadily through the heat-up: four crossings at the
+start, a dozen by mid-morning, forty-odd by the end of a long climb. More evidence means
+less noise, so the estimate tightens as the run proceeds — exactly when you most want it
+to. On the 15.10 run it went from ±76 minutes at the first estimate to the correct minute
+by the finish.
+
+The shape of that is worth knowing: **early in a long heat-up the figure is a good
+ballpark, and it becomes genuinely precise as the spa gets close.** A twenty-hour
+estimate is not a to-the-minute promise and is not presented as one.
+
+#### How it works
+
+1. The crossings so far give a **measured rate** — recomputed every time the water
+   crosses another half degree.
+2. One carried constant turns that rate into a **curve**: the height of the heater's
+   asymptote above the outside air. It is a property of heater power and insulation, it
+   survives a refill untouched, and it is refined once per completed run. A 20 % error in
+   it costs about eleven minutes near the target.
+3. The curve is **walked forward hour by hour through the temperature forecast**, so a
+   run spanning dawn or a cold night is priced against the weather it will actually meet
+   rather than the weather outside now.
+
+#### What you will see
+
+**It holds the opening estimate for the first part of a run.** The temperature probe sits
+in the pump housing and reads heated water before the tub has mixed, so the first
+crossings after the heater engages run too fast to trust — mildly if circulation was
+already running, dramatically if the spa has been standing. Until there is a measurement
+worth showing, Ready at time displays the figure the scheduler committed to, and the
+`nowcast_settled` attribute reads `false`. On a spa with the circulation pump already
+running this is about four crossings; on one starting cold and still it waits until
+successive windows agree the water has mixed.
+
+**It refreshes when the estimate moves, not on a timer.** The time shown is always a real
+estimate, to the minute — never rounded into buckets. What is controlled is how often it
+is redrawn: only once the estimate has moved by more than a few per cent of the time
+remaining. That is roughly a quarter of an hour early in a long run and a couple of
+minutes near the end, so the display is quiet when the answer is vague and responsive
+when it is sharp. Over a 24-hour heat-up that is about nine changes rather than forty.
+
+**Without a weather entity it cannot run.** The nowcast needs the outdoor temperature to
+know how fast the spa is losing heat. With none configured, Ready at time falls back to
+the learned model and reports `regime: fallback`.
 
 ### Sensor attributes
 
@@ -525,8 +557,10 @@ The nowcast's working, all of it measured during this heat-up except the lift:
 | Attribute | Description |
 |---|---|
 | `nowcast_settled` | Whether the water has mixed. `false` means the time shown is held, not measured |
+| `nowcast_premixed` | Whether circulation was already running when the heater engaged |
 | `nowcast_crossings` | How many 0.5 °C boundaries this run has recorded |
-| `nowcast_rate_c_per_h` | Rate over the last four boundaries — a 1.5 °C span |
+| `nowcast_boundaries` | How many of them the rate is currently measured over — this grows through the run |
+| `nowcast_rate_c_per_h` | Measured rate over that window |
 | `nowcast_window_span_c` | How far the water actually moved across that window |
 | `nowcast_window_hours` | How long it took |
 | `nowcast_air_c` | Time-weighted outdoor temperature over the window |
