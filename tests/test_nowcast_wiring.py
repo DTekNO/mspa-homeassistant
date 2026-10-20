@@ -992,3 +992,66 @@ class TestTheCoolingRecorder:
         c.config_entry.options[CONF_CROSSING_LOG] = False
         c._note_idle_crossing(29.5, 5400.0)
         assert c._idle_prev_temp is None and c._crossing_log == []
+
+
+class TestTheLogIsOnePerLine:
+    """JSON Lines, so the file can be grepped, tailed and fed to awk months later.
+
+    Store pretty-prints and offers no way not to, which is why this is written by hand.
+    """
+
+    def _c(self, tmp_path):
+        c = _coord()
+        c._crossing_path = str(tmp_path / "crossings.jsonl")
+        return c
+
+    def test_one_row_is_one_line(self, tmp_path):
+        c = self._c(tmp_path)
+        rows = [{"t": "2026-10-20T12:00:00+00:00", "src": "heat", "water": 30.0 + i}
+                for i in range(5)]
+        c._write_crossing_lines(rows)
+        text = open(c._crossing_path).read()
+        assert text.count("\n") == 5
+        assert all(len(ln) and ln.lstrip() == ln for ln in text.splitlines()), \
+            "no indentation, so a row never wraps onto a second line"
+
+    def test_it_is_compact(self, tmp_path):
+        c = self._c(tmp_path)
+        c._write_crossing_lines([{"t": "x", "water": 30.0, "air": 9.5}])
+        line = open(c._crossing_path).read().strip()
+        assert line == '{"t":"x","water":30.0,"air":9.5}', "no spaces after : or ,"
+
+    def test_the_timestamp_comes_first(self, tmp_path):
+        """So that tail is readable and sort is chronological."""
+        c = _cross(_coord(), [30.0, 30.5])
+        c._crossing_path = str(tmp_path / "crossings.jsonl")
+        c._write_crossing_lines(c._crossing_log)
+        assert open(c._crossing_path).read().startswith('{"t":')
+
+    def test_a_round_trip_keeps_every_row(self, tmp_path):
+        c = self._c(tmp_path)
+        rows = [{"t": str(i), "water": 30.0 + i / 2} for i in range(40)]
+        c._write_crossing_lines(rows)
+        assert c._read_crossing_lines() == rows
+
+    def test_a_torn_last_line_costs_only_that_row(self, tmp_path):
+        """The file is append-shaped, so a crash mid-write must not lose the history
+        in front of it."""
+        c = self._c(tmp_path)
+        c._write_crossing_lines([{"t": "1"}, {"t": "2"}])
+        with open(c._crossing_path, "a") as fh:
+            fh.write('{"t":"3","wat')
+        assert c._read_crossing_lines() == [{"t": "1"}, {"t": "2"}]
+
+    def test_no_file_is_not_an_empty_log(self, tmp_path):
+        """None rather than [], because the loader uses it to decide whether there is a
+        Store to migrate from."""
+        assert self._c(tmp_path)._read_crossing_lines() is None
+
+    def test_the_write_is_atomic(self, tmp_path):
+        """Renamed into place, so a crash cannot leave a half file where a whole one
+        was, and no .tmp is left behind."""
+        c = self._c(tmp_path)
+        c._write_crossing_lines([{"t": "1"}])
+        c._write_crossing_lines([{"t": "1"}, {"t": "2"}])
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["crossings.jsonl"]

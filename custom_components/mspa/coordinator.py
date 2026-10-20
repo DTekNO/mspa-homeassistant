@@ -1,5 +1,7 @@
 """DataUpdateCoordinator for MSpa integration."""
+import json
 import logging
+import os
 from datetime import timedelta, datetime, timezone
 from .mspa_api import MSpaApiClient
 from .thermal import (
@@ -809,6 +811,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # purges states after `purge_keep_days` and keeps only hourly statistics after
         # that, which destroys the crossing *times* — the one quantity the whole method
         # rests on.
+        # One compact JSON object per line (JSON Lines), written here rather than
+        # through Store. Store pretty-prints and gives no way not to, which turns a
+        # thousand rows into fifteen thousand lines and makes the file something you
+        # open in an editor instead of something you grep, tail or feed to awk. The
+        # whole point of the log is being read by hand months later.
+        self._crossing_path = hass.config.path(
+            ".storage", f"{DOMAIN}_crossings_{device_id}.jsonl")
+        # The old pretty-printed Store, kept only to migrate what it already holds.
         self._crossing_store = Store(
             hass, version=1, key=f"{DOMAIN}_crossings_{device_id}")
         self._crossing_log: list[dict] = []
@@ -4752,30 +4762,80 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if self._crossing_log_loaded:
             return
         self._crossing_log_loaded = True
-        if self._crossing_store is None:
-            return
+        rows = await self.hass.async_add_executor_job(self._read_crossing_lines)
+        if rows is None:
+            # No .jsonl yet. Either a first run or a version that still wrote the Store,
+            # so take whatever that holds and let the next save write it back as lines.
+            rows = []
+            if self._crossing_store is not None:
+                try:
+                    stored = await self._crossing_store.async_load()
+                except Exception:                             # noqa: BLE001
+                    _LOGGER.debug("Crossing log: could not be read", exc_info=True)
+                    stored = None
+                migrated = (stored or {}).get("crossings") or []
+                if isinstance(migrated, list) and migrated:
+                    rows = migrated
+                    self._crossing_log_dirty = True
+                    _LOGGER.info("Crossing log: migrating %d row(s) to %s",
+                                 len(rows), os.path.basename(self._crossing_path))
+        self._crossing_log = list(rows[-_CROSSING_LOG_MAX:])
+        _LOGGER.debug("Crossing log: %d row(s) restored", len(self._crossing_log))
+
+    def _read_crossing_lines(self) -> list | None:
+        """Parse the .jsonl, or None when there is no file to parse.
+
+        A row that will not parse is skipped rather than failing the load: the file is
+        append-shaped, so a torn last line costs that crossing and nothing before it.
+        """
         try:
-            stored = await self._crossing_store.async_load()
-        except Exception:                                     # noqa: BLE001
+            with open(self._crossing_path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except FileNotFoundError:
+            return None
+        except OSError:
             _LOGGER.debug("Crossing log: could not be read", exc_info=True)
-            return
-        rows = (stored or {}).get("crossings") or []
-        if isinstance(rows, list):
-            self._crossing_log = list(rows[-_CROSSING_LOG_MAX:])
-            _LOGGER.debug("Crossing log: %d row(s) restored", len(self._crossing_log))
+            return None
+        rows = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                _LOGGER.debug("Crossing log: skipping an unparseable row")
+        return rows
+
+    def _write_crossing_lines(self, rows: list) -> None:
+        """Rewrite the file, one compact object per line.
+
+        A rewrite rather than an append because trimming to the cap drops rows from the
+        front. At most a thousand rows a few times an hour, so the cost is nothing, and
+        it keeps the file exactly the list in memory rather than a thing that drifts
+        from it. Written beside the target and renamed, so a crash cannot leave a half
+        file where a whole one was.
+        """
+        tmp = f"{self._crossing_path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+            os.replace(tmp, self._crossing_path)
+        except OSError:
+            _LOGGER.debug("Crossing log: could not be written", exc_info=True)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     async def _save_crossing_log(self) -> None:
         """Write the log, and only when a crossing has actually been added."""
         if not getattr(self, "_crossing_log_dirty", False):
             return
         self._crossing_log_dirty = False
-        if self._crossing_store is None:
-            return
-        try:
-            await self._crossing_store.async_save(
-                {"crossings": self._crossing_log or []})
-        except Exception:                                     # noqa: BLE001
-            _LOGGER.debug("Crossing log: could not be written", exc_info=True)
+        await self.hass.async_add_executor_job(
+            self._write_crossing_lines, list(self._crossing_log or []))
 
     def thermal_diagnostics(self) -> dict:
         """What the model currently believes, for the diagnostic sensor."""
