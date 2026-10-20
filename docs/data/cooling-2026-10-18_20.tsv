@@ -1,0 +1,40 @@
+# mspa free-cooling run, extracted 20.10.2026 15:10 from HA recorder before the
+# 10-day purge window closes (~28.10). Source: sensor.outside_mspa_oslouvc_bobbyspa_water_temperature
+# Heater off throughout. Sensor reports in 0.5 C steps, so each row is a step crossing.
+# Clean monotonic decay begins 18.10 08:10; everything before that is pump/stratification
+# churn while the spa was still being held near 39-40 and is excluded from the fit.
+# Local time (CEST, UTC+2).
+timestamp	water_c
+2026-10-18T08:10:06	37.5
+2026-10-18T08:39:06	37.0
+2026-10-18T09:42:06	36.5
+2026-10-18T10:55:07	36.0
+2026-10-18T13:20:40	35.5
+2026-10-18T14:48:17	35.0
+2026-10-18T15:55:49	34.5
+2026-10-18T17:08:49	34.0
+2026-10-18T18:16:02	33.5
+2026-10-18T19:28:34	33.0
+2026-10-18T20:39:04	32.5
+2026-10-18T21:55:05	32.0
+2026-10-18T23:08:36	31.5
+2026-10-19T00:32:07	31.0
+2026-10-19T01:50:38	30.5
+2026-10-19T03:11:39	30.0
+2026-10-19T04:30:09	29.5
+2026-10-19T05:48:10	29.0
+2026-10-19T07:13:11	28.5
+2026-10-19T11:04:05	28.0
+2026-10-19T15:10:38	27.5
+2026-10-19T16:39:39	27.0
+2026-10-19T18:07:30	26.5
+2026-10-19T19:48:00	26.0
+2026-10-19T21:18:00	25.5
+2026-10-19T22:54:30	25.0
+2026-10-20T00:35:00	24.5
+2026-10-20T02:14:01	24.0
+2026-10-20T03:53:44	23.5
+2026-10-20T05:35:44	23.0
+2026-10-20T07:19:45	22.5
+# 20.10 09:35-09:53 power cut (whole site). 10:54-10:55 pump mixing after restore:
+# 20.5 -> 22.5 -> 22.0 in 60 s. Bulk temperature after that is 22.0 and FLAT to 15:10.

@@ -120,6 +120,26 @@ CONF_WEATHER_ENTITY = "weather_entity"
 # wipe it. If it ever earns a place in the UI it can be added back deliberately.
 CONF_OUTDOOR_SENSOR = "outdoor_sensor"
 
+# Record a crossing row while the heater is OFF as well as while it is on, so a free
+# cooling run leaves the same evidence a heating run does. Off by default, not in the
+# options dialog, and set the same way as CONF_OUTDOOR_SENSOR above: by hand in
+# .storage/core.config_entries on an installation that is collecting the comparison.
+#
+# It exists because the log was comprehensive only in the regime where the question is
+# hardest to answer. Solar gain is tens of watts against a 2200 W heater, so it is
+# invisible during a run and plain during a cooldown — and on 20.10.2026 the only
+# record of a 46-hour cooldown was the recorder's own history, ten days from being
+# purged. Reconstructing it by hand is what this flag is meant to make unnecessary.
+#
+# The rows it writes are inert. They go to the crossing log and nowhere else: no model
+# reads them, the nowcast window never sees them, and `src` on every row says which
+# regime produced it. A row with no `src` predates this flag and is a heating row.
+#
+# Cost when on: a cooling tub crosses a 0.5 °C boundary roughly every 1.5 h, so about
+# 12 rows a day against _CROSSING_LOG_MAX of 1000. That takes the log's reach from
+# roughly three months of runs to about two months of everything.
+CONF_LOG_IDLE_CROSSINGS = "log_idle_crossings"
+
 # There is deliberately no switch for "apply the learned response to outdoor
 # temperature". Configuring a weather entity *is* the switch: without one `ambient_temp`
 # is None, and both `ambient_rate_factor` and `learned_ambient_factor` already return no

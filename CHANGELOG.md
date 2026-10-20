@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time-weighted outdoor temperature, UV index, wind and gust over the interval. Kept for
   about three months, because the recorder purges states after ten days and keeps only
   hourly statistics, which destroys the crossing times.
+- **Crossings while cooling**, behind `log_idle_crossings`. Off by default and not in
+  the options dialog. Rows carry `src`: `"idle"` for these, `"heat"` for the rest, and
+  no `src` on rows written before the distinction. No model reads them.
 
 - **Connectivity sensor.** A diagnostic binary sensor that reports whether the spa is
   still answering, and unlike every other entity it stays available when the spa is not,

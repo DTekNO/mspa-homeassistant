@@ -869,3 +869,100 @@ class TestAlreadyCirculatingSkipsTheGate:
     def test_before_release_it_is_the_minimum(self):
         c = self._run(pump_minutes=None, rates=(1.25,) * 2)
         assert c.nowcast_boundaries() == nc.WINDOW_BOUNDARIES
+
+
+class TestTheCoolingRecorder:
+    """Crossings while the heater is off: CONF_LOG_IDLE_CROSSINGS.
+
+    The log was comprehensive only while heating, which is the regime where the
+    question it exists for — how much the sun is worth — is hardest to answer. These
+    rows are inert: nothing reads them, and `src` keeps them apart from heating rows.
+    """
+
+    def _idle(self, *, on=True, **over):
+        from custom_components.mspa.const import CONF_LOG_IDLE_CROSSINGS
+        c = _coord(**over)
+        c.config_entry = type("E", (), {
+            "options": {"heater_power_heat": 2200,
+                        CONF_LOG_IDLE_CROSSINGS: on}})()
+        c.measured_outdoor_temp = None
+        return c
+
+    def _cool(self, c, temps, *, minutes=90.0, start=0.0):
+        """Feed readings with the heater off, two polls an interval as in production."""
+        t = start
+        for i, temp in enumerate(temps):
+            if i:
+                for _ in range(2):
+                    t += minutes * 60.0 / 2.0
+                    c._note_idle_crossing(temp if False else c._idle_prev_temp, t)
+            c._note_idle_crossing(temp, t)
+        return c
+
+    def test_off_by_default(self):
+        c = self._idle(on=False)
+        self._cool(c, [30.0, 29.5, 29.0])
+        assert c._crossing_log == [], "a diagnostic nobody asked for stays silent"
+
+    def test_a_cooling_row_is_recorded_with_a_negative_rate(self):
+        c = self._idle()
+        self._cool(c, [30.0, 29.5])
+        assert len(c._crossing_log) == 1
+        row = c._crossing_log[-1]
+        assert row["src"] == "idle"
+        assert row["water"] == 29.5
+        assert row["rate"] == pytest.approx(-0.5 / 1.5, rel=0.01), "cooling is negative"
+        assert row["secs"] == pytest.approx(90 * 60, abs=2)
+
+    def test_the_first_reading_only_anchors(self):
+        c = self._idle()
+        self._cool(c, [30.0])
+        assert c._crossing_log == [], "nothing has been measured yet"
+
+    def test_heating_rows_say_so(self):
+        row = _cross(_coord(), [30.0, 30.5])._crossing_log[-1]
+        assert row["src"] == "heat"
+
+    def test_the_idle_rate_is_not_derived_from_a_heating_crossing(self):
+        """The heating path's previous crossing belongs to another regime and often
+        another day. A rate spanning the two would be invented."""
+        c = self._idle()
+        _cross(c, [30.0, 30.5])                       # a run ends here
+        heat_rows = len(c._crossing_log)
+        c._idle_prev_temp = None                      # heater goes off
+        self._cool(c, [30.5, 30.0], start=10_000.0)
+        idle_row = c._crossing_log[-1]
+        assert len(c._crossing_log) == heat_rows + 1
+        assert idle_row["src"] == "idle"
+        assert idle_row["rate"] == pytest.approx(-0.5 / 1.5, rel=0.01), \
+            "measured from the idle anchor, not from the last heating crossing"
+
+    def test_uv_is_time_weighted_over_the_whole_interval(self):
+        """The point of the exercise. An idle interval runs to hours and UV goes from
+        0 to 1 and back inside one, so an instantaneous sample would be meaningless."""
+        c = self._idle()
+        c.ambient_uv = 0.0
+        c._note_idle_crossing(30.0, 0.0)
+        c.ambient_uv = 0.0
+        c.accumulate_nowcast_conditions(1800.0)       # half an hour dark
+        c.ambient_uv = 1.0
+        c.accumulate_nowcast_conditions(3600.0)       # half an hour at uv 1
+        c._note_idle_crossing(29.5, 3600.0)
+        assert c._crossing_log[-1]["uv"] == pytest.approx(0.5, abs=0.01)
+
+    def test_an_idle_crossing_does_not_move_the_projection_anchor(self):
+        c = self._idle()
+        c._nowcast_last_at = "untouched"
+        self._cool(c, [30.0, 29.5])
+        assert c._nowcast_last_at == "untouched", \
+            "a cooldown is not an anchor for the next run"
+
+    def test_turning_it_off_forgets_the_anchor(self):
+        """Enabling it mid-cooldown must not derive a first rate from hours ago."""
+        from custom_components.mspa.const import CONF_LOG_IDLE_CROSSINGS
+        c = self._idle()
+        c._note_idle_crossing(30.0, 0.0)
+        assert c._idle_prev_temp == 30.0
+        c.config_entry.options[CONF_LOG_IDLE_CROSSINGS] = False
+        c._note_idle_crossing(29.5, 5400.0)
+        assert c._idle_prev_temp is None and c._crossing_log == []

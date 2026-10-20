@@ -71,6 +71,7 @@ from .const import (
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_WEATHER_ENTITY,
+    CONF_LOG_IDLE_CROSSINGS,
     CONF_OUTDOOR_SENSOR,
     CONF_PREDICTION_MODEL,
     DEFAULT_PREDICTION_MODEL,
@@ -528,6 +529,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     _crossing_log: list | None = None
     _crossing_log_loaded: bool = False
     _crossing_log_dirty: bool = False
+    _idle_prev_temp: float | None = None
+    _idle_prev_mono: float = 0.0
 
     def __init__(self, hass: HomeAssistant, config_entry: Dict[str, Any]) -> None:
         """Initialize."""
@@ -805,6 +808,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._crossing_log: list[dict] = []
         self._crossing_log_loaded = False
         self._crossing_log_dirty = False
+        # The cooling recorder's own previous crossing. Separate from the heating
+        # path's: a rate derived across the two would span the end of a run.
+        self._idle_prev_temp: float | None = None
+        self._idle_prev_mono: float = 0.0
         self._nowcast_last_at: datetime | None = None
         # Hourly forecast as [(utc datetime, °C)], refreshed on a throttle. See
         # _refresh_forecast for why this is fetched rather than read off an attribute.
@@ -3516,6 +3523,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     self._bucket_base_bucket = None
             # else: temperature unchanged — let elapsed time accumulate, don't touch anchor
         else:
+            # Not heating, so this is where a cooldown is observed. Before the resets
+            # below, which are about the heating window and say nothing about cooling.
+            self._note_idle_crossing(curr_temp, now_mono)
             # Heater off/preheat — reset anchor so next on-cycle starts fresh
             # (and the next first crossing is treated as phase-uncertain again).
             self._rate_last_temp = None
@@ -4215,6 +4225,57 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._cross_gust_sum += float(self.ambient_gust or 0.0) * secs
             self._cross_wind_secs += secs
 
+    @property
+    def log_idle_crossings(self) -> bool:
+        """Whether to record crossings while the heater is off. See CONF_LOG_IDLE_CROSSINGS."""
+        entry = getattr(self, "config_entry", None)
+        return bool((getattr(entry, "options", None) or {}).get(
+            CONF_LOG_IDLE_CROSSINGS, False))
+
+    def _note_idle_crossing(self, curr_temp, now_mono: float) -> None:
+        """A 0.5 °C boundary with the heater off, written to the log and nowhere else.
+
+        Deliberately not symmetrical with the heating path. There is no phase-uncertain
+        first crossing to discard, because nothing switched on to disturb the probe; no
+        settling gate, because there is no window to settle; and no anchor, because
+        nothing is being projected. A cooldown is only ever evidence after the fact.
+
+        The conditions accumulators are shared with the heating path, which is safe
+        because the two regimes are mutually exclusive on `heat_state` and the interval
+        is reset whenever the regime changes. Sharing them is also the point: an idle
+        row's `uv` is time-weighted over the whole interval exactly as a heating row's
+        is, so the two are directly comparable. Instantaneous sampling would be
+        useless here, where intervals run to hours and UV goes from 0 to 1 and back
+        inside one.
+        """
+        if curr_temp is None:
+            return
+        if not self.log_idle_crossings:
+            # Keep no state while off, so enabling it mid-cooldown starts cleanly rather
+            # than deriving a first rate from a temperature read hours ago.
+            self._idle_prev_temp = None
+            return
+        water = float(curr_temp)
+        if self._idle_prev_temp is None:
+            # First reading in this regime anchors; it measures nothing by itself.
+            self._idle_prev_temp = water
+            self._idle_prev_mono = now_mono
+            self._reset_crossing_conditions()
+            self._cross_last_mono = now_mono
+            return
+        self.accumulate_nowcast_conditions(now_mono)
+        if water == self._idle_prev_temp:
+            return
+        air = (self._cross_air_sum / self._cross_air_secs
+               if self._cross_air_secs > 0 else self.ambient_temp)
+        self._append_crossing_log(
+            now_mono, water, air, src="idle",
+            prev_mono=self._idle_prev_mono, prev_water=self._idle_prev_temp)
+        self._idle_prev_temp = water
+        self._idle_prev_mono = now_mono
+        self._reset_crossing_conditions()
+        self._cross_last_mono = now_mono
+
     def _reset_crossing_conditions(self) -> None:
         """Start accumulating the next interval."""
         self._cross_air_sum = self._cross_air_secs = 0.0
@@ -4601,7 +4662,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
     # ---- the crossing log ----------------------------------------------------
 
-    def _append_crossing_log(self, when_mono: float, water: float, air) -> None:
+    def _append_crossing_log(self, when_mono: float, water: float, air,
+                             *, src: str = "heat",
+                             prev_mono: float | None = None,
+                             prev_water: float | None = None) -> None:
         """One row per crossing, queued for its own store.
 
         The water sensor only changes at half-degree boundaries, so this list *is* the
@@ -4611,21 +4675,36 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         `uv`, `wind` and `gust` are written and never read by any model. They are the
         record that lets solar gain and wind be settled in a few weeks against data
         instead of guessed at now.
+
+        `src` is "heat" for a crossing the heating path produced and "idle" for one the
+        cooling recorder did; a row written before the distinction existed has no `src`
+        and is a heating row. An idle caller passes its own previous crossing, because
+        the heating path's previous crossing belongs to a different regime and often a
+        different day — deriving an idle rate from it would invent a number spanning
+        the end of the last run.
         """
         when = dt_util.utcnow()
-        # The newest crossing's wall clock, which is what the projection is anchored on.
-        # The monotonic clock measures the intervals and cannot be turned into a time of
-        # day; this can, and does not survive a restart, which is correct — a restarted
-        # run re-anchors on its next crossing rather than extrapolating from a time it
-        # cannot place.
-        self._nowcast_last_at = when
-        prev = (self._nowcast_crossings[-2]
-                if len(self._nowcast_crossings) > 1 else None)
-        secs = round(when_mono - prev.mono) if prev is not None else None
-        rate = ((water - prev.water) / (secs / 3600.0)
-                if prev is not None and secs else None)
+        if src == "heat":
+            # The newest crossing's wall clock, which is what the projection is anchored
+            # on. The monotonic clock measures the intervals and cannot be turned into a
+            # time of day; this can, and does not survive a restart, which is correct —
+            # a restarted run re-anchors on its next crossing rather than extrapolating
+            # from a time it cannot place.
+            #
+            # Only the heating path sets it. An idle crossing is not a projection
+            # anchor, and letting a cooldown move it would hand the next run an anchor
+            # from hours before it started.
+            self._nowcast_last_at = when
+            prev = (self._nowcast_crossings[-2]
+                    if len(self._nowcast_crossings) > 1 else None)
+            prev_mono = prev.mono if prev is not None else None
+            prev_water = prev.water if prev is not None else None
+        secs = round(when_mono - prev_mono) if prev_mono is not None else None
+        rate = ((water - prev_water) / (secs / 3600.0)
+                if prev_water is not None and secs else None)
         row = {
             "t": when.isoformat(timespec="seconds"),
+            "src": src,
             "water": water,
             "secs": secs,
             "air": _round_or_none(air, 2),
