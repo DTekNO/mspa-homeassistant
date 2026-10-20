@@ -120,25 +120,32 @@ CONF_WEATHER_ENTITY = "weather_entity"
 # wipe it. If it ever earns a place in the UI it can be added back deliberately.
 CONF_OUTDOOR_SENSOR = "outdoor_sensor"
 
-# Record a crossing row while the heater is OFF as well as while it is on, so a free
-# cooling run leaves the same evidence a heating run does. Off by default, not in the
-# options dialog, and set the same way as CONF_OUTDOOR_SENSOR above: by hand in
-# .storage/core.config_entries on an installation that is collecting the comparison.
+# Keep the full crossing log: months of rows, every 0.5 °C boundary in both directions,
+# each with the time-weighted UV, wind, gust and air it was reached through. Off by
+# default, not in the options dialog, and set the same way as CONF_OUTDOOR_SENSOR above:
+# by hand in .storage/core.config_entries on an installation that is collecting the
+# comparison. It is an instrument, not a feature — nothing in the integration reads what
+# it adds, and no user ever has to know it exists.
 #
-# It exists because the log was comprehensive only in the regime where the question is
-# hardest to answer. Solar gain is tens of watts against a 2200 W heater, so it is
-# invisible during a run and plain during a cooldown — and on 20.10.2026 the only
-# record of a 46-hour cooldown was the recorder's own history, ten days from being
-# purged. Reconstructing it by hand is what this flag is meant to make unnecessary.
+# OFF IS NOT SILENT. The log has two jobs and only one of them is diagnostic. The
+# nowcast window is rebuilt from it after a restart — that is what makes a restart
+# mid-run cost nothing instead of several hours of re-settling — so with this off the
+# log still keeps the recent heating rows that restoration reads, and nothing else:
+# no cooling rows, and no history beyond the run in progress. See _CROSSING_LOG_KEEP_OFF.
 #
-# The rows it writes are inert. They go to the crossing log and nowhere else: no model
-# reads them, the nowcast window never sees them, and `src` on every row says which
-# regime produced it. A row with no `src` predates this flag and is a heating row.
+# ON adds the two things diagnosis needs and restoration does not. Cooling rows, because
+# the question the log exists for cannot be answered without them: solar gain is tens of
+# watts against a 2200 W heater, so it is invisible during a run and plain during a
+# cooldown. And depth, because settling whether UV and wind matter takes months, not one
+# run. On 20.10.2026 the only record of a 46-hour cooldown was the recorder's own
+# history, ten days from being purged; reconstructing it by hand is what this is meant
+# to make unnecessary.
 #
-# Cost when on: a cooling tub crosses a 0.5 °C boundary roughly every 1.5 h, so about
-# 12 rows a day against _CROSSING_LOG_MAX of 1000. That takes the log's reach from
-# roughly three months of runs to about two months of everything.
-CONF_LOG_IDLE_CROSSINGS = "log_idle_crossings"
+# The extra rows are inert either way. No model reads them, the nowcast window never
+# sees a cooling row, and `src` on every row says which regime produced it — "idle",
+# "heat", or absent on a row written before the distinction existed, which is a heating
+# row.
+CONF_CROSSING_LOG = "crossing_log"
 
 # There is deliberately no switch for "apply the learned response to outdoor
 # temperature". Configuring a weather entity *is* the switch: without one `ambient_temp`

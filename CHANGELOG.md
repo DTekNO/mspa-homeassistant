@@ -9,10 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The live estimate wanders much less.** Four changes, measured against the 15–16.10
-  run: the gap is computed from the site thermometer rather than the weather entity's
-  modelled temperature; the forecast walk is levelled on that thermometer; the window
-  widens from four to eight crossings when the target is far; and the carried lift is
+- **The live estimate wanders much less.** Measured against the 15–16.10 run: the window
+  widens from four to eight crossings when the target is far, and the carried lift is
   frozen for the duration of a run. Peak-to-peak wander in the first half of a long run
   falls from 166 to 102 minutes, with the systematic error largely gone.
 - **Ready at time is rounded to the precision it has** — half-hourly beyond 8 h out,
@@ -52,12 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Crossing log.** Every 0.5 °C crossing is written to its own store with the
-  time-weighted outdoor temperature, UV index, wind and gust over the interval. Kept for
-  about three months, because the recorder purges states after ten days and keeps only
-  hourly statistics, which destroys the crossing times.
-- **Crossings while cooling**, behind `log_idle_crossings`. Off by default and not in
-  the options dialog. Rows carry `src`: `"idle"` for these, `"heat"` for the rest, and
-  no `src` on rows written before the distinction. No model reads them.
+  time-weighted outdoor temperature, UV index, wind and gust over the interval. The
+  nowcast window is rebuilt from it after a restart.
+- **`crossing_log`**, off by default and not in the options dialog, keeps the log for
+  about three months and adds crossings while cooling. Off keeps only the run
+  restoration reads. Rows carry `src`: `"idle"`, `"heat"`, or absent on rows written
+  before the distinction. No model reads the rows it adds.
 
 - **Connectivity sensor.** A diagnostic binary sensor that reports whether the spa is
   still answering, and unlike every other entity it stays available when the spa is not,

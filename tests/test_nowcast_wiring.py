@@ -386,12 +386,15 @@ class TestTheCrossingLog:
         assert row["gust"] == pytest.approx(7.5), "kept apart until one is shown to matter"
 
     def test_it_is_bounded(self):
-        from custom_components.mspa.coordinator import _CROSSING_LOG_MAX
+        """Bounded at the cap for the configuration in force — here the default, with
+        the diagnostic log off, which keeps only the run restoration reads. The two
+        caps have their own tests in TestTheCoolingRecorder."""
+        from custom_components.mspa.coordinator import _CROSSING_LOG_KEEP_OFF
         c = _coord()
-        c._crossing_log = [{"t": str(i)} for i in range(_CROSSING_LOG_MAX)]
+        c._crossing_log = [{"t": str(i)} for i in range(_CROSSING_LOG_KEEP_OFF + 50)]
         c.record_nowcast_crossing(0.0, 30.0)
-        assert len(c._crossing_log) == _CROSSING_LOG_MAX
-        assert c._crossing_log[-1]["water"] == 30.0
+        assert len(c._crossing_log) == _CROSSING_LOG_KEEP_OFF
+        assert c._crossing_log[-1]["water"] == 30.0, "the newest row always survives"
 
     def test_it_is_only_written_when_a_crossing_happened(self):
         """The rates store is rewritten every poll; this one must not be, or a thousand
@@ -872,7 +875,7 @@ class TestAlreadyCirculatingSkipsTheGate:
 
 
 class TestTheCoolingRecorder:
-    """Crossings while the heater is off: CONF_LOG_IDLE_CROSSINGS.
+    """Crossings while the heater is off: CONF_CROSSING_LOG.
 
     The log was comprehensive only while heating, which is the regime where the
     question it exists for — how much the sun is worth — is hardest to answer. These
@@ -880,11 +883,11 @@ class TestTheCoolingRecorder:
     """
 
     def _idle(self, *, on=True, **over):
-        from custom_components.mspa.const import CONF_LOG_IDLE_CROSSINGS
+        from custom_components.mspa.const import CONF_CROSSING_LOG
         c = _coord(**over)
         c.config_entry = type("E", (), {
             "options": {"heater_power_heat": 2200,
-                        CONF_LOG_IDLE_CROSSINGS: on}})()
+                        CONF_CROSSING_LOG: on}})()
         c.measured_outdoor_temp = None
         return c
 
@@ -903,6 +906,29 @@ class TestTheCoolingRecorder:
         c = self._idle(on=False)
         self._cool(c, [30.0, 29.5, 29.0])
         assert c._crossing_log == [], "a diagnostic nobody asked for stays silent"
+
+    def test_heating_is_still_logged_with_it_off(self):
+        """Off removes the diagnostic depth, not the log. The nowcast window is rebuilt
+        from these rows after a restart, so dropping them would cost a restarted run
+        several hours of re-settling to save a few hundred rows."""
+        c = _cross(self._idle(on=False), [30.0, 30.5, 31.0])
+        assert [r["water"] for r in c._crossing_log] == [30.0, 30.5, 31.0]
+
+    def test_off_keeps_only_the_run_in_progress(self):
+        from custom_components.mspa.coordinator import (
+            _CROSSING_LOG_KEEP_OFF, _CROSSING_LOG_MAX)
+        assert _CROSSING_LOG_KEEP_OFF < _CROSSING_LOG_MAX
+        c = self._idle(on=False)
+        c._crossing_log = [{"t": str(i)} for i in range(_CROSSING_LOG_MAX)]
+        c.record_nowcast_crossing(0.0, 30.0)
+        assert len(c._crossing_log) == _CROSSING_LOG_KEEP_OFF
+
+    def test_on_keeps_months(self):
+        from custom_components.mspa.coordinator import _CROSSING_LOG_MAX
+        c = self._idle(on=True)
+        c._crossing_log = [{"t": str(i)} for i in range(_CROSSING_LOG_MAX)]
+        c.record_nowcast_crossing(0.0, 30.0)
+        assert len(c._crossing_log) == _CROSSING_LOG_MAX
 
     def test_a_cooling_row_is_recorded_with_a_negative_rate(self):
         c = self._idle()
@@ -959,10 +985,10 @@ class TestTheCoolingRecorder:
 
     def test_turning_it_off_forgets_the_anchor(self):
         """Enabling it mid-cooldown must not derive a first rate from hours ago."""
-        from custom_components.mspa.const import CONF_LOG_IDLE_CROSSINGS
+        from custom_components.mspa.const import CONF_CROSSING_LOG
         c = self._idle()
         c._note_idle_crossing(30.0, 0.0)
         assert c._idle_prev_temp == 30.0
-        c.config_entry.options[CONF_LOG_IDLE_CROSSINGS] = False
+        c.config_entry.options[CONF_CROSSING_LOG] = False
         c._note_idle_crossing(29.5, 5400.0)
         assert c._idle_prev_temp is None and c._crossing_log == []

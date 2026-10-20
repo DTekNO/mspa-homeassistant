@@ -71,7 +71,7 @@ from .const import (
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_WEATHER_ENTITY,
-    CONF_LOG_IDLE_CROSSINGS,
+    CONF_CROSSING_LOG,
     CONF_OUTDOOR_SENSOR,
     CONF_PREDICTION_MODEL,
     DEFAULT_PREDICTION_MODEL,
@@ -379,6 +379,12 @@ _CROSSING_MAX_INTERVAL_S = 7200.0
 # this is roughly three months — enough to settle whether UV and wind matter, which is
 # the question it is being kept for, and small enough that the file stays trivial.
 _CROSSING_LOG_MAX = 1000
+
+# How many rows to keep when the diagnostic log is off. Restoration reads at most one
+# run's worth and stops at the first fall or long gap, so this only has to span the run
+# in progress — _NOWCAST_CROSSINGS_MAX is that bound, and matching it means a restart
+# costs nothing whether the log is on or off.
+_CROSSING_LOG_KEEP_OFF = 400
 
 # How long the circulation pump must have been running before the heater engaged for the
 # tub to count as already mixed.
@@ -4226,11 +4232,15 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._cross_wind_secs += secs
 
     @property
-    def log_idle_crossings(self) -> bool:
-        """Whether to record crossings while the heater is off. See CONF_LOG_IDLE_CROSSINGS."""
+    def crossing_log_enabled(self) -> bool:
+        """Whether to keep the full diagnostic crossing log. See CONF_CROSSING_LOG.
+
+        Off still logs heating crossings, because the nowcast window is rebuilt from
+        them after a restart. What off removes is the cooling rows and the depth.
+        """
         entry = getattr(self, "config_entry", None)
         return bool((getattr(entry, "options", None) or {}).get(
-            CONF_LOG_IDLE_CROSSINGS, False))
+            CONF_CROSSING_LOG, False))
 
     def _note_idle_crossing(self, curr_temp, now_mono: float) -> None:
         """A 0.5 °C boundary with the heater off, written to the log and nowhere else.
@@ -4250,7 +4260,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         """
         if curr_temp is None:
             return
-        if not self.log_idle_crossings:
+        if not self.crossing_log_enabled:
             # Keep no state while off, so enabling it mid-cooldown starts cleanly rather
             # than deriving a first rate from a temperature read hours ago.
             self._idle_prev_temp = None
@@ -4729,10 +4739,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if self._crossing_log is None:
             self._crossing_log = []
         self._crossing_log.append(row)
-        # Bounded. At forty crossings a run and a couple of runs a week this is roughly
-        # three months, which comfortably covers the question being asked of it.
-        if len(self._crossing_log) > _CROSSING_LOG_MAX:
-            self._crossing_log = self._crossing_log[-_CROSSING_LOG_MAX:]
+        # Bounded. On, that is roughly three months at forty crossings a run and a couple
+        # of runs a week, which covers the question being asked of it. Off, it is only
+        # the run in progress, which is all restoration reads.
+        keep = _CROSSING_LOG_MAX if self.crossing_log_enabled else _CROSSING_LOG_KEEP_OFF
+        if len(self._crossing_log) > keep:
+            self._crossing_log = self._crossing_log[-keep:]
         self._crossing_log_dirty = True
 
     async def _load_crossing_log(self) -> None:
