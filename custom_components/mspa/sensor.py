@@ -1740,6 +1740,13 @@ class MSpaAmbientLearningSensor(MSpaSensorEntity):
             # different problem from not having chosen one.
             "outdoor_sensor": c.outdoor_sensor,
             "outdoor_sensor_c": _r(c.read_outdoor_sensor(), 2),
+            # What mspa_dev.yaml set, if anything. Here rather than in the log because
+            # the failure this catches is a file that was written and not read — a typo
+            # in a key, the wrong directory, a reload that did not happen — and the only
+            # way to tell that apart from an option that is working is to see the values
+            # the integration is actually using. Empty means no file, or nothing in it
+            # this version knows. See dev_options.py.
+            "dev_options": dict(getattr(c, "_dev_options", {}) or {}),
             # Where the number above came from. "now" is a live reading; anything else
             # means the factor is 1.0 for want of one rather than by measurement, which
             # a bare 1.0 cannot tell you.

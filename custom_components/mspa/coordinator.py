@@ -21,6 +21,7 @@ from .thermal import (
     implied_loss_w_per_k,
 )
 from . import nowcast as nc
+from .dev_options import DEV_OPTIONS_FILE, read_dev_options
 from .predictor import (
     HEAT_BUCKET_LEARN_MAX,
     HEAT_BUCKET_LEARN_MIN,
@@ -533,6 +534,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     measured_outdoor_temp: float | None = None
     ambient_uv: float | None = None
     ambient_gust: float | None = None
+    ambient_wind_steady: float | None = None
+    _dev_options: dict = {}
+    _dev_options_loaded: bool = False
     _crossing_store = None
     _crossing_log: list | None = None
     _crossing_log_loaded: bool = False
@@ -803,6 +807,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self._cross_last_mono: float | None = None
         self.ambient_uv: float | None = None
         self.ambient_gust: float | None = None
+        self.ambient_wind_steady: float | None = None
         # The crossing log: its own store, written only when a crossing completes.
         # Deliberately not the rates store, which is rewritten on every poll — a
         # thousand-row log there would mean rewriting about a hundred kilobytes every
@@ -821,6 +826,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # The old pretty-printed Store, kept only to migrate what it already holds.
         self._crossing_store = Store(
             hass, version=1, key=f"{DOMAIN}_crossings_{device_id}")
+        self._dev_options: dict = {}
+        self._dev_options_loaded = False
         self._crossing_log: list[dict] = []
         self._crossing_log_loaded = False
         self._crossing_log_dirty = False
@@ -1111,8 +1118,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
             )
             # Written into every crossing, read by nothing. See _read_weather_extras.
-            self.ambient_uv, wind, self.ambient_gust = _read_weather_extras(
-                self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY)
+            # `ambient_wind` above is gust-preferred, because that is what the model
+            # wants; the log needs the steady wind as well, or its `wind` column is the
+            # gust a second time and the question of which one correlates cannot be
+            # asked of it.
+            self.ambient_uv, self.ambient_wind_steady, self.ambient_gust = (
+                _read_weather_extras(
+                    self.hass, self.config_entry.options.get(CONF_WEATHER_ENTITY))
             )
 
             new_temp   = transformed_data.get("water_temperature")
@@ -1454,6 +1466,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # Load persisted rates on the very first poll after startup/reload.
             if not self._rates_loaded:
                 self._rates_loaded = True
+                await self._load_dev_options()
                 await self._load_crossing_log()
                 stored = await self._rates_store.async_load()
                 if stored:
@@ -2395,10 +2408,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
     @property
     def outdoor_sensor(self) -> str | None:
         """The configured local thermometer, or None. See CONF_OUTDOOR_SENSOR."""
-        entry = getattr(self, "config_entry", None)
-        if entry is None:
-            return None
-        return (getattr(entry, "options", None) or {}).get(CONF_OUTDOOR_SENSOR)
+        return self.dev_option(CONF_OUTDOOR_SENSOR)
 
     def sun_is_up(self) -> bool | None:
         """Whether the sun is above the horizon, or None if `sun.sun` is absent.
@@ -3262,6 +3272,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         independent.
         """
         if heat_state == _HEAT_STATE_FULL and curr_temp is not None:
+            # The cooling recorder's anchor cannot outlive the run that interrupts it.
+            # Kept, the first crossing after the heater stops would be measured from a
+            # temperature read before it started, and the log would carry a cooling row
+            # with a positive rate spanning a whole heat-up. The same mistake as reusing
+            # the heating path's previous crossing, from the other side.
+            self._idle_prev_temp = None
             # The nowcast's weather, time-weighted over the interval between crossings.
             # Before anything else in this branch, so a poll that completes a crossing
             # has the interval it was reached through already accumulated.
@@ -3541,7 +3557,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         else:
             # Not heating, so this is where a cooldown is observed. Before the resets
             # below, which are about the heating window and say nothing about cooling.
-            self._note_idle_crossing(curr_temp, now_mono)
+            #
+            # Preheat is not a cooldown: the heater is on and the water is about to
+            # climb, so a crossing there measures nothing, and an anchor held across it
+            # would date the next cooling row from before the run.
+            if heat_state == 2:
+                self._idle_prev_temp = None
+            else:
+                self._note_idle_crossing(curr_temp, now_mono)
             # Heater off/preheat — reset anchor so next on-cycle starts fresh
             # (and the next first crossing is treated as phase-uncertain again).
             self._rate_last_temp = None
@@ -4236,10 +4259,30 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if self.measured_outdoor_temp is not None:
             self._cross_meas_sum += float(self.measured_outdoor_temp) * secs
             self._cross_meas_secs += secs
-        if self.ambient_wind is not None or self.ambient_gust is not None:
-            self._cross_wind_sum += float(self.ambient_wind or 0.0) * secs
+        if self.ambient_wind_steady is not None or self.ambient_gust is not None:
+            self._cross_wind_sum += float(self.ambient_wind_steady or 0.0) * secs
             self._cross_gust_sum += float(self.ambient_gust or 0.0) * secs
             self._cross_wind_secs += secs
+
+    async def _load_dev_options(self) -> None:
+        """Read mspa_dev.yaml once per setup. See dev_options.py."""
+        if self._dev_options_loaded:
+            return
+        self._dev_options_loaded = True
+        path = self.hass.config.path(DEV_OPTIONS_FILE)
+        self._dev_options = await self.hass.async_add_executor_job(
+            read_dev_options, path)
+
+    def dev_option(self, key: str, default=None):
+        """A development option: the file if it names the key, else the config entry.
+
+        Both sources are read, because the file is new and an installation that set one
+        of these by hand in .storage should keep working untouched.
+        """
+        if key in self._dev_options:
+            return self._dev_options[key]
+        entry = getattr(self, "config_entry", None)
+        return (getattr(entry, "options", None) or {}).get(key, default)
 
     @property
     def crossing_log_enabled(self) -> bool:
@@ -4248,9 +4291,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         Off still logs heating crossings, because the nowcast window is rebuilt from
         them after a restart. What off removes is the cooling rows and the depth.
         """
-        entry = getattr(self, "config_entry", None)
-        return bool((getattr(entry, "options", None) or {}).get(
-            CONF_CROSSING_LOG, False))
+        return bool(self.dev_option(CONF_CROSSING_LOG, False))
 
     def _note_idle_crossing(self, curr_temp, now_mono: float) -> None:
         """A 0.5 °C boundary with the heater off, written to the log and nowhere else.
@@ -4738,7 +4779,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 if self._cross_uv_secs > 0 else self.ambient_uv, 2),
             "wind": _round_or_none(
                 self._cross_wind_sum / self._cross_wind_secs
-                if self._cross_wind_secs > 0 else self.ambient_wind, 2),
+                if self._cross_wind_secs > 0 else self.ambient_wind_steady, 2),
             "gust": _round_or_none(
                 self._cross_gust_sum / self._cross_wind_secs
                 if self._cross_wind_secs > 0 else self.ambient_gust, 2),

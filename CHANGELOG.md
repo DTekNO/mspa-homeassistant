@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cooling row could report the water rising.** The cooling recorder's previous
+  crossing survived a heating cycle, so the first row after a run was measured from a
+  temperature read before it started. Cleared when the heater comes on, and preheat now
+  records nothing in either regime.
+- **`wind` in the crossing log repeated `gust`.** It was written from the gust-preferred
+  figure the model reads; it now carries the steady wind, so the two columns are two
+  measurements.
 - **The carried lift no longer drifts mid-run.** With no completed run to measure one it
   was re-derived from the learned `A`, which the same run updates at every chord — so
   the one constant the live estimate carries was being moved by a feedback loop. It is
@@ -58,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about three months and adds crossings while cooling. Off keeps only the run
   restoration reads. Rows carry `src`: `"idle"`, `"heat"`, or absent on rows written
   before the distinction. No model reads the rows it adds.
+- **`mspa_dev.yaml`** in the configuration directory sets `crossing_log` and
+  `outdoor_sensor` without editing `.storage/core.config_entries`. Read at setup, so a
+  Reload applies it; only those two keys are honoured, and the file wins over the config
+  entry. What was read is reported by Ambient learning under `dev_options`.
+- **`docs/data/seed_crossings.py`** rebuilds a crossing log from recorder history, so an
+  installation that switches the log on does not start from empty.
 
 - **Connectivity sensor.** A diagnostic binary sensor that reports whether the spa is
   still answering, and unlike every other entity it stays available when the spa is not,

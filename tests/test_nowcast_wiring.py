@@ -42,6 +42,7 @@ def _coord(**over):
     c.ambient_temp = 12.0
     c.ambient_wind = None
     c.ambient_gust = None
+    c.ambient_wind_steady = None
     c.ambient_uv = None
     c.config_entry = type("E", (), {"options": {"heater_power_heat": 2200}})()
     c._window_amb_n = 0
@@ -377,13 +378,17 @@ class TestTheCrossingLog:
     def test_uv_and_wind_are_written_even_though_nothing_reads_them(self):
         c = _coord()
         c.record_nowcast_crossing(0.0, 30.0)
-        c.ambient_uv, c.ambient_wind, c.ambient_gust = 1.2, 3.0, 7.5
+        c.ambient_uv, c.ambient_wind_steady, c.ambient_gust = 1.2, 3.0, 7.5
+        # `ambient_wind` is the gust-preferred figure the model reads; the log keeps the
+        # steady wind, so that the two columns are two measurements.
+        c.ambient_wind = 7.5
         c.accumulate_nowcast_conditions(1620.0)
         c.record_nowcast_crossing(1620.0, 30.5)
         row = c._crossing_log[-1]
         assert row["uv"] == pytest.approx(1.2)
         assert row["wind"] == pytest.approx(3.0)
         assert row["gust"] == pytest.approx(7.5), "kept apart until one is shown to matter"
+        assert row["wind"] != row["gust"], "a column that repeats another answers nothing"
 
     def test_it_is_bounded(self):
         """Bounded at the cap for the configuration in force — here the default, with
@@ -1055,3 +1060,165 @@ class TestTheLogIsOnePerLine:
         c._write_crossing_lines([{"t": "1"}])
         c._write_crossing_lines([{"t": "1"}, {"t": "2"}])
         assert sorted(p.name for p in tmp_path.iterdir()) == ["crossings.jsonl"]
+
+
+class TestTheIdleAnchorIsNotKeptAcrossARun:
+    """The cooling recorder's previous crossing must belong to the same cooldown.
+
+    It was kept across a heating cycle, because nothing cleared it when the heater came
+    on. The next cooling row was then measured from a temperature read before the run —
+    on the maintenance-band days of 16–18.10.2026 that produced cooling rows with
+    *positive* rates, which is the one thing a cooling row cannot be. The same mistake
+    as reusing the heating path's previous crossing, seen from the other side.
+    """
+
+    def _idle_coord(self, **over):
+        from custom_components.mspa.const import CONF_CROSSING_LOG
+        c = _coord(**over)
+        c.config_entry = type("E", (), {
+            "options": {"heater_power_heat": 2200, CONF_CROSSING_LOG: True}})()
+        c.measured_outdoor_temp = None
+        # What the heating branch touches on the way past.
+        c._rate_last_temp = None
+        c._rate_last_time = None
+        c._rate_prev_temp = None
+        c._rate_first_step = False
+        c._bucket_base_bucket = None
+        return c
+
+    def _cool(self, c, temps, *, minutes=90.0, start=0.0):
+        """Readings with the heater off, two polls an interval as in production."""
+        t = start
+        for i, temp in enumerate(temps):
+            if i:
+                for _ in range(2):
+                    t += minutes * 60.0 / 2.0
+                    c._note_idle_crossing(c._idle_prev_temp, t)
+            c._note_idle_crossing(temp, t)
+        return t
+
+    def test_the_heater_coming_on_clears_it(self):
+        c = self._idle_coord()
+        c._idle_prev_temp = 30.0
+        c._track_heating_rate(30.5, 3, 100.0)
+        assert c._idle_prev_temp is None
+
+    def test_preheat_clears_it_and_records_nothing(self):
+        """Preheat is neither regime: the heater is on and the climb has not started,
+        so a crossing there measures nothing in either direction."""
+        c = self._idle_coord()
+        c._idle_prev_temp = 30.0
+        c._track_heating_rate(30.5, 2, 100.0)
+        assert c._idle_prev_temp is None
+        assert c._crossing_log == []
+
+    def test_the_cooldown_after_a_run_re_anchors_instead_of_measuring(self):
+        """The first reading of the new cooldown is a position, not a crossing. With
+        the stale anchor it was a crossing — 29.0 °C hours ago to 35.0 °C now, written
+        as a cooling row with a rate of +4 °C/h."""
+        c = self._idle_coord()
+        t = self._cool(c, [30.0, 29.5, 29.0])
+        assert [r["rate"] for r in c._crossing_log] == pytest.approx([-0.3333, -0.3333])
+
+        # A run, then a cooldown from well above where the last one left off — which is
+        # what makes a stale anchor visible rather than merely wrong.
+        c._track_heating_rate(35.0, 3, t + 60.0)
+        self._cool(c, [35.0, 34.5], start=t + 3600.0)
+
+        rows = [r for r in c._crossing_log if r["src"] == "idle"]
+        assert [r["water"] for r in rows] == [29.5, 29.0, 34.5], \
+            "35.0 anchors the new cooldown; it is not a crossing of it"
+        assert rows[-1]["secs"] == 5400, "this cooldown only, not the run before it"
+        assert rows[-1]["rate"] == pytest.approx(-0.3333, abs=1e-3)
+
+    def test_no_cooling_row_ever_reports_the_water_rising(self):
+        """The maintenance band, where the thermostat cycles every couple of hours and
+        every cycle used to leave one of these behind."""
+        c = self._idle_coord()
+        t = 0.0
+        for cycle in range(3):
+            t = self._cool(c, [39.5, 39.0, 38.5], start=t)
+            c._track_heating_rate(39.5, 3, t + 60.0)
+            t += 3600.0
+        rising = [r for r in c._crossing_log
+                  if r["src"] == "idle" and (r["rate"] or 0) > 0]
+        assert rising == [], f"cooling rows with the water rising: {rising}"
+
+
+class TestTheDevOptionsFile:
+    """mspa_dev.yaml: the development options, without hand-editing .storage.
+
+    Switching on the crossing log used to mean stopping Home Assistant and editing one
+    entry of a single-line JSON file holding every integration on the system. That is
+    not a reasonable price for a log, and the risk of it is all downside — a broken
+    core.config_entries loses the whole installation's configuration, not one option.
+    """
+
+    def _read(self, tmp_path, text):
+        from custom_components.mspa.dev_options import read_dev_options
+        path = tmp_path / "mspa_dev.yaml"
+        if text is not None:
+            path.write_text(text, encoding="utf-8")
+        return read_dev_options(str(path))
+
+    def test_no_file_sets_nothing(self, tmp_path):
+        assert self._read(tmp_path, None) == {}
+
+    def test_an_empty_file_sets_nothing(self, tmp_path):
+        """A file holding only comments parses as None, not as a mapping."""
+        assert self._read(tmp_path, "# nothing here yet\n") == {}
+
+    def test_it_reads_the_options_it_owns(self, tmp_path):
+        assert self._read(tmp_path, "crossing_log: true\n"
+                                    "outdoor_sensor: sensor.wall\n") == {
+            "crossing_log": True, "outdoor_sensor": "sensor.wall"}
+
+    def test_an_option_it_does_not_own_is_ignored(self, tmp_path):
+        """Or the file becomes a second configuration surface competing with the
+        dialog, and a key here could silently override something the user set in the
+        UI."""
+        assert self._read(tmp_path, "crossing_log: true\n"
+                                    "heater_power_heat: 1\n") == {"crossing_log": True}
+
+    def test_a_file_that_is_not_a_mapping_is_ignored(self, tmp_path):
+        assert self._read(tmp_path, "- crossing_log\n") == {}
+
+    def test_a_malformed_file_does_not_stop_the_integration(self, tmp_path):
+        """The alternative is an installation that will not start because of a typo in
+        a diagnostic switch."""
+        assert self._read(tmp_path, "crossing_log: [true\n") == {}
+
+    def test_the_file_wins_over_the_config_entry(self):
+        """So an option set by hand in .storage before this file existed can be turned
+        off from here, which it could not be if the entry won."""
+        from custom_components.mspa.const import CONF_CROSSING_LOG
+        c = _coord()
+        c.config_entry = type("E", (), {"options": {CONF_CROSSING_LOG: True}})()
+        c._dev_options = {CONF_CROSSING_LOG: False}
+        assert c.crossing_log_enabled is False
+
+    def test_the_config_entry_still_works_without_a_file(self):
+        from custom_components.mspa.const import CONF_CROSSING_LOG, CONF_OUTDOOR_SENSOR
+        c = _coord()
+        c.config_entry = type("E", (), {"options": {
+            CONF_CROSSING_LOG: True, CONF_OUTDOOR_SENSOR: "sensor.wall"}})()
+        c._dev_options = {}
+        assert c.crossing_log_enabled is True
+        assert c.outdoor_sensor == "sensor.wall"
+
+    def test_both_options_reach_the_things_that_read_them(self, tmp_path):
+        from custom_components.mspa.const import CONF_CROSSING_LOG, CONF_OUTDOOR_SENSOR
+        c = _coord()
+        c.config_entry = type("E", (), {"options": {}})()
+        c._dev_options = self._read(
+            tmp_path, f"{CONF_CROSSING_LOG}: true\n"
+                      f"{CONF_OUTDOOR_SENSOR}: sensor.nes25_outdoor_temperature\n")
+        assert c.crossing_log_enabled is True
+        assert c.outdoor_sensor == "sensor.nes25_outdoor_temperature"
+
+    def test_an_unset_option_is_still_the_default(self):
+        c = _coord()
+        c.config_entry = type("E", (), {"options": {}})()
+        c._dev_options = {}
+        assert c.crossing_log_enabled is False
+        assert c.outdoor_sensor is None
