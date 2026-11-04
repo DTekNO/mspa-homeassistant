@@ -1529,6 +1529,24 @@ class MSpaHeatScheduleStartSensor(MSpaSensorEntity):
             return None
 
         start_at_utc = target_utc - timedelta(minutes=minutes_needed)
+        # To the minute, the precision this actually has — the same discipline cea0c15
+        # applied to Ready at.  `minutes_needed` is a float, so without this the state
+        # and the `start_at` attribute carry sub-second noise and change on every poll.
+        # That is invisible on screen, where both render as HH:MM, and expensive
+        # underneath: inside _START_TRACK_WITHIN_MIN the hold is off by design and the
+        # spa is in the 30 s ACTIVE tier, so 28.10 wrote 78 states in 39 minutes, each
+        # one a recorder row, a push to every open UI and a trigger for anything
+        # automating on this entity.  Rounded, the same window writes about seven.
+        #
+        # Truncating drops seconds rather than rounding to the nearest minute, so the
+        # displayed start is never later than the computed one: it errs toward starting
+        # early, which is the safe direction for arriving on time.
+        #
+        # Display only.  The coordinator keeps full precision for the moment it actually
+        # fires (`_maybe_trigger_schedule`), so the two can differ by under a minute —
+        # below what either of them shows, and both still plan from the same estimate,
+        # which is the property c5010d3 was about.
+        start_at_utc = start_at_utc.replace(second=0, microsecond=0)
         return (target_utc, target_temp, start_at_utc)
 
     def display_plan(self):

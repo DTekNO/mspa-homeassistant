@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Heat schedule start rewrote itself every 30 s for the last 45 minutes before a
+  start.** The planned start carried sub-second precision, so the state and the
+  `start_at` attribute took a new value on every poll while rendering as the same
+  HH:MM — 78 recorder rows, UI pushes and automation triggers per run. It is now
+  published to the minute, as Ready at already was.
+
 - **A cooling row could report the water rising.** The cooling recorder's previous
   crossing survived a heating cycle, so the first row after a run was measured from a
   temperature read before it started. Cleared when the heater comes on, and preheat now

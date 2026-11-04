@@ -1837,3 +1837,91 @@ class TestTheDisplayRefreshesOnMovement:
         once = r(raw, now=self._NOW)
         assert r(raw, now=self._NOW, shown=once) == once
         assert r(raw, now=self._NOW, shown=once) == once
+
+
+class TestTheStartIsPublishedToTheMinute:
+    """The planned start carries no sub-minute precision, because it has none.
+
+    `minutes_needed` is a float, so before this the state and the `start_at`
+    attribute took a new value on every poll while rendering as the same HH:MM.
+    Inside _START_TRACK_WITHIN_MIN the slew hold is off by design and the spa is in
+    the 30 s ACTIVE tier whenever the filter runs, so the 28.10.2026 run wrote 78
+    states in the 39 minutes before ignition — each one a recorder row, a push to
+    every open UI and a trigger for anything automating on the entity.
+    """
+
+    # 2.0 exactly puts the raw start on :00 — 20 °C to 40 °C at 2 °C/h is 600 min to
+    # the second — which would make every assertion here pass with or without the
+    # rounding. That is exactly how a guard stops guarding without anyone noticing,
+    # so the rate lands the start mid-minute and _raw_has_seconds enforces it.
+    def _coord(self, heat_rate=2.0003):
+        return MockCoordinator(
+            scheduled_ready_at=_NOW_UTC + timedelta(hours=12),
+            schedule_target_temp=40.0, water_temp=20.0, heat_rate=heat_rate,
+        )
+
+    def _raw_has_seconds(self, c):
+        """Fail loudly if the fixture stops exercising the thing under test."""
+        raw = self._raw(c)
+        assert (raw.second, raw.microsecond) != (0, 0), (
+            f"fixture no longer produces a sub-minute start ({raw.isoformat()}); "
+            "this test would pass unrounded")
+        return raw
+
+    def _published(self, c):
+        return _HeatScheduleStub(c, MockConfigEntry())._schedule_data()[2]
+
+    @staticmethod
+    def _raw(c):
+        """The start before rounding, from the same inputs _schedule_data uses."""
+        mins = _segmented_heating_minutes(c.scheduling_temp(),
+                                          c.schedule_target_temp, c)
+        return c.scheduled_ready_at - timedelta(minutes=mins)
+
+    def test_the_start_carries_no_seconds(self):
+        c = self._coord()
+        self._raw_has_seconds(c)
+        s = self._published(c)
+        assert (s.second, s.microsecond) == (0, 0), s.isoformat()
+
+    def test_truncation_never_moves_the_start_later(self):
+        """Erring early is the safe direction — it cannot make the tub arrive late."""
+        c = self._coord()
+        raw, shown = self._raw_has_seconds(c), self._published(c)
+        assert shown < raw
+        assert raw - shown < timedelta(minutes=1)
+        assert shown == raw.replace(second=0, microsecond=0)
+
+    def test_sub_minute_drift_no_longer_republishes(self):
+        """The regression itself.
+
+        A sweep of heat rates whose raw starts all fall inside one minute used to
+        yield a distinct timestamp apiece; rounded, they collapse to the one minute
+        they share, or two if the sweep straddles a boundary.
+        """
+        rates = [2.0 + i * 0.0001 for i in range(20)]
+        coords = [self._coord(r) for r in rates]
+        raws = {self._raw(c) for c in coords}
+        shown = {self._published(c) for c in coords}
+        assert len(raws) == len(rates), "the sweep must actually move the raw start"
+        assert max(raws) - min(raws) < timedelta(minutes=1), "sweep too wide to prove this"
+        assert len(shown) <= 2, f"still republishing sub-minute drift: {sorted(shown)}"
+
+    def test_the_live_attribute_is_rounded_too(self):
+        """`start_at` is the live plan an automation acts on, and it is the half that
+        actually churned: the state is held by the slew for most of the wait, while
+        this one is recomputed every poll by design."""
+        c = self._coord()
+        self._raw_has_seconds(c)
+        start_at = _heat_schedule_attrs(c)["start_at"]
+        assert start_at.endswith(":00+00:00"), start_at
+
+    def test_the_mirrors_inherit_it(self):
+        """All four entities read the same plan, so none of them can churn alone."""
+        c = self._coord()
+        self._raw_has_seconds(c)
+        stub = _HeatScheduleStub(c, MockConfigEntry())
+        state = stub.display_schedule()[1]
+        assert (state.second, state.microsecond) == (0, 0)
+        assert MSpaHeatScheduleSensor.extra_state_attributes.fget(
+            _mirror(stub, c))["start_at"].endswith(":00+00:00")
