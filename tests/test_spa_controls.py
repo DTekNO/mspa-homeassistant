@@ -9,6 +9,7 @@ Covers the tangible integration behaviours rather than internal math:
 Run with: python -m pytest tests/test_spa_controls.py -v
 """
 import asyncio
+import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -251,6 +252,60 @@ class TestFilterHeaterCoupling:
         _run(c.set_feature_state("heater", "on"))
         assert "filter" not in c._pending_changes
         c.api.set_filter_state.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UVC keep-filter option — filter-on rides along with UVC so the pump keeps running
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestUvcKeepFilter:
+
+    def _coord(self, keep_filter, filter_state="on"):
+        c = _trigger_coord()
+        c.config_entry = _make_config_entry({"uvc_keep_filter": keep_filter})
+        c._last_data["filter"] = filter_state
+        c.api.set_uvc_state = AsyncMock(return_value={"message": "SUCCESS"})
+        c.api.send_device_command = AsyncMock(return_value={"message": "SUCCESS"})
+        return c
+
+    @pytest.mark.parametrize("state, value", [("on", 1), ("off", 0)])
+    def test_option_on_sends_filter_with_uvc(self, state, value):
+        c = self._coord(keep_filter=True)
+        _run(c.set_feature_state("uvc", state))
+        c.api.set_uvc_state.assert_awaited_once_with(value, filter_state=1)
+        assert c._pending_raw_command == {"uvc_state": value, "filter_state": 1}
+
+    def test_option_off_sends_uvc_alone(self):
+        c = self._coord(keep_filter=False)
+        _run(c.set_feature_state("uvc", "off"))
+        c.api.set_uvc_state.assert_awaited_once_with(0)
+
+    def test_never_starts_a_stopped_filter(self):
+        c = self._coord(keep_filter=True, filter_state="off")
+        _run(c.set_feature_state("uvc", "on"))
+        c.api.set_uvc_state.assert_awaited_once_with(1)
+
+    def test_does_not_undo_a_pending_filter_off(self):
+        """Filter off then UVC before the next poll: the filter still reads on."""
+        c = self._coord(keep_filter=True)
+        c._pending_changes = {"filter": "off"}
+        _run(c.set_feature_state("uvc", "off"))
+        c.api.set_uvc_state.assert_awaited_once_with(0)
+
+    def test_retry_keeps_the_filter_until_uvc_confirms(self):
+        c = self._coord(keep_filter=True)
+        c._external_change_until = None
+        c._last_snapshot = {}
+        c._last_heat_state = None
+        _run(c.set_feature_state("uvc", "on"))
+
+        c._rapid_poll_until = time.time() - 1      # unconfirmed when the window ends
+        _run(c._check_adaptive_polling({"filter": "on", "uvc": "off"}))
+        c.api.send_device_command.assert_awaited_once_with(
+            {"uvc_state": 1, "filter_state": 1})
+
+        _run(c._check_adaptive_polling({"filter": "on", "uvc": "on"}))
+        assert c._pending_raw_command == {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

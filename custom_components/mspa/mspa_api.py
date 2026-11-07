@@ -567,8 +567,11 @@ class MSpaApiClient:
     async def set_ozone_state(self, state: int):
         return await self.send_device_command({"ozone_state": state})
 
-    async def set_uvc_state(self, state: int):
-        return await self.send_device_command({"uvc_state": state})
+    async def set_uvc_state(self, state: int, filter_state: int | None = None):
+        command = {"uvc_state": state}
+        if filter_state is not None:
+            command["filter_state"] = filter_state
+        return await self.send_device_command(command)
 
     async def set_temperature_setting(self, temp: int):
         return await self.send_device_command({"temperature_setting": temp*2})
