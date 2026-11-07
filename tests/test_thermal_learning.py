@@ -335,9 +335,10 @@ class TestNoStepAtHandover:
         it is about to move in does."""
         c = self._coord_mid_dwell()
         before = c.scheduling_temp()
-        c.reanchor_for_direction_change()
         from datetime import datetime, timezone
-        c.heating_since = datetime.now(timezone.utc)      # as the real transition does
+        now = datetime.now(timezone.utc)
+        c.reanchor_for_direction_change(now)
+        c.heating_since = now                  # one timestamp, as the real transition does
         after = c.scheduling_temp()
         assert after == pytest.approx(before, abs=0.02), (
             f"plan temperature stepped {before:.3f} -> {after:.3f} at handover")
