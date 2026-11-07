@@ -1227,6 +1227,9 @@ class TestWarmingWithTheHeaterOff:
     def test_warming_while_heating_still_extrapolates(self):
         """The heater's rate is the right model when the heater is what is doing it."""
         c = self._coord(rising=True, heating=True)
+        # Inside the stale-anchor cap: at 2 °C/h a band takes 15 min and the cap is
+        # three bands, so the fixture's 45-minute anchor sits exactly on it.
+        c.temp_anchor_time = datetime.now(timezone.utc) - timedelta(minutes=30)
         est = c.scheduling_temp()
         assert est > 30.25, "should have climbed above the anchor"
 

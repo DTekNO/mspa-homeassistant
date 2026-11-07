@@ -1647,14 +1647,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.circulating_since = None
 
             heater_now_active = (heat_state == _HEAT_STATE_FULL)
+            # One timestamp for the anchor and heating_since. Stamped separately,
+            # heating_since lands microseconds after the anchor, scheduling_temp's
+            # stale-direction guard fires, and the carried-over position is lost.
+            heater_start = datetime.now(timezone.utc)
             if heater_now_active and not self._heat_was_active:
                 # Strictly before heating_since is set below, or scheduling_temp's
                 # stale-direction guard fires and there is nothing left to carry over.
                 # R3: the estimate must not step at handover merely because the heater
                 # changed state.
-                self.reanchor_for_direction_change()
+                self.reanchor_for_direction_change(heater_start)
             if heater_now_active and self.heating_since is None:
-                self.heating_since = datetime.now(timezone.utc)
+                self.heating_since = heater_start
                 # After heating_since, so the hold is priced from the same position the
                 # scheduler just handed over — the re-anchored one, not the raw reading.
                 self.begin_thermal_hold(self.scheduling_temp(), new_target)
@@ -2071,7 +2075,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.temp_anchor_rising   = rising
         self._anchor_prev_reading = new_temp
 
-    def reanchor_for_direction_change(self) -> None:
+    def reanchor_for_direction_change(self, now: datetime | None = None) -> None:
         """Carry the extrapolated position across a change of heating direction — R3.
 
         The water does not move when the heater switches on; only the direction it is
@@ -2101,7 +2105,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if est is None:
             return
         prev = self.temp_anchor_temp
-        self.temp_anchor_time = datetime.now(timezone.utc)
+        self.temp_anchor_time = now or datetime.now(timezone.utc)
         self.temp_anchor_temp = est
         self.temp_anchor_rising = True
         _LOGGER.debug(
