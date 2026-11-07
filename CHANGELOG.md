@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Option to keep the filter running when switching UVC.** On some UVC models (seen on a
+  Frame Mono), switching UVC either way with the heater off also stops the pump. With
+  *Keep the filter running when switching UVC* on, the UVC command carries
+  `filter_state: 1` in the same device command, and the retry does too. It is only sent
+  when the filter is on and not being switched off, so it never starts a stopped filter.
+  Off by default.
+
 ### Changed
 
 - **The live estimate wanders much less.** Measured against the 15–16.10 run: the window

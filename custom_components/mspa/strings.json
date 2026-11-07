@@ -49,6 +49,7 @@
           "track_temperature_unit": "Reset the spa's °C/°F after a power cut",
           "always_enforce_unit": "Check the unit on every poll, not only after a power cut",
           "restore_state": "Restore the previous settings after a power cut",
+          "uvc_keep_filter": "Keep the filter running when switching UVC",
           "weather_entity": "Weather Entity (optional)",
           "schedule_target_temp": "Target temperature for a scheduled heat-up",
           "offline_after_minutes": "Call the spa offline after (minutes)"
@@ -61,6 +62,7 @@
           "track_temperature_unit": "The spa forgets whether it is set to Celsius or Fahrenheit when it loses power. When it comes back online, set it again to match Home Assistant.",
           "always_enforce_unit": "For spas that forget the unit without ever losing power. Checks on every update and sends a command only when the unit is actually wrong.",
           "restore_state": "When the spa comes back online, send back the target temperature and settings it had before the power cut. This writes to the spa, so leave it off if you would rather nothing were set on your behalf.",
+          "uvc_keep_filter": "Some spas stop the filter pump when UVC is switched while the heater is off, and frequent pump restarts can cause an F1 fault. With this on, UVC commands keep the filter on. It never starts a stopped filter.",
           "weather_entity": "Select a weather entity (e.g. Met.no, OpenWeatherMap) to bias heating estimates by ambient temperature and wind speed. Historical sessions are weighted by how closely their conditions match the current weather.",
           "schedule_target_temp": "What a scheduled heat-up aims for, as opposed to the setpoint you choose by hand. Also adjustable at any time from the Schedule Target Temperature entity.",
           "offline_after_minutes": "How long the spa may stay silent before the Connectivity sensor reports it offline. Short gaps are normal: a broadband blip or a missed cloud poll clears in well under a minute."

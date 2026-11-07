@@ -73,6 +73,7 @@ from .const import (
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
+    CONF_UVC_KEEP_FILTER,
     CONF_WEATHER_ENTITY,
     CONF_CROSSING_LOG,
     CONF_OUTDOOR_SENSOR,
@@ -5172,6 +5173,18 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if feature == "heater" and numerical_state == 1:
                 pump_started = await self._start_pump_before_heater()
 
+            # On some UVC models (seen on a Frame Mono), switching UVC with the heater
+            # off also stops the pump. Sending filter-on in the same command keeps it
+            # running. Only sent while the filter is on and not being switched off, so
+            # it never starts a stopped filter.
+            keep_filter = (
+                feature == "uvc"
+                and self.config_entry.options.get(CONF_UVC_KEEP_FILTER, False)
+                and self._last_data.get("filter") == "on"
+                and self._pending_changes.get("filter") != "off"
+            )
+            extra = {"filter_state": 1} if keep_filter else {}
+
             # Build raw command for potential retry
             if feature == "bubble":
                 bubble_level = max(1, self._last_data.get("bubble_level") or 1)
@@ -5179,7 +5192,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 await api_method(numerical_state, bubble_level)
                 raw_command = {"bubble_state": numerical_state, "bubble_level": bubble_level}
             else:
-                response = await api_method(numerical_state)
+                response = await api_method(numerical_state, **extra)
                 # The response was previously discarded, so a command the spa *refused*
                 # still armed the confirmation wait and surfaced 15 s later as "Spa did
                 # not confirm" — indistinguishable from a command that was accepted and
@@ -5194,6 +5207,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                     )
                 raw_key = _PENDING_TO_RAW_KEY.get(feature)
                 raw_command = {raw_key: numerical_state} if raw_key else {}
+                raw_command.update(extra)  # the retry must keep the filter on too
 
             # Turning off the filter also forces the heater off (handled in the API
             # layer).  Register that implicit change here so _pending_changes stays
@@ -5369,6 +5383,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 raw_key = _PENDING_TO_RAW_KEY.get(key)
                 if raw_key:
                     self._pending_raw_command.pop(raw_key, None)
+                # A filter-on sent along with UVC (uvc_keep_filter) is not tracked on
+                # its own, so it stays in the retry until UVC confirms.
+                if key == "uvc" and "filter" not in self._pending_changes:
+                    self._pending_raw_command.pop("filter_state", None)
 
             if confirmed and not self._pending_changes:
                 self._command_retry_count = 0
