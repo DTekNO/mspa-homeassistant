@@ -5372,6 +5372,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             if confirmed and not self._pending_changes:
                 self._command_retry_count = 0
+                # Raw keys without a pending counterpart (e.g. the bubble_level that
+                # accompanies a bubble on/off) are never pruned above; drop them so a
+                # later retry does not resend them.
+                self._pending_raw_command.clear()
 
         # --- Phase 2: Check rapid poll timeout / retry ---
         if self._rapid_poll_until and time.time() > self._rapid_poll_until:
@@ -5497,6 +5501,10 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
     def _enable_rapid_polling(self, expected_changes: dict, raw_command: dict = None) -> None:
         """Enable rapid polling and track expected changes."""
+        if not self._pending_changes:
+            # Nothing is awaiting confirmation, so any raw keys left over from an
+            # earlier command are stale and must not ride along in a retry.
+            self._pending_raw_command.clear()
         self._pending_changes.update(expected_changes)
         if raw_command:
             self._pending_raw_command.update(raw_command)
