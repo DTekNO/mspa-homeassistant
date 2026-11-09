@@ -5194,18 +5194,24 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # running. Only sent while the filter is on and not being switched off, so
             # it never starts a stopped filter.
             #
-            # Not sent while the spa is actually heating: the pump is interlocked with
-            # the heater then, so the spa keeps it running on its own and the command
-            # can stay the single field it should be. Deliberately `heat_state` and not
-            # `heater`: heater_state stays 1 through a thermostat standby, where that
-            # interlock no longer holds, and skipping the rider there would drop the
-            # protection in the one state that looks heated but is not.
+            # Not sent while the heater switch is on: that is the state the spa keeps
+            # the pump up for by itself, so the command can stay the single field it
+            # should be.
+            #
+            # Gated on `heater` — the spa's own heater_state — and deliberately not on
+            # `heat_state`, nor on the climate entity's hvac mode. heater_state is what
+            # the spa controls; the climate mode is our abstraction on top of it, and
+            # compensating for device behaviour from our own modelling would couple the
+            # two. A thermostat standby holds heater_state at 1, so the rider is skipped
+            # there too: whether the pump interlock still holds in standby has not been
+            # measured, and the narrower command is the right default in reverse-
+            # engineered territory.
             keep_filter = (
                 feature == "uvc"
                 and self.config_entry.options.get(CONF_UVC_KEEP_FILTER, False)
                 and self._last_data.get("filter") == "on"
                 and self._pending_changes.get("filter") != "off"
-                and self._last_data.get("heat_state") != _HEAT_STATE_FULL
+                and self._last_data.get("heater") != "on"
             )
             extra = {"filter_state": 1} if keep_filter else {}
 

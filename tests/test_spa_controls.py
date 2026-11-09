@@ -307,23 +307,26 @@ class TestUvcKeepFilter:
         assert "filter_state" not in c._pending_raw_command
         assert c._pending_raw_command == {"heater_state": 0}
 
-    def test_not_sent_while_the_spa_is_heating(self):
-        """Actually heating: the pump is interlocked with the heater, so the spa keeps
-        it running and the command stays the single field it should be."""
+    def test_not_sent_while_the_heater_switch_is_on(self):
+        """The spa keeps the pump up for its own heater, so the command stays the single
+        field it should be. Gated on the spa's heater switch, not on our climate mode."""
         c = self._coord(keep_filter=True)
-        c._last_data["heat_state"] = 3                  # _HEAT_STATE_FULL
+        c._last_data["heater"] = "on"
+        c._last_data["heat_state"] = 3                  # heating
         _run(c.set_feature_state("uvc", "off"))
         c.api.set_uvc_state.assert_awaited_once_with(0)
         assert "filter_state" not in c._pending_raw_command
 
-    def test_sent_in_thermostat_standby(self):
-        """heater_state stays 1 through a standby but the interlock does not, so the
-        rider is still needed in the state that looks heated and is not."""
+    def test_not_sent_in_thermostat_standby_either(self):
+        """A standby holds heater_state at 1. The switch is what is gated on, so the
+        rider is skipped here too rather than widening the command on an interlock
+        nobody has measured in this state."""
         c = self._coord(keep_filter=True)
         c._last_data["heater"] = "on"
         c._last_data["heat_state"] = 4                  # standby
         _run(c.set_feature_state("uvc", "off"))
-        c.api.set_uvc_state.assert_awaited_once_with(0, filter_state=1)
+        c.api.set_uvc_state.assert_awaited_once_with(0)
+        assert "filter_state" not in c._pending_raw_command
 
     def test_a_filter_off_after_the_uvc_command_overwrites_the_rider(self):
         """Filter off arrives while the UVC command is already queued for retry:

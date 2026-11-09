@@ -1109,7 +1109,7 @@ On some UVC models, switching UVC on or off while the heater is off also stops t
 
 When enabled, a UVC command also sends filter-on in the same command, so the pump keeps running. It is only sent when the filter is already on, so it never starts a stopped pump. It is off by default, so a spa that behaves oddly with the combined command can simply be switched back.
 
-It is not sent while the spa is actually heating: the pump is interlocked with the heater then, so the spa keeps it running without being asked and the command stays a single instruction.
+It is not sent while the spa's heater switch is on: the spa keeps the pump running itself then, so the command stays a single instruction.
 
 This only covers commands sent from Home Assistant. Switching UVC — or the heater — at the spa's own control panel bypasses the integration entirely, so the pump will stop there just as it always did.
 
