@@ -292,6 +292,29 @@ class TestUvcKeepFilter:
         _run(c.set_feature_state("uvc", "off"))
         c.api.set_uvc_state.assert_awaited_once_with(0)
 
+    def test_a_filter_off_after_the_uvc_command_overwrites_the_rider(self):
+        """Filter off arrives while the UVC command is already queued for retry:
+        `filter` maps to `filter_state`, so the queued 1 must become 0 and the retry
+        must not switch the filter back on."""
+        c = self._coord(keep_filter=True)
+        c._external_change_until = None
+        c._last_snapshot = {}
+        c._last_heat_state = None
+        _run(c.set_feature_state("uvc", "on"))
+        assert c._pending_raw_command["filter_state"] == 1
+
+        _run(c.set_feature_state("filter", "off"))
+        assert c._pending_raw_command["filter_state"] == 0
+        assert c._pending_raw_command["heater_state"] == 0      # filter-off coupling
+
+        c.api.send_device_command.reset_mock()
+        c._rapid_poll_until = time.time() - 1
+        _run(c._check_adaptive_polling({"filter": "on", "uvc": "off"}))   # neither confirmed
+        c.api.send_device_command.assert_awaited_once()
+        sent = c.api.send_device_command.await_args.args[0]
+        assert sent["filter_state"] == 0
+        assert sent["uvc_state"] == 1
+
     def test_retry_keeps_the_filter_until_uvc_confirms(self):
         c = self._coord(keep_filter=True)
         c._external_change_until = None
