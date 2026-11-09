@@ -7,19 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **The position carried over at the start of heating was thrown away.** The re-anchor
-  and `heating_since` were stamped by separate `datetime.now()` calls, so
-  `heating_since` landed microseconds after the anchor and the stale-direction guard
-  in `scheduling_temp` fell back to the reading. The thermal hold was then priced from
-  the reading, not the carried-over position. Both now share one timestamp. Caught by
-  `test_the_position_survives_the_direction_change`, which only passed where two
-  consecutive `now()` calls returned the same time.
-- **`test_warming_while_heating_still_extrapolates` sat exactly on the stale-anchor
-  cap** (45 minutes at 2 °C/h) and failed by run time alone. Its anchor is now
-  30 minutes old.
-
 ### Changed
 
 - **The live estimate wanders much less.** Measured against the 15–16.10 run: the window

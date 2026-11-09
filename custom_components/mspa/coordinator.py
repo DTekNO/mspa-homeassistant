@@ -2061,10 +2061,6 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         # anchor, the guard fires, and the carried-over position is lost.
         heater_start = datetime.now(timezone.utc)
         if heater_now_active and not self._heat_was_active:
-            # Anchored at heater_start, the instant heating_since takes below. The
-            # guard fires when heating_since is strictly later than the anchor, so
-            # ordering the anchor first is what trips it; only sharing the stamp
-            # keeps the carried-over position.
             # R3: the estimate must not step at handover merely because the heater
             # changed state.
             self.reanchor_for_direction_change(heater_start)
@@ -2101,6 +2097,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         position is kept, the direction is refreshed, and the guard no longer has a
         stale anchor to reject. Called from the heater transition, before
         `heating_since` is set, so the extrapolation still sees the old direction.
+
+        `now` is the caller's own stamp, so the anchor and `heating_since` carry the
+        identical instant. The guard is a strict `heating_since > anchor`, so taking a
+        second `now()` here would trip it and discard what this just carried over. Do
+        not round either stamp to make them agree: equal is exact, and rounding to the
+        second would both hide a reintroduced second `now()` and risk landing the anchor
+        before `circulating_since`, which is a guard of its own.
 
         What it must not do is launder a stale extrapolation into a fresh anchor. That
         18.0 was itself the product of a sixteen-hour projection, and re-anchoring on it
