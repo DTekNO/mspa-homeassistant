@@ -343,6 +343,34 @@ class TestNoStepAtHandover:
         assert after == pytest.approx(before, abs=0.02), (
             f"plan temperature stepped {before:.3f} -> {after:.3f} at handover")
 
+    def test_the_coordinator_transition_keeps_the_position(self, monkeypatch):
+        """Drives the transition the coordinator itself runs, not a copy of it.
+
+        Consecutive `datetime.now()` calls differ on real hardware, so the clock here
+        advances a microsecond per call. A second `now()` for `heating_since` then
+        lands after the anchor and the guard discards the carried-over position.
+        """
+        from datetime import datetime, timedelta, timezone
+        from custom_components.mspa import coordinator as coord_mod
+
+        tick = {"t": datetime.now(timezone.utc)}
+
+        class _Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                tick["t"] += timedelta(microseconds=1)
+                return tick["t"]
+
+        c = self._coord_mid_dwell()
+        c._heat_was_active = False
+        before = c.scheduling_temp()
+        monkeypatch.setattr(coord_mod, "datetime", _Clock)
+        c._apply_heater_transition(True, 39.0)
+        after = c.scheduling_temp()
+        assert c.heating_since is not None
+        assert after == pytest.approx(before, abs=0.02), (
+            f"plan temperature stepped {before:.3f} -> {after:.3f} at handover")
+
     def test_without_the_fix_the_guard_would_discard_it(self):
         """Pins the defect this exists for: set heating_since without re-anchoring and
         the guard falls back to the raw reading."""
