@@ -759,31 +759,28 @@ class TestStaleRawKeys:
         c.api.set_bubble_state = AsyncMock(return_value={"message": "SUCCESS"})
         return c
 
-    def test_a_confirmed_bubble_level_is_not_resent_by_a_later_retry(self):
-        """Bubbles turning themselves back on (issue #29).
+    def test_a_leftover_raw_key_is_dropped_once_nothing_is_pending(self):
+        """Issue #29: a raw key with no pending counterpart was never pruned.
 
-        Bubble off sends `bubble_level: 1` — the level is >= 1 even when switching off —
-        but registers only `{"bubble": "off"}`. Phase 1 prunes raw keys by their pending
-        counterpart, and `bubble_level` has none, so it is never dropped. A later command
-        the spa does not confirm then retries it, and the spa reads a level write as
-        bubbles on.
+        Phase 1 prunes by pending key, so the `bubble_level` that used to accompany a
+        bubble-off sat in the payload forever and a later retry resent it. Bubble-off
+        no longer sends a level at all, so the leftover is seeded directly here: the
+        guard has to hold for any untracked key, not only that one.
         """
         c = self._coord()
-        c._last_data["bubble"] = "on"
-        c._last_data["bubble_level"] = 1
+        _run(c.set_feature_state("ozone", "on"))
+        c._pending_raw_command["bubble_level"] = 1        # no pending counterpart
 
-        _run(c.set_feature_state("bubble", "off"))
-        assert c._pending_raw_command.get("bubble_level") == 1, "the level rides along"
+        _run(c._check_adaptive_polling({"ozone": "on"}))
+        assert not c._pending_changes, "ozone on was confirmed"
+        assert c._pending_raw_command == {}, (
+            f"leftover survived confirmation: {c._pending_raw_command}")
 
-        _run(c._check_adaptive_polling({"bubble": "off"}))
-        assert not c._pending_changes, "bubble off was confirmed"
-        assert "bubble_level" not in c._pending_raw_command, (
-            f"stale level survived confirmation: {c._pending_raw_command}")
-
+        # ...and a later command the spa does not confirm retries only its own keys.
         _run(c.set_feature_state("filter", "off"))
         c._rapid_poll_until = time.time() - 1
         c.api.send_device_command.reset_mock()
-        _run(c._check_adaptive_polling({"filter": "on", "bubble": "off"}))
+        _run(c._check_adaptive_polling({"filter": "on"}))
 
         c.api.send_device_command.assert_awaited_once()
         sent = c.api.send_device_command.await_args.args[0]
@@ -799,3 +796,64 @@ class TestStaleRawKeys:
         _run(c.set_feature_state("ozone", "on"))
         assert c._pending_raw_command == {"ozone_state": 1}, (
             f"leftovers joined the new command: {c._pending_raw_command}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bubble command payload — off is one field, on carries a usable level
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBubbleCommandLevel:
+
+    def _coord(self, level, bubble="off"):
+        c = _trigger_coord()
+        c.config_entry = _make_config_entry()
+        c._external_change_until = None
+        c._last_snapshot = {}
+        c._last_heat_state = None
+        c._last_data["bubble"] = bubble
+        c._last_data["bubble_level"] = level
+        c.api.set_bubble_state = AsyncMock(return_value={"message": "SUCCESS"})
+        return c
+
+    def test_off_sends_no_level_at_all(self):
+        """Switching off is one instruction. A level sent on its own reads as *on*."""
+        c = self._coord(level=2, bubble="on")
+        _run(c.set_feature_state("bubble", "off"))
+        c.api.set_bubble_state.assert_awaited_once_with(0, None)
+        assert c._pending_raw_command == {"bubble_state": 0}
+
+    def test_on_lifts_a_zero_level_to_one(self):
+        """`bubble_state: 1` alone does not reliably start the bubbles on every spa,
+        and a spa that is off reports level 0, so give it a usable one."""
+        c = self._coord(level=0)
+        _run(c.set_feature_state("bubble", "on"))
+        c.api.set_bubble_state.assert_awaited_once_with(1, 1)
+        assert c._pending_raw_command == {"bubble_state": 1, "bubble_level": 1}
+
+    def test_on_lifts_a_missing_level_to_one(self):
+        c = self._coord(level=None)
+        del c._last_data["bubble_level"]
+        _run(c.set_feature_state("bubble", "on"))
+        c.api.set_bubble_state.assert_awaited_once_with(1, 1)
+
+    def test_on_keeps_a_level_already_set(self):
+        """A speed the user chose survives the switch — spas that remember it keep it."""
+        c = self._coord(level=3)
+        _run(c.set_feature_state("bubble", "on"))
+        c.api.set_bubble_state.assert_awaited_once_with(1, 3)
+        assert c._pending_raw_command == {"bubble_state": 1, "bubble_level": 3}
+
+    def test_the_set_bubble_service_follows_the_same_rule(self):
+        """The service and the switch must not drift apart."""
+        c = self._coord(level=2, bubble="on")
+        svc = type("ServiceCall", (), {"data": {coordinator_mod.ATTR_STATE: "off"}})()
+        _run(c.set_bubble(svc))
+        c.api.set_bubble_state.assert_awaited_once_with(0, None)
+        assert c._pending_raw_command == {"bubble_state": 0}
+
+    def test_the_set_bubble_service_lifts_a_zero_level(self):
+        c = self._coord(level=0)
+        svc = type("ServiceCall", (), {"data": {coordinator_mod.ATTR_STATE: "on"}})()
+        _run(c.set_bubble(svc))
+        c.api.set_bubble_state.assert_awaited_once_with(1, 1)
+        assert c._pending_raw_command == {"bubble_state": 1, "bubble_level": 1}

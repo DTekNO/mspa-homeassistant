@@ -17,8 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never starts a stopped filter and never widens a command the spa handles itself.
   Commands from the spa's own panel are unaffected. Off by default.
 
+### Fixed
+
+- **Bubbles turned themselves back on.** A confirmed command left its raw keys in the
+  retry payload, so a later unconfirmed command resent `bubble_level`.
+
 ### Changed
 
+- **Switching the bubbles off sends only `bubble_state`.** Switching them on sends the
+  level already set, or 1 when it is zero or missing.
 - **The live estimate wanders much less.** Measured against the 15–16.10 run: the window
   widens from four to eight crossings when the target is far, and the carried lift is
   frozen for the duration of a run. Peak-to-peak wander in the first half of a long run

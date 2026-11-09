@@ -5153,6 +5153,26 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             await asyncio.sleep(_PUMP_SETTLE_SECONDS)
         return True
 
+    def _bubble_command_level(self, numerical_state: int) -> int | None:
+        """The level to send with a bubble on/off, or None to send no level at all.
+
+        **Off is one instruction.** `bubble_state: 0` alone, with no level. The level
+        used to ride along at `max(1, ...)` even when switching off, which is how a
+        retry came to resend a bare `bubble_level: 1` and turn the bubbles back on —
+        issue #29. A spa being told to stop does not need telling what speed it
+        stopped at.
+
+        **On carries a level**, because `bubble_state: 1` alone does not reliably
+        start the bubbles on every spa (seen on an OSLO). A level already set is kept,
+        so a speed the user chose survives the switch; only a missing or zero level is
+        lifted to 1. Spas that report 0 while off therefore get 1, and spas that
+        remember their level keep it — which is the point, since they do not agree.
+        """
+        if numerical_state == 0:
+            return None
+        level = self._last_data.get("bubble_level") or 0
+        return level if level >= 1 else 1
+
     async def set_feature_state(self, feature: str, state: str) -> None:
         """Set a feature state using the API map."""
         # INFO, not DEBUG: these are rare, consequential, and externally triggered.
@@ -5217,10 +5237,12 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             # Build raw command for potential retry
             if feature == "bubble":
-                bubble_level = max(1, self._last_data.get("bubble_level") or 1)
-                self._last_data["bubble_level"] = bubble_level
+                bubble_level = self._bubble_command_level(numerical_state)
                 await api_method(numerical_state, bubble_level)
-                raw_command = {"bubble_state": numerical_state, "bubble_level": bubble_level}
+                raw_command = {"bubble_state": numerical_state}
+                if bubble_level is not None:
+                    self._last_data["bubble_level"] = bubble_level
+                    raw_command["bubble_level"] = bubble_level
             else:
                 response = await api_method(numerical_state, **extra)
                 # The response was previously discarded, so a command the spa *refused*
@@ -5302,14 +5324,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             bubble_state = service.data.get(ATTR_STATE)
             _LOGGER.debug("Setting bubble state to %s", bubble_state)
             numerical_state = 1 if bubble_state.lower() == "on" else 0
-            bubble_level = max(1, self._last_data.get("bubble_level") or 1)
+            bubble_level = self._bubble_command_level(numerical_state)
             await self.api.set_bubble_state(numerical_state, bubble_level)
 
+            raw_command = {"bubble_state": numerical_state}
+            if bubble_level is not None:
+                self._last_data["bubble_level"] = bubble_level
+                raw_command["bubble_level"] = bubble_level
+
             # Enable rapid polling to quickly detect the change
-            self._enable_rapid_polling(
-                {"bubble": bubble_state},
-                {"bubble_state": numerical_state, "bubble_level": bubble_level},
-            )
+            self._enable_rapid_polling({"bubble": bubble_state}, raw_command)
             await self.async_request_refresh()
         except Exception as err:
             _LOGGER.error("Failed to set bubble state: %s", str(err))

@@ -552,8 +552,11 @@ class MSpaApiClient:
     async def set_heater_state(self, state: int):
         return await self.send_device_command({"heater_state": state})
 
-    async def set_bubble_state(self, state: int, level: int):
-        return await self.send_device_command({"bubble_state": state, "bubble_level": level})
+    async def set_bubble_state(self, state: int, level: int | None = None):
+        command = {"bubble_state": state}
+        if level is not None:
+            command["bubble_level"] = level
+        return await self.send_device_command(command)
 
     async def set_bubble_level(self, level: int):
         return await self.send_device_command({"bubble_level": level})
