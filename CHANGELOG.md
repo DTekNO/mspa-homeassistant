@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Frame Mono), switching UVC either way with the heater off also stops the pump. With
   *Keep the filter running when switching UVC* on, the UVC command carries
   `filter_state: 1` in the same device command, and the retry does too. It is only sent
-  when the filter is on and not being switched off, so it never starts a stopped filter.
-  Off by default.
+  when the filter is on, not being switched off, and the spa is not already heating, so
+  it never starts a stopped filter and never widens a command the spa handles itself.
+  Commands from the spa's own panel are unaffected. Off by default.
 
 ### Changed
 

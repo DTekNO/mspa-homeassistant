@@ -292,6 +292,24 @@ class TestUvcKeepFilter:
         _run(c.set_feature_state("uvc", "off"))
         c.api.set_uvc_state.assert_awaited_once_with(0)
 
+    def test_not_sent_while_the_spa_is_heating(self):
+        """Actually heating: the pump is interlocked with the heater, so the spa keeps
+        it running and the command stays the single field it should be."""
+        c = self._coord(keep_filter=True)
+        c._last_data["heat_state"] = 3                  # _HEAT_STATE_FULL
+        _run(c.set_feature_state("uvc", "off"))
+        c.api.set_uvc_state.assert_awaited_once_with(0)
+        assert "filter_state" not in c._pending_raw_command
+
+    def test_sent_in_thermostat_standby(self):
+        """heater_state stays 1 through a standby but the interlock does not, so the
+        rider is still needed in the state that looks heated and is not."""
+        c = self._coord(keep_filter=True)
+        c._last_data["heater"] = "on"
+        c._last_data["heat_state"] = 4                  # standby
+        _run(c.set_feature_state("uvc", "off"))
+        c.api.set_uvc_state.assert_awaited_once_with(0, filter_state=1)
+
     def test_a_filter_off_after_the_uvc_command_overwrites_the_rider(self):
         """Filter off arrives while the UVC command is already queued for retry:
         `filter` maps to `filter_state`, so the queued 1 must become 0 and the retry

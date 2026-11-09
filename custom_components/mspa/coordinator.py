@@ -5193,11 +5193,19 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # off also stops the pump. Sending filter-on in the same command keeps it
             # running. Only sent while the filter is on and not being switched off, so
             # it never starts a stopped filter.
+            #
+            # Not sent while the spa is actually heating: the pump is interlocked with
+            # the heater then, so the spa keeps it running on its own and the command
+            # can stay the single field it should be. Deliberately `heat_state` and not
+            # `heater`: heater_state stays 1 through a thermostat standby, where that
+            # interlock no longer holds, and skipping the rider there would drop the
+            # protection in the one state that looks heated but is not.
             keep_filter = (
                 feature == "uvc"
                 and self.config_entry.options.get(CONF_UVC_KEEP_FILTER, False)
                 and self._last_data.get("filter") == "on"
                 and self._pending_changes.get("filter") != "off"
+                and self._last_data.get("heat_state") != _HEAT_STATE_FULL
             )
             extra = {"filter_state": 1} if keep_filter else {}
 
