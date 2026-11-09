@@ -1646,30 +1646,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 self.circulating_since = None
 
             heater_now_active = (heat_state == _HEAT_STATE_FULL)
-            # One timestamp for the anchor and heating_since. Stamped separately,
-            # heating_since lands microseconds after the anchor, scheduling_temp's
-            # stale-direction guard fires, and the carried-over position is lost.
-            heater_start = datetime.now(timezone.utc)
-            if heater_now_active and not self._heat_was_active:
-                # Strictly before heating_since is set below, or scheduling_temp's
-                # stale-direction guard fires and there is nothing left to carry over.
-                # R3: the estimate must not step at handover merely because the heater
-                # changed state.
-                self.reanchor_for_direction_change(heater_start)
-            if heater_now_active and self.heating_since is None:
-                self.heating_since = heater_start
-                # After heating_since, so the hold is priced from the same position the
-                # scheduler just handed over — the re-anchored one, not the raw reading.
-                self.begin_thermal_hold(self.scheduling_temp(), new_target)
-            elif not heater_now_active:
-                self.heating_since = None
-                if self._heat_was_active:
-                    # A genuine stop. Not the lag between the scheduler's setpoint
-                    # command and the device reporting `heating` — 30 s of `standby`
-                    # polls on 24.09.2026 15:12, during which this released the hold the
-                    # trigger had just set and the transition then priced a second
-                    # opinion. See thermal_hold_finish.
-                    self.release_thermal_hold()
+            self._apply_heater_transition(heater_now_active, new_target)
             if heater_now_active and not self._heat_was_active:
                 delta_to_target = abs((new_target or 0) - (curr_temp or 0))
                 if delta_to_target > _NEW_SESSION_DELTA:
@@ -2073,6 +2050,38 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         self.temp_anchor_target   = new_target
         self.temp_anchor_rising   = rising
         self._anchor_prev_reading = new_temp
+
+    def _apply_heater_transition(self, heater_now_active: bool, new_target) -> None:
+        """Re-anchor, stamp heating_since and open or release the thermal hold as the
+        heater switches. Pulled out of `_async_update_data` so the handover can be
+        driven directly."""
+        # One timestamp for the anchor and heating_since, and it has to be exactly
+        # one: scheduling_temp's stale-direction guard is a strict `heating_since >
+        # anchor`. Stamped separately, heating_since lands microseconds after the
+        # anchor, the guard fires, and the carried-over position is lost.
+        heater_start = datetime.now(timezone.utc)
+        if heater_now_active and not self._heat_was_active:
+            # Anchored at heater_start, the instant heating_since takes below. The
+            # guard fires when heating_since is strictly later than the anchor, so
+            # ordering the anchor first is what trips it; only sharing the stamp
+            # keeps the carried-over position.
+            # R3: the estimate must not step at handover merely because the heater
+            # changed state.
+            self.reanchor_for_direction_change(heater_start)
+        if heater_now_active and self.heating_since is None:
+            self.heating_since = heater_start
+            # After heating_since, so the hold is priced from the same position the
+            # scheduler just handed over — the re-anchored one, not the raw reading.
+            self.begin_thermal_hold(self.scheduling_temp(), new_target)
+        elif not heater_now_active:
+            self.heating_since = None
+            if self._heat_was_active:
+                # A genuine stop. Not the lag between the scheduler's setpoint
+                # command and the device reporting `heating` — 30 s of `standby`
+                # polls on 24.09.2026 15:12, during which this released the hold the
+                # trigger had just set and the transition then priced a second
+                # opinion. See thermal_hold_finish.
+                self.release_thermal_hold()
 
     def reanchor_for_direction_change(self, now: datetime | None = None) -> None:
         """Carry the extrapolated position across a change of heating direction — R3.
