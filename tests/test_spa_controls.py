@@ -292,6 +292,21 @@ class TestUvcKeepFilter:
         _run(c.set_feature_state("uvc", "off"))
         c.api.set_uvc_state.assert_awaited_once_with(0)
 
+    def test_a_heater_command_never_carries_the_rider(self):
+        """The rider is for UVC commands only.
+
+        Switching the heater off stops the pump on some spas too, but widening *that*
+        command has never been measured on any hardware, so it keeps its single field
+        whatever UVC is doing. The same goes the other way: nothing is added to a
+        heater command to compensate for what the spa then does to the pump.
+        """
+        c = self._coord(keep_filter=True)
+        c._last_data["uvc"] = "on"
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0)
+        assert "filter_state" not in c._pending_raw_command
+        assert c._pending_raw_command == {"heater_state": 0}
+
     def test_not_sent_while_the_spa_is_heating(self):
         """Actually heating: the pump is interlocked with the heater, so the spa keeps
         it running and the command stays the single field it should be."""
