@@ -1107,7 +1107,7 @@ When enabled, the integration will attempt to detect power cycles and restore de
 #### 3. Keep the Filter Running When Switching UVC (Optional)
 On some UVC models, switching UVC on or off while the heater is off also stops the filter pump. The spa does this itself, not Home Assistant. Turning the pump off and on often can cause an F1 fault.
 
-When enabled, a UVC command also sends filter-on in the same command, so the pump keeps running. It is only sent when the filter is already on, so it never starts a stopped pump. It is off by default, so a spa that behaves oddly with the combined command can simply be switched back.
+When enabled, a UVC command also sends filter-on in the same command, so the pump keeps running. It is only sent when the filter is already on, so it never starts a stopped pump. It is on by default; a spa that behaves oddly with the combined command can simply be switched back off.
 
 It is not sent while the spa's heater switch is on: the spa keeps the pump running itself then, so the command stays a single instruction.
 
@@ -1116,11 +1116,13 @@ This only covers commands sent from Home Assistant. Switching UVC — or the hea
 #### 4. Keep the Filter Running When Switching the Heater Off (Optional)
 On some spas, switching the heater off lets the filter pump run on for a while and then stops it. The spa does this itself. Starting the pump again afterwards holds, so the shutdown follows the heater command rather than anything about the pump.
 
-When enabled, a heater-off command carries filter-on in the same command, so the pump is asserted rather than left to the spa. As with the UVC option it is only sent when the filter is already on, so it never starts a stopped pump, and it is off by default.
+When enabled, a heater-off command carries filter-on in the same command, so the pump is asserted rather than left to the spa. As with the UVC option it is only sent when the filter is already on, so it never starts a stopped pump, and it is on by default.
 
 This is separate from the UVC option because they are separate behaviours: enabling one says nothing about the other. Neither applies to a heater *start*, which always sends its own pump command first and waits for the spa to confirm it — heating without flow can be refused outright, so that one is never folded into a single payload.
 
 Again, this only covers commands from Home Assistant; the spa's own control panel bypasses the integration.
+
+Neither rider is sent while the spa reports a fault. Switching anything on during a fault is refused outright, and a rider is a hidden on — asserting the pump into an F1 flow fault is the one thing a shutdown must not do, so a faulting spa is shut down with the bare command.
 
 ### State Restoration After Power Outage
 

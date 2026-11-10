@@ -19,6 +19,12 @@ CONF_RESTORE_STATE = "restore_state"
 CONF_ALWAYS_ENFORCE_UNIT = "always_enforce_unit"
 CONF_UVC_KEEP_FILTER = "uvc_keep_filter"
 CONF_HEATER_KEEP_FILTER = "heater_keep_filter"
+# Both on by default: the spa taking the pump down by itself is the surprising
+# behaviour, so holding it up is the better default and the options are there to opt
+# out of it.  Named here because the gate and the options dialog both need the same
+# answer — were they to disagree, the checkbox would misreport what the code does.
+DEFAULT_UVC_KEEP_FILTER = True
+DEFAULT_HEATER_KEEP_FILTER = True
 
 # Region configuration
 # ROW = Rest of World (Europe, Africa, Middle East, Oceania, etc.)

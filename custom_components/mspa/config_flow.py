@@ -27,6 +27,8 @@ from .const import (
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_HEATER_KEEP_FILTER,
     CONF_UVC_KEEP_FILTER,
+    DEFAULT_HEATER_KEEP_FILTER,
+    DEFAULT_UVC_KEEP_FILTER,
     CONF_WEATHER_ENTITY,
     CONF_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_TARGET_TEMP,
@@ -312,11 +314,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             ): bool,
             vol.Optional(
                 CONF_UVC_KEEP_FILTER,
-                default=self.config_entry.options.get(CONF_UVC_KEEP_FILTER, False),
+                default=self.config_entry.options.get(CONF_UVC_KEEP_FILTER, DEFAULT_UVC_KEEP_FILTER),
             ): bool,
             vol.Optional(
                 CONF_HEATER_KEEP_FILTER,
-                default=self.config_entry.options.get(CONF_HEATER_KEEP_FILTER, False),
+                default=self.config_entry.options.get(CONF_HEATER_KEEP_FILTER, DEFAULT_HEATER_KEEP_FILTER),
             ): bool,
             vol.Optional(
                 CONF_WEATHER_ENTITY,

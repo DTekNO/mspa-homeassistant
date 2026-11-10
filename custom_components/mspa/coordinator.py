@@ -75,6 +75,8 @@ from .const import (
     CONF_ALWAYS_ENFORCE_UNIT,
     CONF_HEATER_KEEP_FILTER,
     CONF_UVC_KEEP_FILTER,
+    DEFAULT_HEATER_KEEP_FILTER,
+    DEFAULT_UVC_KEEP_FILTER,
     CONF_WEATHER_ENTITY,
     CONF_CROSSING_LOG,
     CONF_OUTDOOR_SENSOR,
@@ -5213,13 +5215,20 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         being started here: the pump is already running and the assertion only
         has to survive.
         """
+        if self.fault_code:
+            # Switching anything *on* during a fault is refused above, and a rider is
+            # a hidden on: asserting the pump into an F1 — a flow fault — is the one
+            # thing a shutdown must not do.  Shutting a faulting spa down stays
+            # allowed, as the bare command it was before.
+            return {}
+
         if feature == "uvc":
-            option = CONF_UVC_KEEP_FILTER
+            option, default = CONF_UVC_KEEP_FILTER, DEFAULT_UVC_KEEP_FILTER
         elif feature == "heater" and numerical_state == 0:
-            option = CONF_HEATER_KEEP_FILTER
+            option, default = CONF_HEATER_KEEP_FILTER, DEFAULT_HEATER_KEEP_FILTER
         else:
             return {}                                  # nothing else takes a rider
-        if not self.config_entry.options.get(option, False):
+        if not self.config_entry.options.get(option, default):
             return {}
         if self._last_data.get("filter") != "on":
             return {}                                  # never start a stopped pump

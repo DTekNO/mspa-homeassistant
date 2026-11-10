@@ -270,7 +270,8 @@ class TestUvcKeepFilter:
 
     def _coord(self, keep_filter, filter_state="on"):
         c = _trigger_coord()
-        c.config_entry = _make_config_entry({"uvc_keep_filter": keep_filter})
+        c.config_entry = _make_config_entry({"uvc_keep_filter": keep_filter,
+                                             "heater_keep_filter": False})
         c._last_data["filter"] = filter_state
         c.api.set_uvc_state = AsyncMock(return_value={"message": "SUCCESS"})
         c.api.send_device_command = AsyncMock(return_value={"message": "SUCCESS"})
@@ -394,9 +395,9 @@ class TestHeaterKeepFilter:
     again afterwards does stay up.
     """
 
-    def _coord(self, keep_filter, filter_state="on", heater="on", option=None):
+    def _coord(self, keep_filter, filter_state="on", heater="on", **options):
         c = _trigger_coord()
-        c.config_entry = _make_config_entry({option or "heater_keep_filter": keep_filter})
+        c.config_entry = _make_config_entry({"heater_keep_filter": keep_filter, **options})
         c._last_data["filter"] = filter_state
         c._last_data["heater"] = heater
         c.api.send_device_command = AsyncMock(return_value={"message": "SUCCESS"})
@@ -420,10 +421,23 @@ class TestHeaterKeepFilter:
         c.api.set_heater_state.assert_awaited_once_with(0)
         assert c._pending_raw_command == {"heater_state": 0}
 
-    def test_the_uvc_option_does_not_enable_it(self):
-        c = self._coord(keep_filter=True, option="uvc_keep_filter")
+    def test_it_follows_its_own_option_not_the_uvc_one(self):
+        """Both default on, so what matters is that opting out of one is respected
+        while the other is still on."""
+        c = self._coord(keep_filter=False, uvc_keep_filter=True)
         _run(c.set_feature_state("heater", "off"))
         c.api.set_heater_state.assert_awaited_once_with(0)
+
+    def test_it_stands_down_while_the_spa_is_faulting(self):
+        """Shutting a faulting spa down must stay possible, and must stay a bare
+        command: F1 is the flow fault, and asserting the pump into one is the single
+        thing this must never do.  Switching anything on during a fault is refused
+        outright, and a rider is a hidden on."""
+        c = self._coord(keep_filter=True)
+        c._last_data["fault"] = "F1"
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0)
+        assert c._pending_raw_command == {"heater_state": 0}
 
     def test_never_starts_a_stopped_filter(self):
         """Frequent pump restarts are what brings on an F1, so a stopped pump stays

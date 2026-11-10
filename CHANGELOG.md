@@ -9,17 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Option to keep the filter running when the heater is switched off.** A heater-off
-  command carries `filter_state: 1`, and so does its retry. Only sent when the filter
-  is on and not being switched off. Never applies to a heater start, which keeps its
-  separate, confirmed pump command. Off by default.
-- **Option to keep the filter running when switching UVC.** On some UVC models (seen on a
-  Frame Mono), switching UVC either way with the heater off also stops the pump. With
-  *Keep the filter running when switching UVC* on, the UVC command carries
-  `filter_state: 1` in the same device command, and the retry does too. It is only sent
-  when the filter is on, not being switched off, and the spa's heater is off, so it
-  never starts a stopped filter and never widens a command the spa handles itself.
-  Commands from the spa's own panel are unaffected. Off by default.
+- **The filter is kept running when the heater is switched off.** A heater-off command
+  carries `filter_state: 1`, and so does its retry. Only sent when the filter is on and
+  not being switched off, and never while the spa reports a fault. Never applies to a
+  heater start, which keeps its separate, confirmed pump command. On by default —
+  *Keep the filter running when the heater is switched off* turns it off.
+- **The filter is kept running when switching UVC.** On some UVC models (seen on a
+  Frame Mono), switching UVC either way with the heater off also stops the pump. The UVC
+  command now carries `filter_state: 1` in the same device command, and the retry does
+  too. It is only sent when the filter is on, not being switched off, the spa's heater is
+  off, and the spa reports no fault, so it never starts a stopped filter and never widens
+  a command the spa handles itself. Commands from the spa's own panel are unaffected.
+  On by default — *Keep the filter running when switching UVC* turns it off.
 
 ### Fixed
 
