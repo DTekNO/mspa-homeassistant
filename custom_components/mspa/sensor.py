@@ -13,9 +13,7 @@ from .const import (
     DEFAULT_BUBBLE_POWER,
     DEFAULT_HEATER_POWER_PREHEAT,
     DEFAULT_HEATER_POWER_HEAT,
-    CONF_SCHEDULE_TARGET_TEMP,
     CONF_SCHEDULE_LOOKAHEAD_DAYS,
-    DEFAULT_SCHEDULE_TARGET_TEMP,
     DEFAULT_SCHEDULE_LOOKAHEAD_DAYS,
 )
 from .entity import MSpaSensorEntity, MSpaBinarySensorEntity
@@ -861,28 +859,36 @@ def _rate_diagnostics(coordinator, water_f, span_target) -> str:
             f"scalar={scalar:.2f} amb={amb_str} bias={bias:.2f}")
 
 
-def _log_readiness_change(coordinator, old_state: object, new_state: "str | None") -> None:
-    """Emit one INFO line when the Ready at sensor value transitions."""
-    data = coordinator._last_data
-    try:
-        water_f = float(data.get("water_temperature"))
-        water = f"{water_f:.1f}"
-    except (TypeError, ValueError):
-        water_f = None
-        water = "?"
-    try:
-        setpoint = f"{float(data.get('target_temperature')):.1f}"
-    except (TypeError, ValueError):
-        setpoint = "?"
+def _log_temp(value) -> "tuple[float | None, str]":
+    """A temperature for a log line: the float when it parses, and a string always.
 
+    Both diagnostic log lines formatted this by hand, which is two places for one
+    convention to be changed in.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None, "?"
+    return f, f"{f:.1f}"
+
+
+def _log_sched_context(coordinator) -> str:
+    """The `sched=` field shared by the readiness and schedule log lines."""
     sched_at = getattr(coordinator, "scheduled_ready_at", None)
     sched_temp = getattr(coordinator, "schedule_target_temp", None)
     if sched_at is not None and sched_temp is not None:
-        sched_ctx = f"sched={sched_temp:.1f}°C@{sched_at.strftime('%H:%M')}"
-    elif sched_temp is not None:
-        sched_ctx = f"sched={sched_temp:.1f}°C"
-    else:
-        sched_ctx = "no-sched"
+        return f"sched={sched_temp:.1f}°C@{sched_at.strftime('%H:%M')}"
+    if sched_temp is not None:
+        return f"sched={sched_temp:.1f}°C"
+    return "no-sched"
+
+
+def _log_readiness_change(coordinator, old_state: object, new_state: "str | None") -> None:
+    """Emit one INFO line when the Ready at sensor value transitions."""
+    data = coordinator._last_data
+    water_f, water = _log_temp(data.get("water_temperature"))
+    _, setpoint = _log_temp(data.get("target_temperature"))
+    sched_ctx = _log_sched_context(coordinator)
 
     heater = data.get("heater", "?")
     latched = getattr(coordinator, "ready_latched", False)
@@ -972,22 +978,10 @@ def _log_schedule_change(
 ) -> None:
     """Emit one INFO line when the Heat Schedule sensor value transitions."""
     data = coordinator._last_data
-    try:
-        water_f = float(data.get("water_temperature"))
-        water = f"{water_f:.1f}"
-    except (TypeError, ValueError):
-        water_f = None
-        water = "?"
+    water_f, water = _log_temp(data.get("water_temperature"))
+    sched_ctx = _log_sched_context(coordinator)
 
-    sched_at = getattr(coordinator, "scheduled_ready_at", None)
     sched_temp = getattr(coordinator, "schedule_target_temp", None)
-    if sched_at is not None and sched_temp is not None:
-        sched_ctx = f"sched={sched_temp:.1f}°C@{sched_at.strftime('%H:%M')}"
-    elif sched_temp is not None:
-        sched_ctx = f"sched={sched_temp:.1f}°C"
-    else:
-        sched_ctx = "no-sched"
-
     rate_str = _rate_diagnostics(coordinator, water_f, sched_temp)
     triggered = getattr(coordinator, "_schedule_triggered", False)
 

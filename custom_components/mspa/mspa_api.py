@@ -248,6 +248,41 @@ class MSpaApiClient:
         """
         return self.hass.data["mspa_auth"][self._creds_key]["session"]
 
+    def _adopt_device(self, device: dict) -> None:
+        """Take identity and firmware fields from one device record.
+
+        Keeps them on the client and publishes them to the coordinator, which is
+        where the device info block and the firmware sensors read them from.
+
+        The live device list and the demo records carry the same keys, so one
+        copy serves both.  It was two copies before, and they had already begun
+        to drift: one read `url` with an `""` default and the other without, and
+        a field added to one would simply be missing from the other.
+        """
+        self.device_id = device.get("device_id")
+        self.product_id = device.get("product_id")
+        self.series = device.get("product_series")
+        self.model = device.get("product_model")
+        self.software_version = device.get("software_version")
+        self.product_pic_url = device.get("url")
+        self.device_alias = device.get("device_alias")
+        self.serial_number = device.get("sn")
+        self.mac_address = device.get("mac")
+
+        c = self.coordinator
+        c.device_id = self.device_id
+        c.product_id = self.product_id
+        c.series = self.series
+        c.model = self.model
+        c.software_version = self.software_version
+        c.product_pic_url = self.product_pic_url
+        c.device_alias = self.device_alias
+        c.serial_number = self.serial_number
+        c.mac_address = self.mac_address
+        # wifi/mcu versions feed the firmware version sensor
+        c.wifi_version = device.get("wifi_version")
+        c.mcu_version = device.get("mcu_version")
+
     async def async_init(self):
         await self._do_async_init()
 
@@ -258,26 +293,7 @@ class MSpaApiClient:
                 (d for d in _DEMO_DEVICES if d["device_id"] == self._target_device_id),
                 _DEMO_DEVICES[0],
             )
-            self.device_id = device["device_id"]
-            self.product_id = device["product_id"]
-            self.series = device["product_series"]
-            self.model = device["product_model"]
-            self.software_version = device["software_version"]
-            self.product_pic_url = device.get("url", "")
-            self.device_alias = device["device_alias"]
-            self.coordinator.model = self.model
-            self.coordinator.series = self.series
-            self.coordinator.software_version = self.software_version
-            self.coordinator.product_pic_url = self.product_pic_url
-            self.coordinator.device_id = self.device_id
-            self.coordinator.product_id = self.product_id
-            self.coordinator.device_alias = self.device_alias
-            self.coordinator.wifi_version = device.get("wifi_version")
-            self.coordinator.mcu_version = device.get("mcu_version")
-            self.serial_number = device.get("sn")
-            self.coordinator.serial_number = self.serial_number
-            self.mac_address = device.get("mac")
-            self.coordinator.mac_address = self.mac_address
+            self._adopt_device(device)
             _LOGGER.info("DEMO MODE: initialised demo device '%s'", self.device_alias)
             return
 
@@ -322,28 +338,7 @@ class MSpaApiClient:
             device = devices[0]
 
         _LOGGER.debug("DIAGNOSTIC: Found %d device(s). Selected device: %s", len(devices), device)
-        self.product_id = device.get("product_id")
-        self.device_id = device.get("device_id")
-        self.series = device.get("product_series")
-        self.model = device.get("product_model")
-        self.software_version = device.get("software_version")
-        self.product_pic_url = device.get("url")
-
-        self.device_alias = device.get("device_alias")
-        self.coordinator.model = self.model
-        self.coordinator.series = self.series
-        self.coordinator.software_version = self.software_version
-        self.coordinator.product_pic_url = self.product_pic_url
-        self.coordinator.device_id = self.device_id
-        self.coordinator.product_id = self.product_id
-        self.coordinator.device_alias = self.device_alias
-        # Store wifi/mcu versions from the device list for the firmware version sensor
-        self.coordinator.wifi_version = device.get("wifi_version")
-        self.coordinator.mcu_version = device.get("mcu_version")
-        self.serial_number = device.get("sn")
-        self.coordinator.serial_number = self.serial_number
-        self.mac_address = device.get("mac")
-        self.coordinator.mac_address = self.mac_address
+        self._adopt_device(device)
 
         # Fetch extended device detail (once on init, non-critical)
         detail = await self.get_device_detail()

@@ -86,7 +86,6 @@ from .const import (
     DEFAULT_SCHEDULE_TARGET_TEMP,
     AMBIENT_BASELINE_ALPHA,
     AMBIENT_BASELINE_DEFAULT,
-    ambient_rate_factor,
     BIAS_EMA_ALPHA,
     BIAS_ALPHA_MAX,
     BIAS_SPAN_FULL_C,

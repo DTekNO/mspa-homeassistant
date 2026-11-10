@@ -12,11 +12,13 @@ import pytest
 from datetime import datetime, timezone, timedelta
 
 from custom_components.mspa.const import (
+    BIAS_CLAMP_MIN,
+    BIAS_CLAMP_MAX,
+)
+from custom_components.mspa.predictor import (
     ambient_rate_factor,
     AMBIENT_FACTOR_MIN,
     AMBIENT_FACTOR_MAX,
-    BIAS_CLAMP_MIN,
-    BIAS_CLAMP_MAX,
 )
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
 from custom_components.mspa.predictor import extrapolate_within_band
