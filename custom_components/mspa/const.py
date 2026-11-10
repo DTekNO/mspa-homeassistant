@@ -8,6 +8,14 @@ ACTIVE_SCAN_INTERVAL = 30  # Polling interval when spa is active (heater/filter 
 RAPID_SCAN_INTERVAL = 1  # Polling interval in seconds when waiting for changes
 RAPID_POLL_TIMEOUT = 15  # Maximum time in seconds to poll rapidly
 EXTERNAL_CHANGE_INTERVAL = 5  # Polling interval after detecting an external change
+
+# Putting the pump back after the spa's post-heat purge stops it.  The purge was
+# measured at 43 s and 46 s on an OSLO (firmware 141-410), ending the instant
+# heat_state reached 0, and a filter_state asserted in the heater-off command itself
+# does not survive it.  The window is generous against a slower purge on another
+# model; the cadence is what decides how long the pump is actually down.
+PUMP_REASSERT_WINDOW = 180    # seconds to watch for the stop before giving up
+PUMP_REASSERT_INTERVAL = 5    # poll cadence while watching
 EXTERNAL_CHANGE_TIMEOUT = 15  # How long to rapid-poll after an external change
 IDLE_STABLE_THRESHOLD = 600  # Seconds of unchanged state before entering idle tier
 

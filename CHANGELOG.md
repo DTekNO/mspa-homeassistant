@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The filter is kept running when the heater is switched off.** A heater-off command
-  carries `filter_state: 1`, and so does its retry. Only sent when the filter is on and
-  not being switched off, and never while the spa reports a fault. Never applies to a
-  heater start, which keeps its separate, confirmed pump command. On by default —
-  *Keep the filter running when the heater is switched off* turns it off.
+- **The filter is kept running when the heater is switched off.** The spa stops the
+  pump at the end of its post-heat purge, ~45 s later; the pump is started again as
+  soon as that stop is seen, and the poll runs at 5 s while waiting. Not done if the
+  pump was already off, if the filter is switched off meanwhile, if the heater comes
+  back on, or while the spa reports a fault; the watch gives up after 3 minutes. On by
+  default — *Keep the filter running when the heater is switched off* turns it off.
 - **The filter is kept running when switching UVC.** On some UVC models (seen on a
   Frame Mono), switching UVC either way with the heater off also stops the pump. The UVC
   command now carries `filter_state: 1` in the same device command, and the retry does

@@ -77,6 +77,8 @@ from .const import (
     CONF_UVC_KEEP_FILTER,
     DEFAULT_HEATER_KEEP_FILTER,
     DEFAULT_UVC_KEEP_FILTER,
+    PUMP_REASSERT_INTERVAL,
+    PUMP_REASSERT_WINDOW,
     CONF_WEATHER_ENTITY,
     CONF_CROSSING_LOG,
     CONF_OUTDOOR_SENSOR,
@@ -588,6 +590,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         )
         self._rapid_poll_until = None  # Timestamp when to stop rapid polling
         self._external_change_until = None  # Timestamp when to stop external-change polling
+        self._pump_reassert_until = None  # Deadline for the post-heat pump watch
         self._pending_changes = {}  # Track expected changes (transformed keys)
         self._pending_raw_command = {}  # Raw API payload for retrying unconfirmed commands
         self._command_retry_count = 0  # Number of retries attempted for current command
@@ -5175,45 +5178,90 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         level = self._last_data.get("bubble_level") or 0
         return level if level >= 1 else 1
 
-    def _keep_filter_rider(self, feature: str, numerical_state: int) -> dict:
-        """`{"filter_state": 1}` to carry with this command, or nothing.
+    def _arm_pump_reassert(self) -> None:
+        """Start watching for the spa taking the pump down after a heater-off.
 
-        Two features can take the pump down with them, and both behaviours are
-        the spa's own rather than ours — we send one sparse key and the firmware
-        does the rest:
+        The spa runs a purge once the heater stops and ends it by stopping the pump —
+        measured at 43 s and 46 s on an OSLO (firmware 141-410), both times at the
+        instant `heat_state` reached 0.  Asserting `filter_state: 1` inside the
+        heater-off command does not survive that; starting the pump once the stop has
+        happened does, which is what a user does by hand.
 
-        * **UVC.** On some models (seen on a Frame Mono) switching UVC with the
-          heater off stops the pump at once.
-        * **The heater.** Switching the heater off lets the pump run on and then
-          stops it after a delay.  Starting the pump again afterwards holds, so
-          the shutdown is tied to the heater command rather than to the pump.
+        So the watch waits for the stop to be *observed* rather than firing on a
+        timer.  Nothing is sent on a spa that never stops the pump, and nothing is sent
+        into the middle of a shutdown sequence that is still running.
 
-        Asserting the pump in the same command is an attempt to pre-empt both.
-        Each is behind its own option because they are separate behaviours on
-        separate hardware, and because a spa that reacts badly to the wider
-        command must be able to go back to the plain one.
+        This is the one place the integration starts a pump that is not running, which
+        is otherwise a rule — frequent restarts are what brings on an F1.  What makes
+        it defensible is that it only ever puts back a pump that *was* running and that
+        the spa stopped against the user's wish: one restart per heater-off, the same
+        action the user would take, and never while the spa reports a fault.
+        """
+        self._pump_reassert_until = time.time() + PUMP_REASSERT_WINDOW
+        _LOGGER.debug("Watching for the post-heat pump stop for %ds",
+                      PUMP_REASSERT_WINDOW)
 
-        Two conditions apply to either rider: the filter must already be on, so
-        this can never start a stopped pump (frequent restarts are what brings
-        on an F1), and it must not be on its way off, so this cannot undo a
-        filter-off the user has just asked for.
+    async def _check_pump_reassert(self, data: dict) -> None:
+        """Start the pump again once the spa's post-heat purge has stopped it."""
+        if not self._pump_reassert_until:
+            return
 
-        The UVC rider additionally stands down while the spa's heater is on,
-        which is the state the spa keeps the pump up for by itself.  That is
-        gated on `heater` — the spa's own heater_state — and deliberately not on
-        `heat_state` or the climate entity's hvac mode: heater_state is what the
-        spa controls, the climate mode is our abstraction over it, and
-        compensating for device behaviour out of our own modelling would couple
-        the two.  A thermostat standby holds heater_state at 1, so the rider is
-        skipped there too; whether the interlock still holds in standby has not
-        been measured, and the narrower command is the right default in
-        reverse-engineered territory.
+        if time.time() > self._pump_reassert_until:
+            # No stop came.  Either this spa does not do it or the purge outlasted the
+            # window; either way, stop watching rather than act on a guess.
+            _LOGGER.debug("Post-heat pump watch expired with the pump still running")
+            self._pump_reassert_until = None
+            return
 
-        Note this is one payload asserting two keys, which `_start_pump_before
-        _heater` deliberately avoids for a heater *start* — there the ordering
-        matters, because heat without flow can be refused outright.  Nothing is
-        being started here: the pump is already running and the assertion only
-        has to survive.
+        if data.get("heater") == "on":
+            # Heating again, so the spa is holding the pump up for its own reasons.
+            self._pump_reassert_until = None
+            return
+
+        if data.get("filter") != "off":
+            return                                      # still running — keep watching
+
+        self._pump_reassert_until = None                # one shot, whatever follows
+
+        if self.fault_code:
+            _LOGGER.info(
+                "The spa stopped the pump after the heater went off, but it reports "
+                "fault %s — leaving the pump stopped", self.fault_code)
+            return
+
+        _LOGGER.info("The spa stopped the pump after the heater went off — "
+                     "starting it again")
+        response = await self.api.set_filter_state(1)
+        if not (isinstance(response, dict) and response.get("message") == "SUCCESS"):
+            _LOGGER.warning(
+                "The spa did not accept the pump restart (response: %r)", response)
+            return
+        # Confirmed and retried like any other command.
+        self._enable_rapid_polling({"filter": "on"}, {"filter_state": 1})
+
+    def _keep_filter_rider(self, feature: str) -> dict:
+        """`{"filter_state": 1}` to carry with a UVC command, or nothing.
+
+        On some models (seen on a Frame Mono, and consistent with an OSLO holding
+        its pump through a UVC-off on 10.11) switching UVC with the heater off
+        stops the pump at once.  Asserting the pump in the same command keeps it
+        running, which is the spa's own behaviour being pre-empted rather than
+        anything of ours being added.
+
+        Conditions.  The filter must already be on, so this can never start a
+        stopped pump (frequent restarts are what brings on an F1), and it must
+        not be on its way off, so this cannot undo a filter-off the user has just
+        asked for.  It also stands down while the spa's heater is on, which is
+        the state the spa keeps the pump up for by itself — gated on `heater`,
+        the spa's own heater_state, and deliberately not on `heat_state` or the
+        climate entity's hvac mode: heater_state is what the spa controls, the
+        climate mode is our abstraction over it, and compensating for device
+        behaviour out of our own modelling would couple the two.
+
+        The heater has no rider.  The same trick was tried for it and measured
+        not to work: the spa's post-heat purge takes the pump down ~45 s later
+        regardless of what the heater-off command asserted, so that case is
+        handled after the fact by `_arm_pump_reassert` instead.
         """
         if self.fault_code:
             # Switching anything *on* during a fault is refused above, and a rider is
@@ -5222,19 +5270,16 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # allowed, as the bare command it was before.
             return {}
 
-        if feature == "uvc":
-            option, default = CONF_UVC_KEEP_FILTER, DEFAULT_UVC_KEEP_FILTER
-        elif feature == "heater" and numerical_state == 0:
-            option, default = CONF_HEATER_KEEP_FILTER, DEFAULT_HEATER_KEEP_FILTER
-        else:
+        if feature != "uvc":
             return {}                                  # nothing else takes a rider
-        if not self.config_entry.options.get(option, default):
+        if not self.config_entry.options.get(CONF_UVC_KEEP_FILTER,
+                                             DEFAULT_UVC_KEEP_FILTER):
             return {}
         if self._last_data.get("filter") != "on":
             return {}                                  # never start a stopped pump
         if self._pending_changes.get("filter") == "off":
             return {}                                  # never undo a pending filter-off
-        if feature == "uvc" and self._last_data.get("heater") == "on":
+        if self._last_data.get("heater") == "on":
             return {}                                  # the spa holds the pump up itself
         return {"filter_state": 1}
 
@@ -5274,7 +5319,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if feature == "heater" and numerical_state == 1:
                 pump_started = await self._start_pump_before_heater()
 
-            extra = self._keep_filter_rider(feature, numerical_state)
+            extra = self._keep_filter_rider(feature)
 
             # Build raw command for potential retry
             if feature == "bubble":
@@ -5324,6 +5369,17 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
 
             # Enable rapid polling to quickly detect the change
             self._enable_rapid_polling(expected_changes, raw_command)
+
+            # Any heater or filter command settles what the pump should be doing, so a
+            # watch armed by an earlier heater-off no longer applies.
+            if feature in ("heater", "filter"):
+                self._pump_reassert_until = None
+            if (feature == "heater" and numerical_state == 0
+                    and self.config_entry.options.get(CONF_HEATER_KEEP_FILTER,
+                                                      DEFAULT_HEATER_KEEP_FILTER)
+                    and self._last_data.get("filter") == "on"
+                    and not self.fault_code):
+                self._arm_pump_reassert()
             await self.async_request_refresh()
 
             # Close the loop on a heater start: pump on, confirmed, heater on, and now
@@ -5478,14 +5534,13 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 raw_key = _PENDING_TO_RAW_KEY.get(key)
                 if raw_key:
                     self._pending_raw_command.pop(raw_key, None)
-                # A filter-on carried by a UVC or heater command (the keep-filter
-                # options) is not tracked as a pending change of its own, so it stays
-                # in the retry payload until the command it rode with confirms.  The
-                # blanket clear below catches it only when nothing else is pending;
-                # with another command still outstanding it would otherwise linger and
-                # be resent with that one, which is how the bubbles used to turn
-                # themselves back on.
-                if key in ("uvc", "heater") and "filter" not in self._pending_changes:
+                # A filter-on carried by a UVC command (uvc_keep_filter) is not
+                # tracked as a pending change of its own, so it stays in the retry
+                # payload until the UVC command confirms.  The blanket clear below
+                # catches it only when nothing else is pending; with another command
+                # still outstanding it would otherwise linger and be resent with that
+                # one, which is how the bubbles used to turn themselves back on.
+                if key == "uvc" and "filter" not in self._pending_changes:
                     self._pending_raw_command.pop("filter_state", None)
 
             if confirmed and not self._pending_changes:
@@ -5576,6 +5631,9 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             self._last_heat_state = current_heat_state
             self._last_state_change_time = current_time
 
+        # --- Phase 5b: Put the pump back if the spa's purge has stopped it ---
+        await self._check_pump_reassert(data)
+
         # --- Phase 6: Determine appropriate tier and set interval ---
         if self._rapid_poll_until or self._pending_changes:
             # RAPID tier: confirming a command we sent
@@ -5585,6 +5643,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             # EXTERNAL tier: someone used the panel/app, watch for follow-up changes
             target_interval = EXTERNAL_CHANGE_INTERVAL
             tier = "external"
+        elif self._pump_reassert_until:
+            # PUMP WATCH tier: waiting for the spa's post-heat purge to stop the pump.
+            # Nothing else needs this cadence, but it is what decides how long the pump
+            # stays stopped before it is started again — at the 30s active rate the gap
+            # would be up to half a minute of the pump being off "by itself", which is
+            # the whole thing being avoided.
+            target_interval = PUMP_REASSERT_INTERVAL
+            tier = "pump watch"
         elif self._is_spa_active(data):
             # ACTIVE tier: heater, filter or bubble/jet running
             target_interval = ACTIVE_SCAN_INTERVAL

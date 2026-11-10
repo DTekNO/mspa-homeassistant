@@ -1113,21 +1113,27 @@ It is not sent while the spa's heater switch is on: the spa keeps the pump runni
 
 This only covers commands sent from Home Assistant. Switching UVC — or the heater — at the spa's own control panel bypasses the integration entirely, so the pump will stop there just as it always did.
 
-#### 4. Keep the Filter Running When Switching the Heater Off (Optional)
-On some spas, switching the heater off lets the filter pump run on for a while and then stops it. The spa does this itself. Starting the pump again afterwards holds, so the shutdown follows the heater command rather than anything about the pump.
+#### 4. Keep the Filter Running When the Heater Is Switched Off (Optional)
+Switching the heater off does not stop the pump straight away. The spa runs a post-heat purge and stops the pump when it ends — measured at 43 and 46 seconds on an OSLO (firmware 141-410), both times at the instant the Heat State sensor reached 0. Starting the pump again *after* that holds.
 
-When enabled, a heater-off command carries filter-on in the same command, so the pump is asserted rather than left to the spa. As with the UVC option it is only sent when the filter is already on, so it never starts a stopped pump, and it is on by default.
+Carrying filter-on inside the heater-off command was tried and measured not to work: the purge takes the pump down regardless of what that command asserted. So with this enabled the integration waits until it actually sees the pump stop, and then starts it again. The pump is briefly off in between — the poll runs at 5 s while it is watching, so typically a few seconds rather than the 30 s a normal poll would take to notice.
 
-This is separate from the UVC option because they are separate behaviours: enabling one says nothing about the other. Neither applies to a heater *start*, which always sends its own pump command first and waits for the spa to confirm it — heating without flow can be refused outright, so that one is never folded into a single payload.
+It waits for the stop to be *seen* rather than firing on a timer, so nothing is sent on a spa that never stops its pump, and nothing is sent into a shutdown that is still running. The watch gives up after 3 minutes.
 
-Again, this only covers commands from Home Assistant; the spa's own control panel bypasses the integration.
+Nothing is sent if the pump was already off when the heater was switched off (there is nothing to keep running), if you switch the pump off yourself in the meantime, if the heater comes back on (the spa holds the pump up for its own heater), or if the spa reports a fault.
+
+This is the one place the integration starts a pump that is not running, which it otherwise never does — frequent restarts are what brings on an F1. What makes it acceptable is that it only ever puts back a pump that *was* running and that the spa stopped: one restart per heater-off, the same thing you would do by hand.
+
+It is on by default, and turning it off leaves the spa's own behaviour alone. It is separate from the UVC option because these are separate behaviours, with separate mechanisms. Neither applies to a heater *start*, which always sends its own pump command first and waits for the spa to confirm it — heating without flow can be refused outright, so that one is never folded into a single payload.
+
+Only the heater being switched off from Home Assistant is covered; the spa's own control panel bypasses the integration.
 
 #### Controls While the Spa Reports a Fault
 A fault is cleared at the spa's control box, not remotely, and the spa will not run through one — not from Home Assistant and not from the MSpa Link app. So while the Fault sensor reads anything other than OK, the controls that command the spa report **unavailable**: the switches, the thermostat and the bubble level. The Fault sensor and the other sensors keep reporting, and the schedule settings stay editable, so a heat-up can be set up for after the filter has been cleaned.
 
 Home Assistant treats availability as advisory, so an explicit service call from a script or automation is still delivered — and still refused, with the reason, by the command path itself.
 
-Neither rider is sent while the spa reports a fault. Switching anything on during a fault is refused outright, and a rider is a hidden on — asserting the pump into an F1 flow fault is the one thing a shutdown must not do, so a faulting spa is shut down with the bare command.
+For the same reason, neither keep-the-filter-running behaviour acts while a fault stands: switching anything on during a fault is refused outright, and starting a pump into an F1 flow fault is what raises F1 in the first place. A faulting spa is shut down with the bare command.
 
 ### State Restoration After Power Outage
 
