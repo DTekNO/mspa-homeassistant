@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The spa's controls report unavailable while it reports a fault.** The switches, the
+  thermostat and the bubble level. Sensors, the schedule settings and the schedule's own
+  controls are unaffected, and an explicit service call is still delivered.
 - **Switching the bubbles off sends only `bubble_state`.** Switching them on sends the
   level already set, or 1 when it is zero or missing.
 - **The live estimate wanders much less.** Measured against the 15–16.10 run: the window

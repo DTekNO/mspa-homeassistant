@@ -16,6 +16,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from custom_components.mspa import coordinator as coordinator_mod
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
 from homeassistant.exceptions import HomeAssistantError
+from custom_components.mspa.entity import (
+    MSpaClimateEntity,
+    MSpaSensorEntity,
+    MSpaSwitchEntity,
+)
+from custom_components.mspa.number import (
+    MspaBubbleLevelNumber,
+    MSpaScheduleTargetTemp,
+)
 from custom_components.mspa.sensor import (
     _effective_heat_rate,
     _effective_cool_rate,
@@ -374,6 +383,45 @@ class TestUvcKeepFilter:
 
         _run(c._check_adaptive_polling({"filter": "on", "uvc": "on"}))
         assert c._pending_raw_command == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Controls under a fault
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestControlsUnavailableWhileFaulting:
+    """A fault is cleared at the control box, not remotely, and the spa will not run
+    through one — not from here and not from the MSpa Link app.  A control that still
+    looks operable misreports that, so the ones that command the spa report
+    unavailable.  The refusal in `set_feature_state` is still the enforcement: Home
+    Assistant treats availability as advisory and delivers an explicit call anyway.
+    """
+
+    def _entity(self, cls, fault):
+        c = object.__new__(MSpaUpdateCoordinator)
+        c._last_data = {"fault": fault, "is_online": True}
+        c.last_update_success = True
+        e = object.__new__(cls)          # `available` needs no entity machinery
+        e.coordinator = c
+        return e
+
+    @pytest.mark.parametrize("cls", [MSpaSwitchEntity, MSpaClimateEntity,
+                                     MspaBubbleLevelNumber])
+    def test_a_spa_control_goes_unavailable(self, cls):
+        assert self._entity(cls, "F1").available is False
+
+    @pytest.mark.parametrize("healthy", [None, "", "OK"])
+    def test_and_comes_back_when_the_fault_clears(self, healthy):
+        assert self._entity(MSpaSwitchEntity, healthy).available is True
+
+    def test_a_sensor_keeps_reporting(self):
+        """The fault sensor above all — it is the one thing the user needs to read."""
+        assert self._entity(MSpaSensorEntity, "F1").available is True
+
+    def test_the_schedule_target_temperature_stays_editable(self):
+        """Ours rather than the spa's.  Setting up a heat-up for after the filter has
+        been cleaned is a reasonable thing to do while the fault still stands."""
+        assert self._entity(MSpaScheduleTargetTemp, "F1").available is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

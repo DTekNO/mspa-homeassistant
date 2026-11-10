@@ -53,11 +53,27 @@ class MSpaBaseEntity:
     # MSpa Link app shows it). Those two rows trade their icon for the photo; the rest
     # keep theirs.
 
+    # Set True on the entity types that command the spa.  A fault the spa will not run
+    # through — F1, the flow fault above all — has to be cleared at the control box,
+    # and until it is, neither this integration nor the MSpa Link app can run anything.
+    # A control that still looks operable misreports that, so those report unavailable
+    # instead.  Sensors keep reporting, the fault sensor most of all, and settings that
+    # belong to the integration rather than to the spa stay editable: a schedule for
+    # after the filter has been cleaned is a reasonable thing to set.
+    #
+    # This is the UI half only.  Home Assistant treats `available` as advisory and will
+    # still deliver an explicit service call, so the refusal in `set_feature_state`
+    # remains the enforcement; this stops the panel offering what cannot work.
+    _unavailable_while_faulting = False
+
     @property
     def available(self):
         """Return True if entity is available."""
         # Check if coordinator has data and if device is online
         if not self.coordinator.last_update_success:
+            return False
+
+        if self._unavailable_while_faulting and self.coordinator.fault_code:
             return False
         
         # Check if device is online based on is_online flag or ConnectType
@@ -75,13 +91,13 @@ class MSpaSensorEntity(MSpaBaseEntity, CoordinatorEntity, SensorEntity):
     pass
 
 class MSpaClimateEntity(MSpaBaseEntity, CoordinatorEntity, ClimateEntity):
-    pass
+    _unavailable_while_faulting = True
 
 class MSpaBinarySensorEntity(MSpaBaseEntity, CoordinatorEntity, BinarySensorEntity):
     pass
 
 class MSpaSwitchEntity(MSpaBaseEntity, CoordinatorEntity, SwitchEntity):
-    pass
+    _unavailable_while_faulting = True
 
 class MSpaNumberEntity(MSpaBaseEntity, CoordinatorEntity, NumberEntity):
     pass

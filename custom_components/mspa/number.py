@@ -21,6 +21,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
 class MspaBubbleLevelNumber(MSpaNumberEntity):
     """Representation of the MSpa bubble level number entity."""
 
+    # Commands the spa, unlike the schedule target temperature below, which is ours.
+    _unavailable_while_faulting = True
+
     name = "Bubble Level"
     icon = "mdi:chart-bubble"
 

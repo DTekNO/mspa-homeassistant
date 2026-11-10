@@ -1122,6 +1122,11 @@ This is separate from the UVC option because they are separate behaviours: enabl
 
 Again, this only covers commands from Home Assistant; the spa's own control panel bypasses the integration.
 
+#### Controls While the Spa Reports a Fault
+A fault is cleared at the spa's control box, not remotely, and the spa will not run through one — not from Home Assistant and not from the MSpa Link app. So while the Fault sensor reads anything other than OK, the controls that command the spa report **unavailable**: the switches, the thermostat and the bubble level. The Fault sensor and the other sensors keep reporting, and the schedule settings stay editable, so a heat-up can be set up for after the filter has been cleaned.
+
+Home Assistant treats availability as advisory, so an explicit service call from a script or automation is still delivered — and still refused, with the reason, by the command path itself.
+
 Neither rider is sent while the spa reports a fault. Switching anything on during a fault is refused outright, and a rider is a hidden on — asserting the pump into an F1 flow fault is the one thing a shutdown must not do, so a faulting spa is shut down with the bare command.
 
 ### State Restoration After Power Outage
