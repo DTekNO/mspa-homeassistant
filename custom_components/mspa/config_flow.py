@@ -25,6 +25,7 @@ from .const import (
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
+    CONF_HEATER_KEEP_FILTER,
     CONF_UVC_KEEP_FILTER,
     CONF_WEATHER_ENTITY,
     CONF_SCHEDULE_TARGET_TEMP,
@@ -254,7 +255,8 @@ class MSpaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 OPTION_KEYS = frozenset({
     "pump_power", "bubble_power", "heater_power_preheat", "heater_power_heat",
     CONF_TRACK_TEMPERATURE_UNIT, CONF_ALWAYS_ENFORCE_UNIT, CONF_RESTORE_STATE,
-    CONF_UVC_KEEP_FILTER, CONF_WEATHER_ENTITY, CONF_SCHEDULE_TARGET_TEMP,
+    CONF_UVC_KEEP_FILTER, CONF_HEATER_KEEP_FILTER, CONF_WEATHER_ENTITY,
+    CONF_SCHEDULE_TARGET_TEMP,
     CONF_OFFLINE_AFTER_MINUTES,
 })
 
@@ -311,6 +313,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             vol.Optional(
                 CONF_UVC_KEEP_FILTER,
                 default=self.config_entry.options.get(CONF_UVC_KEEP_FILTER, False),
+            ): bool,
+            vol.Optional(
+                CONF_HEATER_KEEP_FILTER,
+                default=self.config_entry.options.get(CONF_HEATER_KEEP_FILTER, False),
             ): bool,
             vol.Optional(
                 CONF_WEATHER_ENTITY,

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Option to keep the filter running when the heater is switched off.** A heater-off
+  command carries `filter_state: 1`, and so does its retry. Only sent when the filter
+  is on and not being switched off. Never applies to a heater start, which keeps its
+  separate, confirmed pump command. Off by default.
 - **Option to keep the filter running when switching UVC.** On some UVC models (seen on a
   Frame Mono), switching UVC either way with the heater off also stops the pump. With
   *Keep the filter running when switching UVC* on, the UVC command carries

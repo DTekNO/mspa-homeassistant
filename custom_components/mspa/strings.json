@@ -50,6 +50,7 @@
           "always_enforce_unit": "Check the unit on every poll, not only after a power cut",
           "restore_state": "Restore the previous settings after a power cut",
           "uvc_keep_filter": "Keep the filter running when switching UVC",
+          "heater_keep_filter": "Keep the filter running when switching the heater off",
           "weather_entity": "Weather Entity (optional)",
           "schedule_target_temp": "Target temperature for a scheduled heat-up",
           "offline_after_minutes": "Call the spa offline after (minutes)"
@@ -63,6 +64,7 @@
           "always_enforce_unit": "For spas that forget the unit without ever losing power. Checks on every update and sends a command only when the unit is actually wrong.",
           "restore_state": "When the spa comes back online, send back the target temperature and settings it had before the power cut. This writes to the spa, so leave it off if you would rather nothing were set on your behalf.",
           "uvc_keep_filter": "Some spas stop the filter pump when UVC is switched while the heater is off, and frequent pump restarts can cause an F1 fault. With this on, UVC commands keep the filter on. It never starts a stopped filter, and it is not sent while the spa's heater is on, when the spa keeps the pump running itself. Only applies to commands from Home Assistant: switching UVC or the heater at the spa's own panel still stops the pump.",
+          "heater_keep_filter": "Some spas stop the filter pump a short while after the heater is switched off. With this on, the heater-off command carries filter_state: 1, so the pump is asserted in the same command rather than left to the spa. It never starts a stopped filter. Only applies to commands from Home Assistant: switching the heater at the spa's own panel still stops the pump. Off by default — the wider command has not been observed on every model.",
           "weather_entity": "Select a weather entity (e.g. Met.no, OpenWeatherMap) to bias heating estimates by ambient temperature and wind speed. Historical sessions are weighted by how closely their conditions match the current weather.",
           "schedule_target_temp": "What a scheduled heat-up aims for, as opposed to the setpoint you choose by hand. Also adjustable at any time from the Schedule Target Temperature entity.",
           "offline_after_minutes": "How long the spa may stay silent before the Connectivity sensor reports it offline. Short gaps are normal: a broadband blip or a missed cloud poll clears in well under a minute."

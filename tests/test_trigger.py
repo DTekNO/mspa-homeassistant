@@ -11,6 +11,7 @@ import asyncio
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 from custom_components.mspa.coordinator import MSpaUpdateCoordinator
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
@@ -421,11 +422,17 @@ class TestFaultBlocksSwitchingOn:
         c = MSpaUpdateCoordinator.__new__(MSpaUpdateCoordinator)
         c._last_data = {"fault": fault, "filter": "on", "heater": "off"}
         c.api = MagicMock()
+        # Real coordinators always have these; without them the stub diverges from
+        # production the moment a command path consults either.
+        c.config_entry = SimpleNamespace(options={})
+        c._pending_changes = {}
         c.spa = {"heater_state": 0, "filter_state": 1 if fault != "__nopump__" else 0}
 
         def _cmd(key):
-            def _fn(value, *_a):
+            def _fn(value, *_a, **kw):
                 c.spa[key] = int(value)
+                if kw.get("filter_state") is not None:
+                    c.spa["filter_state"] = int(kw["filter_state"])
                 return {"message": "SUCCESS"}
             return _fn
 

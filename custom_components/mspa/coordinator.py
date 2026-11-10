@@ -73,6 +73,7 @@ from .const import (
     CONF_TRACK_TEMPERATURE_UNIT,
     CONF_RESTORE_STATE,
     CONF_ALWAYS_ENFORCE_UNIT,
+    CONF_HEATER_KEEP_FILTER,
     CONF_UVC_KEEP_FILTER,
     CONF_WEATHER_ENTITY,
     CONF_CROSSING_LOG,
@@ -5172,6 +5173,62 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         level = self._last_data.get("bubble_level") or 0
         return level if level >= 1 else 1
 
+    def _keep_filter_rider(self, feature: str, numerical_state: int) -> dict:
+        """`{"filter_state": 1}` to carry with this command, or nothing.
+
+        Two features can take the pump down with them, and both behaviours are
+        the spa's own rather than ours — we send one sparse key and the firmware
+        does the rest:
+
+        * **UVC.** On some models (seen on a Frame Mono) switching UVC with the
+          heater off stops the pump at once.
+        * **The heater.** Switching the heater off lets the pump run on and then
+          stops it after a delay.  Starting the pump again afterwards holds, so
+          the shutdown is tied to the heater command rather than to the pump.
+
+        Asserting the pump in the same command is an attempt to pre-empt both.
+        Each is behind its own option because they are separate behaviours on
+        separate hardware, and because a spa that reacts badly to the wider
+        command must be able to go back to the plain one.
+
+        Two conditions apply to either rider: the filter must already be on, so
+        this can never start a stopped pump (frequent restarts are what brings
+        on an F1), and it must not be on its way off, so this cannot undo a
+        filter-off the user has just asked for.
+
+        The UVC rider additionally stands down while the spa's heater is on,
+        which is the state the spa keeps the pump up for by itself.  That is
+        gated on `heater` — the spa's own heater_state — and deliberately not on
+        `heat_state` or the climate entity's hvac mode: heater_state is what the
+        spa controls, the climate mode is our abstraction over it, and
+        compensating for device behaviour out of our own modelling would couple
+        the two.  A thermostat standby holds heater_state at 1, so the rider is
+        skipped there too; whether the interlock still holds in standby has not
+        been measured, and the narrower command is the right default in
+        reverse-engineered territory.
+
+        Note this is one payload asserting two keys, which `_start_pump_before
+        _heater` deliberately avoids for a heater *start* — there the ordering
+        matters, because heat without flow can be refused outright.  Nothing is
+        being started here: the pump is already running and the assertion only
+        has to survive.
+        """
+        if feature == "uvc":
+            option = CONF_UVC_KEEP_FILTER
+        elif feature == "heater" and numerical_state == 0:
+            option = CONF_HEATER_KEEP_FILTER
+        else:
+            return {}                                  # nothing else takes a rider
+        if not self.config_entry.options.get(option, False):
+            return {}
+        if self._last_data.get("filter") != "on":
+            return {}                                  # never start a stopped pump
+        if self._pending_changes.get("filter") == "off":
+            return {}                                  # never undo a pending filter-off
+        if feature == "uvc" and self._last_data.get("heater") == "on":
+            return {}                                  # the spa holds the pump up itself
+        return {"filter_state": 1}
+
     async def set_feature_state(self, feature: str, state: str) -> None:
         """Set a feature state using the API map."""
         # INFO, not DEBUG: these are rare, consequential, and externally triggered.
@@ -5208,31 +5265,7 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
             if feature == "heater" and numerical_state == 1:
                 pump_started = await self._start_pump_before_heater()
 
-            # On some UVC models (seen on a Frame Mono), switching UVC with the heater
-            # off also stops the pump. Sending filter-on in the same command keeps it
-            # running. Only sent while the filter is on and not being switched off, so
-            # it never starts a stopped filter.
-            #
-            # Not sent while the heater switch is on: that is the state the spa keeps
-            # the pump up for by itself, so the command can stay the single field it
-            # should be.
-            #
-            # Gated on `heater` — the spa's own heater_state — and deliberately not on
-            # `heat_state`, nor on the climate entity's hvac mode. heater_state is what
-            # the spa controls; the climate mode is our abstraction on top of it, and
-            # compensating for device behaviour from our own modelling would couple the
-            # two. A thermostat standby holds heater_state at 1, so the rider is skipped
-            # there too: whether the pump interlock still holds in standby has not been
-            # measured, and the narrower command is the right default in reverse-
-            # engineered territory.
-            keep_filter = (
-                feature == "uvc"
-                and self.config_entry.options.get(CONF_UVC_KEEP_FILTER, False)
-                and self._last_data.get("filter") == "on"
-                and self._pending_changes.get("filter") != "off"
-                and self._last_data.get("heater") != "on"
-            )
-            extra = {"filter_state": 1} if keep_filter else {}
+            extra = self._keep_filter_rider(feature, numerical_state)
 
             # Build raw command for potential retry
             if feature == "bubble":
@@ -5436,9 +5469,14 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
                 raw_key = _PENDING_TO_RAW_KEY.get(key)
                 if raw_key:
                     self._pending_raw_command.pop(raw_key, None)
-                # A filter-on sent along with UVC (uvc_keep_filter) is not tracked on
-                # its own, so it stays in the retry until UVC confirms.
-                if key == "uvc" and "filter" not in self._pending_changes:
+                # A filter-on carried by a UVC or heater command (the keep-filter
+                # options) is not tracked as a pending change of its own, so it stays
+                # in the retry payload until the command it rode with confirms.  The
+                # blanket clear below catches it only when nothing else is pending;
+                # with another command still outstanding it would otherwise linger and
+                # be resent with that one, which is how the bubbles used to turn
+                # themselves back on.
+                if key in ("uvc", "heater") and "filter" not in self._pending_changes:
                     self._pending_raw_command.pop("filter_state", None)
 
             if confirmed and not self._pending_changes:

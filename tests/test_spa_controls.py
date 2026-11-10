@@ -62,6 +62,9 @@ def _trigger_coord(**overrides) -> MSpaUpdateCoordinator:
     c._pending_raw_command = {}
     c._command_retry_count = 0
     c._rapid_poll_until = None
+    # Every real coordinator has one, and the command paths read their options.  A
+    # test that cares passes its own through `overrides`.
+    c.config_entry = _make_config_entry()
     c.update_interval = MagicMock()
     c._last_data = {
         "heater": "off",
@@ -78,9 +81,14 @@ def _trigger_coord(**overrides) -> MSpaUpdateCoordinator:
     c.spa = {"heater_state": 0, "filter_state": 0}
 
     def _cmd(name, key):
-        def _fn(value, *_a):
+        def _fn(value, *_a, **kw):
             c.calls.append(name)
             c.spa[key] = int(value)
+            # A heater or UVC command can carry a `filter_state` rider.  The fake spa
+            # has to take it, or a test of the rider would be passing against a stub
+            # that quietly dropped it.
+            if kw.get("filter_state") is not None:
+                c.spa["filter_state"] = int(kw["filter_state"])
             return {"message": "SUCCESS"}
         return _fn
 
@@ -293,12 +301,12 @@ class TestUvcKeepFilter:
         c.api.set_uvc_state.assert_awaited_once_with(0)
 
     def test_a_heater_command_never_carries_the_rider(self):
-        """The rider is for UVC commands only.
+        """This option is for UVC commands only.
 
-        Switching the heater off stops the pump on some spas too, but widening *that*
-        command has never been measured on any hardware, so it keeps its single field
-        whatever UVC is doing. The same goes the other way: nothing is added to a
-        heater command to compensate for what the spa then does to the pump.
+        Switching the heater off stops the pump on some spas too, and there is a
+        separate option for that — see TestHeaterKeepFilter. What must not happen is
+        one option widening the other's commands: a spa that needs the UVC rider has
+        said nothing about what its heater command should look like.
         """
         c = self._coord(keep_filter=True)
         c._last_data["uvc"] = "on"
@@ -364,6 +372,121 @@ class TestUvcKeepFilter:
             {"uvc_state": 1, "filter_state": 1})
 
         _run(c._check_adaptive_polling({"filter": "on", "uvc": "on"}))
+        assert c._pending_raw_command == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Keeping the pump up when the heater goes off
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestHeaterKeepFilter:
+    """Switching the heater off stops the pump a short while later on some spas.
+
+    The pump stays up when it is started again afterwards, so the shutdown follows the
+    heater command rather than the pump's own state.  This option asserts the pump in
+    the same command, to see whether that pre-empts it.
+
+    Separate from the UVC option because these are separate behaviours on separate
+    hardware, and off by default: the wider command has not been observed on any spa
+    yet.  Should it turn out that the firmware's delayed stop simply overrides a
+    simultaneous assertion, the next thing to try is a second command after the delay
+    rather than a wider first one — the user's own report is that the pump started
+    again afterwards does stay up.
+    """
+
+    def _coord(self, keep_filter, filter_state="on", heater="on", option=None):
+        c = _trigger_coord()
+        c.config_entry = _make_config_entry({option or "heater_keep_filter": keep_filter})
+        c._last_data["filter"] = filter_state
+        c._last_data["heater"] = heater
+        c.api.send_device_command = AsyncMock(return_value={"message": "SUCCESS"})
+        return c
+
+    def test_option_on_sends_the_pump_with_the_heater_off(self):
+        """One payload, both keys: heater off, filter asserted on.
+
+        Note this rider is sent *because* the heater is on, which is the opposite of
+        the UVC gate — it is this very command that takes away the state the spa was
+        keeping the pump up for.
+        """
+        c = self._coord(keep_filter=True)
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0, filter_state=1)
+        assert c._pending_raw_command == {"heater_state": 0, "filter_state": 1}
+
+    def test_option_off_sends_the_heater_alone(self):
+        c = self._coord(keep_filter=False)
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0)
+        assert c._pending_raw_command == {"heater_state": 0}
+
+    def test_the_uvc_option_does_not_enable_it(self):
+        c = self._coord(keep_filter=True, option="uvc_keep_filter")
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0)
+
+    def test_never_starts_a_stopped_filter(self):
+        """Frequent pump restarts are what brings on an F1, so a stopped pump stays
+        stopped: the rider holds a running pump up, it does not start one."""
+        c = self._coord(keep_filter=True, filter_state="off")
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0)
+        assert "filter_state" not in c._pending_raw_command
+
+    def test_does_not_undo_a_pending_filter_off(self):
+        """Filter off, then the heater before the next poll: the filter still reads on,
+        but the user has asked for it off and that must stand."""
+        c = self._coord(keep_filter=True)
+        c._pending_changes = {"filter": "off"}
+        _run(c.set_feature_state("heater", "off"))
+        c.api.set_heater_state.assert_awaited_once_with(0)
+
+    def test_nothing_rides_on_a_heater_start(self):
+        """A heater *on* still leads with its own, separately confirmed pump command.
+
+        Asserting both keys in one payload is exactly what `_start_pump_before_heater`
+        avoids, because heat without flow can be refused outright. The option does not
+        reach that path.
+        """
+        c = self._coord(keep_filter=True, filter_state="off", heater="off")
+        _run(c.set_feature_state("heater", "on"))
+        assert c.calls == ["filter", "heater"]          # two commands, in order
+        c.api.set_heater_state.assert_awaited_once_with(1)
+        assert c._pending_raw_command == {"heater_state": 1}
+
+    def test_the_rider_is_dropped_once_the_heater_confirms(self):
+        """With another command still outstanding, so the blanket clear cannot help.
+
+        The rider is not a pending change of its own, so nothing retires it when the
+        heater confirms unless this path does — and a `filter_state` left behind gets
+        resent with whatever retries next.
+        """
+        c = self._coord(keep_filter=True)
+        c._external_change_until = None
+        c._last_snapshot = {}
+        c._last_heat_state = None
+        _run(c.set_feature_state("heater", "off"))
+        c._pending_changes["target_temperature"] = 38      # still outstanding
+
+        _run(c._check_adaptive_polling({"filter": "on", "heater": "off"}))
+        assert "filter_state" not in c._pending_raw_command
+        assert c._pending_changes == {"target_temperature": 38}
+
+    def test_the_retry_carries_both_keys(self):
+        """An unconfirmed command is resent whole, so the rider must survive it —
+        a retry of the bare heater key would hand the pump straight back to the spa."""
+        c = self._coord(keep_filter=True)
+        c._external_change_until = None
+        c._last_snapshot = {}
+        c._last_heat_state = None
+        _run(c.set_feature_state("heater", "off"))
+
+        c._rapid_poll_until = time.time() - 1      # unconfirmed when the window ends
+        _run(c._check_adaptive_polling({"filter": "on", "heater": "on"}))
+        c.api.send_device_command.assert_awaited_once_with(
+            {"heater_state": 0, "filter_state": 1})
+
+        _run(c._check_adaptive_polling({"filter": "on", "heater": "off"}))
         assert c._pending_raw_command == {}
 
 

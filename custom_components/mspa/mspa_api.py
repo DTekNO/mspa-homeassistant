@@ -13,6 +13,17 @@ import functools
 _LOGGER = logging.getLogger(__name__)
 
 
+def _desired(**fields) -> dict:
+    """A desired-state block holding only the fields that were actually given.
+
+    A device command is a sparse block: a key the spa is not sent keeps whatever
+    value it already had, so `None` has to mean "do not mention this key at all"
+    rather than "send nothing for it".  Zero is a value and not an omission,
+    which is why the test is against None and not against falsiness.
+    """
+    return {k: v for k, v in fields.items() if v is not None}
+
+
 class _MSpaThrottle:
     """Proactive spike-arrest rate limiter shared across all API clients for one account.
 
@@ -544,14 +555,13 @@ class MSpaApiClient:
 
 
 
-    async def set_heater_state(self, state: int):
-        return await self.send_device_command({"heater_state": state})
+    async def set_heater_state(self, state: int, filter_state: int | None = None):
+        return await self.send_device_command(
+            _desired(heater_state=state, filter_state=filter_state))
 
     async def set_bubble_state(self, state: int, level: int | None = None):
-        command = {"bubble_state": state}
-        if level is not None:
-            command["bubble_level"] = level
-        return await self.send_device_command(command)
+        return await self.send_device_command(
+            _desired(bubble_state=state, bubble_level=level))
 
     async def set_bubble_level(self, level: int):
         return await self.send_device_command({"bubble_level": level})
@@ -566,10 +576,8 @@ class MSpaApiClient:
         return await self.send_device_command({"ozone_state": state})
 
     async def set_uvc_state(self, state: int, filter_state: int | None = None):
-        command = {"uvc_state": state}
-        if filter_state is not None:
-            command["filter_state"] = filter_state
-        return await self.send_device_command(command)
+        return await self.send_device_command(
+            _desired(uvc_state=state, filter_state=filter_state))
 
     async def set_temperature_setting(self, temp: int):
         return await self.send_device_command({"temperature_setting": temp*2})

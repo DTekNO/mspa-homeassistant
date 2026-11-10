@@ -1113,6 +1113,15 @@ It is not sent while the spa's heater switch is on: the spa keeps the pump runni
 
 This only covers commands sent from Home Assistant. Switching UVC — or the heater — at the spa's own control panel bypasses the integration entirely, so the pump will stop there just as it always did.
 
+#### 4. Keep the Filter Running When Switching the Heater Off (Optional)
+On some spas, switching the heater off lets the filter pump run on for a while and then stops it. The spa does this itself. Starting the pump again afterwards holds, so the shutdown follows the heater command rather than anything about the pump.
+
+When enabled, a heater-off command carries filter-on in the same command, so the pump is asserted rather than left to the spa. As with the UVC option it is only sent when the filter is already on, so it never starts a stopped pump, and it is off by default.
+
+This is separate from the UVC option because they are separate behaviours: enabling one says nothing about the other. Neither applies to a heater *start*, which always sends its own pump command first and waits for the spa to confirm it — heating without flow can be refused outright, so that one is never folded into a single payload.
+
+Again, this only covers commands from Home Assistant; the spa's own control panel bypasses the integration.
+
 ### State Restoration After Power Outage
 
 The MSpa hardware resets to default values (Fahrenheit, 40°C target temperature, all features off) when power cycled. The integration can attempt to automatically restore your previous settings:
