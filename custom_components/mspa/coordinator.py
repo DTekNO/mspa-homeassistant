@@ -5198,8 +5198,8 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         action the user would take, and never while the spa reports a fault.
         """
         self._pump_reassert_until = time.time() + PUMP_REASSERT_WINDOW
-        _LOGGER.debug("Watching for the post-heat pump stop for %ds",
-                      PUMP_REASSERT_WINDOW)
+        _LOGGER.info("Heater off: watching up to %ds for the spa to stop the pump, "
+                     "to start it again", PUMP_REASSERT_WINDOW)
 
     async def _check_pump_reassert(self, data: dict) -> None:
         """Start the pump again once the spa's post-heat purge has stopped it."""
@@ -5209,12 +5209,22 @@ class MSpaUpdateCoordinator(DataUpdateCoordinator):
         if time.time() > self._pump_reassert_until:
             # No stop came.  Either this spa does not do it or the purge outlasted the
             # window; either way, stop watching rather than act on a guess.
-            _LOGGER.debug("Post-heat pump watch expired with the pump still running")
+            _LOGGER.info("Post-heat pump watch expired with the pump still "
+                         "running — nothing to do")
             self._pump_reassert_until = None
             return
 
-        if data.get("heater") == "on":
+        if data.get("heater") == "on" and self._pending_changes.get("heater") != "off":
             # Heating again, so the spa is holding the pump up for its own reasons.
+            #
+            # The pending-change test is what makes this safe.  The first rapid poll
+            # lands about a second after the heater-off command and the spa has not
+            # applied it yet, so it still reports the heater on — reading that as
+            # "heating again" cancelled the watch immediately, which is exactly what
+            # happened on the first live run (13:17 on 10.11: the poll fell back to the
+            # 30 s active tier instead of the 5 s watch).  While our own heater-off is
+            # still waiting to be confirmed, an on is the state we are leaving, not a
+            # state being returned to.
             self._pump_reassert_until = None
             return
 

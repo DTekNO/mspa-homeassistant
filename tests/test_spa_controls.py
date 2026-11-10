@@ -550,6 +550,18 @@ class TestPumpReassert:
         c.api.set_filter_state.assert_not_awaited()
         assert c._pump_reassert_until is None
 
+    def test_a_poll_that_has_not_caught_up_yet_does_not_cancel_it(self):
+        """The first rapid poll lands ~1 s after the heater-off and the spa has not
+        applied it, so it still reports the heater on.  Reading that as "heating again"
+        cancelled the watch on the spot — the first live run, 13:17 on 10.11, fell back
+        to the 30 s active tier instead of the 5 s watch and the pump stayed off.
+        """
+        c = self._watching()
+        c._pending_changes = {"heater": "off"}          # ours, not yet confirmed
+        _run(c._check_adaptive_polling({"heater": "on", "filter": "on"}))
+        assert c._pump_reassert_until is not None, "the watch must survive a stale poll"
+        c.api.set_filter_state.assert_not_awaited()
+
     def test_a_user_filter_command_cancels_it(self):
         """Switching the pump off by hand during the window must stand."""
         c = self._watching()
